@@ -82,6 +82,15 @@ def load_model(model_filename,batch_size=8,max_context_length=512,n_parts_overwr
     return ret
 
 def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85,rep_pen=1.1,rep_pen_range=128,seed=-1):
+    
+    # enforce the maximum lenght of generated tokens and context informed at program arguments, 
+    # useful to do avoid timeouts when using this program with KoboldHorde
+    global maxlen, ctxlen
+    if max_length > maxlen:
+        max_length = maxlen
+    if max_context_length > maxctx:
+        max_context_length = maxctx
+    
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
@@ -102,7 +111,7 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
 ### A hacky simple HTTP server simulating a kobold api by Concedo
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
 #################################################################
-friendlymodelname = "concedo/koboldcpp"  # local kobold api apparently needs a hardcoded known HF model name
+friendlymodelname = "KoboldCPP/concedo"  # local kobold api apparently needs a model name
 maxctx = 2048
 maxlen = 128
 modelbusy = False
@@ -316,10 +325,18 @@ def RunServerMultiThreaded(addr, port, embedded_kailite = None):
             sys.exit(0)
 
 def main(args): 
-    global use_blas, use_clblast, use_noavx2
+    global use_blas, use_clblast, use_noavx2, friendlymodelname, maxctx, maxlen
     use_blas = False 
     use_clblast = False 
     use_noavx2 = False 
+
+    # parameters useful when joining the KoboldHorde
+    if args.friendlymodelname:
+        friendlymodelname = "KoboldCPP/" + args.friendlymodelname
+    if args.maxctx:
+        maxctx = args.maxctx
+    if args.maxlen:
+        maxlen = args.maxlen
 
     if os.name != 'nt':
         print("You are not on Windows. Default koboldcpp.dll library file will be used. Remember to manually link with OpenBLAS using LLAMA_OPENBLAS=1, or CLBlast with LLAMA_CLBLAST=1 if you want to use them.")
@@ -427,6 +444,9 @@ if __name__ == '__main__':
     if os.cpu_count()!=None and os.cpu_count()>1:
         physical_core_limit = int(os.cpu_count()/2)
     default_threads = (physical_core_limit if physical_core_limit<=3 else max(3,physical_core_limit-1))
+    parser.add_argument("--friendlymodelname", help="Use a custom name for the model at KoboldAI API, useful when joining the Horde", type=str, action='store')
+    parser.add_argument("--maxctx", help="Maximum context size to be used, useful when joining the Horde", type=int, action='store')
+    parser.add_argument("--maxlen", help="Maximum lenght size to be used, useful when joining the Horde", type=int, action='store')
     parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores", type=int, default=default_threads)
     parser.add_argument("--psutil_set_threads", help="Experimental flag. If set, uses psutils to determine thread count based on physical cores.", action='store_true')
     parser.add_argument("--stream", help="Uses pseudo streaming", action='store_true')
