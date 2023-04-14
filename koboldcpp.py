@@ -113,7 +113,7 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
 ### A hacky simple HTTP server simulating a kobold api by Concedo
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
 #################################################################
-friendlymodelname = "KoboldCPP/concedo"  # local kobold api apparently needs a model name
+friendlymodelname = "concedo/koboldcpp"  # local KoboldAI-United API needs a model name registered at HuggingFace. This is the placeholder: https://huggingface.co/concedo/koboldcpp
 maxctx = 2048
 maxlen = 128
 modelbusy = False
@@ -333,8 +333,8 @@ def main(args):
     use_noavx2 = False 
 
     # parameters useful when joining the KoboldHorde
-    if args.friendlymodelname:
-        friendlymodelname = "KoboldCPP/" + args.friendlymodelname
+    if args.kobold_horde_model_name:
+        friendlymodelname = "KoboldCPP/" + args.kobold_horde_model_name
     if args.maxctx:
         maxctx = args.maxctx
     if args.maxlen:
@@ -434,10 +434,10 @@ def main(args):
 if __name__ == '__main__':
     print("Welcome to KoboldCpp - Version 1.7") # just update version manually
     parser = argparse.ArgumentParser(description='Kobold llama.cpp server')
-    parser.add_argument("model_file", help="Model file to load", nargs="?")
+    parser.add_argument("model_file", help="Model file to load.", nargs="?")
     portgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
-    portgroup.add_argument("--port", help="Port to listen on", default=defaultport, type=int, action='store')
-    portgroup.add_argument("l_port", help="Port to listen on (deprecated)", default=defaultport, nargs="?", type=int, action='store')
+    portgroup.add_argument("--port", help="Port to listen on.", default=defaultport, type=int, action='store')
+    portgroup.add_argument("l_port", help="Port to listen on (deprecated).", default=defaultport, nargs="?", type=int, action='store')
     parser.add_argument("--host", help="Host IP to listen on. If empty, all routable interfaces are accepted.", default="")
     
     #os.environ["OMP_NUM_THREADS"] = '12'
@@ -446,17 +446,17 @@ if __name__ == '__main__':
     if os.cpu_count()!=None and os.cpu_count()>1:
         physical_core_limit = int(os.cpu_count()/2)
     default_threads = (physical_core_limit if physical_core_limit<=3 else max(3,physical_core_limit-1))
-    parser.add_argument("--friendlymodelname", help="Use a custom name for the model at KoboldAI API, useful when joining the Horde", type=str, action='store')
-    parser.add_argument("--maxctx", help="Maximum context size to be used, useful when joining the Horde", type=int, action='store')
-    parser.add_argument("--maxlen", help="Maximum lenght size to be used, useful when joining the Horde", type=int, action='store')
-    parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores", type=int, default=default_threads)
+    parser.add_argument("--kobold_horde_model_name", help="Use a custom name for the model at KoboldAI API. Use only for KoboldHorde! It breaks KoboldAI-United compability.", type=str, action='store')
+    parser.add_argument("--maxctx", help="Maximum context size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
+    parser.add_argument("--maxlen", help="Maximum lenght size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
+    parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores.", type=int, default=default_threads)
     parser.add_argument("--psutil_set_threads", help="Experimental flag. If set, uses psutils to determine thread count based on physical cores.", action='store_true')
-    parser.add_argument("--stream", help="Uses pseudo streaming", action='store_true')
+    parser.add_argument("--stream", help="Uses pseudo streaming.", action='store_true')
     parser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently.", action='store_true')
-    parser.add_argument("--nommap", help="If set, do not use mmap to load newer models", action='store_true')
+    parser.add_argument("--nommap", help="If set, do not use mmap to load newer models.", action='store_true')
     parser.add_argument("--noavx2", help="Do not use AVX2 instructions, a slower compatibility mode for older devices. Does not work with --clblast.", action='store_true')
     compatgroup = parser.add_mutually_exclusive_group()
-    compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion", action='store_true')
+    compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion.", action='store_true')
     compatgroup.add_argument("--useclblast", help="Use CLBlast instead of OpenBLAS for prompt ingestion. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
     args = parser.parse_args()
     main(args)
