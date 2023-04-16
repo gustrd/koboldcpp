@@ -27,11 +27,7 @@ double timer_check()
     return time_taken;
 }
 
-void print_tok_vec(std::vector<int> &embd)
-{
-    print_tok_vec(embd,nullptr);
-}
-void print_tok_vec(std::vector<int> &embd, std::map<int32_t, std::string> * decoder)
+void print_vec(std::vector<std::string> &embd)
 {
     std::cout << "[";
     bool first = true;
@@ -41,15 +37,23 @@ void print_tok_vec(std::vector<int> &embd, std::map<int32_t, std::string> * deco
         {
             std::cout << ',';
         }
-        first = false;
-        if(decoder)
+        first = false;        
+        std::cout << i;        
+    }
+    std::cout << "]\n";
+}
+void print_tok_vec(std::vector<int> &embd)
+{
+    std::cout << "[";
+    bool first = true;
+    for (auto i : embd)
+    {
+        if (!first)
         {
-            std::cout << (*decoder)[i];
+            std::cout << ',';
         }
-        else
-        {
-            std::cout << i;
-        }
+        first = false;        
+        std::cout << i;        
     }
     std::cout << "]\n";
 }
@@ -313,7 +317,7 @@ void print_tok_vec(std::vector<float> &embd)
                     {
                         break;
                     }
-                    if ((i + 2) >= embd_inp_len)
+                    if ((i + 2 - offset_fix) >= embd_inp_len)
                     {
                         break;
                     }
