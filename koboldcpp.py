@@ -8,6 +8,8 @@ import os
 import argparse
 import json, http.server, threading, socket, sys, time
 
+stop_token_max = 10
+
 class load_model_inputs(ctypes.Structure):
     _fields_ = [("threads", ctypes.c_int),
                 ("max_context_length", ctypes.c_int),
@@ -17,7 +19,8 @@ class load_model_inputs(ctypes.Structure):
                 ("n_parts_overwrite", ctypes.c_int),
                 ("use_mmap", ctypes.c_bool),
                 ("use_smartcontext", ctypes.c_bool),
-                ("clblast_info", ctypes.c_int)]
+                ("clblast_info", ctypes.c_int),
+                ("blasbatchsize", ctypes.c_int)]
 
 class generation_inputs(ctypes.Structure):
     _fields_ = [("seed", ctypes.c_int),
@@ -28,7 +31,8 @@ class generation_inputs(ctypes.Structure):
                 ("top_k", ctypes.c_int),
                 ("top_p", ctypes.c_float),
                 ("rep_pen", ctypes.c_float),
-                ("rep_pen_range", ctypes.c_int)]
+                ("rep_pen_range", ctypes.c_int),
+                ("stop_sequence", ctypes.c_char_p * stop_token_max)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -66,7 +70,7 @@ def init_library():
     handle.generate.argtypes = [generation_inputs, ctypes.c_wchar_p] #apparently needed for osx to work. i duno why they need to interpret it that way but whatever
     handle.generate.restype = generation_outputs
     
-def load_model(model_filename,batch_size=8,max_context_length=512,n_parts_overwrite=-1,threads=6,use_mmap=False,use_smartcontext=False):
+def load_model(model_filename,batch_size=8,max_context_length=512,n_parts_overwrite=-1,threads=6,use_mmap=False,use_smartcontext=False,blasbatchsize=512):
     inputs = load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
     inputs.batch_size = batch_size
@@ -76,6 +80,7 @@ def load_model(model_filename,batch_size=8,max_context_length=512,n_parts_overwr
     inputs.f16_kv = True
     inputs.use_mmap = use_mmap
     inputs.use_smartcontext = use_smartcontext
+    inputs.blasbatchsize = blasbatchsize
     clblastids = 0
     if args.useclblast:
         clblastids = 100 + int(args.useclblast[0])*10 + int(args.useclblast[1])
@@ -83,7 +88,7 @@ def load_model(model_filename,batch_size=8,max_context_length=512,n_parts_overwr
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85,rep_pen=1.1,rep_pen_range=128,seed=-1):
+def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
@@ -95,6 +100,11 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
     inputs.seed = seed
+    for n in range(0,stop_token_max):
+        if n >= len(stop_sequence):
+            inputs.stop_sequence[n] = "".encode("UTF-8")
+        else:
+            inputs.stop_sequence[n] = stop_sequence[n].encode("UTF-8")
     ret = handle.generate(inputs,outputs)
     if(ret.status==1):
         return ret.text.decode("UTF-8","ignore")
@@ -168,6 +178,12 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"values": []}).encode())
             return
+        
+        if self.path.endswith(('/api/v1/info/version', '/api/latest/info/version')):
+            self.send_response(200)
+            self.end_headers()           
+            self.wfile.write(json.dumps({"result":"1.2.2"}).encode())
+            return
 
         self.send_response(404)
         self.end_headers()
@@ -227,7 +243,8 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     top_p=genparams.get('top_p', 0.85),
                     rep_pen=genparams.get('rep_pen', 1.1),
                     rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=-1
+                    seed=-1,
+                    stop_sequence=genparams.get('stop_sequence', [])
                     )
                 print("\nOutput: " + recvtxt)
                 res = {"results": [{"text": recvtxt}]}                            
@@ -240,7 +257,8 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     top_p=genparams.get('top_p', 0.85),
                     rep_pen=genparams.get('rep_pen', 1.1),
                     rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=-1
+                    seed=-1,
+                    stop_sequence=genparams.get('stop_sequence', [])
                     )
                 print("\nOutput: " + recvtxt)
                 res = {"data": {"seqs":[recvtxt]}}
@@ -355,8 +373,10 @@ def main(args):
         print("Overriding thread count, using " + str(args.threads) + " threads instead.")
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
-    ggml_selected_file = args.model_file
     embedded_kailite = None 
+    ggml_selected_file = args.model_param
+    if not ggml_selected_file:
+        ggml_selected_file = args.model    
     if not ggml_selected_file:     
         #give them a chance to pick a file
         print("For command line arguments, please refer to --help")
@@ -386,7 +406,7 @@ def main(args):
     mdl_nparts = sum(1 for n in range(1, 9) if os.path.exists(f"{ggml_selected_file}.{n}")) + 1
     modelname = os.path.abspath(ggml_selected_file)
     print(f"Loading model: {modelname} \n[Parts: {mdl_nparts}, Threads: {args.threads}, SmartContext: {args.smartcontext}]")
-    loadok = load_model(modelname,8,maxctx,mdl_nparts,args.threads,(not args.nommap),args.smartcontext)
+    loadok = load_model(modelname,8,maxctx,mdl_nparts,args.threads,(not args.nommap),args.smartcontext,args.blasbatchsize)
     print("Load Model OK: " + str(loadok))
 
     if not loadok:
@@ -401,8 +421,8 @@ def main(args):
     except:
         print("Could not find Kobold Lite. Embedded Kobold Lite will not be available.")
 
-    if args.l_port!=defaultport:
-        args.port = args.l_port
+    if args.port_param!=defaultport:
+        args.port = args.port_param
     print(f"Starting Kobold HTTP Server on port {args.port}")
     epurl = ""
     if args.host=="":
@@ -415,12 +435,14 @@ def main(args):
     RunServerMultiThreaded(args.host, args.port, embedded_kailite)
 
 if __name__ == '__main__':
-    print("Welcome to KoboldCpp - Version 1.7") # just update version manually
+    print("Welcome to KoboldCpp - Version 1.9") # just update version manually
     parser = argparse.ArgumentParser(description='Kobold llama.cpp server')
-    parser.add_argument("model_file", help="Model file to load", nargs="?")
+    modelgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
+    modelgroup.add_argument("--model", help="Model file to load", nargs="?")
+    modelgroup.add_argument("model_param", help="Model file to load (positional)", nargs="?")
     portgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
     portgroup.add_argument("--port", help="Port to listen on", default=defaultport, type=int, action='store')
-    portgroup.add_argument("l_port", help="Port to listen on (deprecated)", default=defaultport, nargs="?", type=int, action='store')
+    portgroup.add_argument("port_param", help="Port to listen on (positional)", default=defaultport, nargs="?", type=int, action='store')
     parser.add_argument("--host", help="Host IP to listen on. If empty, all routable interfaces are accepted.", default="")
     
     #os.environ["OMP_NUM_THREADS"] = '12'
@@ -431,6 +453,7 @@ if __name__ == '__main__':
     default_threads = (physical_core_limit if physical_core_limit<=3 else max(3,physical_core_limit-1))
     parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores", type=int, default=default_threads)
     parser.add_argument("--psutil_set_threads", help="Experimental flag. If set, uses psutils to determine thread count based on physical cores.", action='store_true')
+    parser.add_argument("--blasbatchsize", help="Sets the batch size used in BLAS processing (default 512)", type=int,choices=[64,128,256,512,1024], default=512)
     parser.add_argument("--stream", help="Uses pseudo streaming", action='store_true')
     parser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently.", action='store_true')
     parser.add_argument("--nommap", help="If set, do not use mmap to load newer models", action='store_true')

@@ -1,5 +1,6 @@
 #pragma once
 
+const int stop_token_max = 10;
 struct load_model_inputs
 {
     const int threads;
@@ -11,6 +12,7 @@ struct load_model_inputs
     const bool use_mmap;
     const bool use_smartcontext;
     const int clblast_info = 0;
+    const int blasbatchsize = 512;
 };
 struct generation_inputs
 {
@@ -23,6 +25,7 @@ struct generation_inputs
     const float top_p;
     const float rep_pen;
     const int rep_pen_range;
+    const char * stop_sequence[stop_token_max];
 };
 struct generation_outputs
 {

@@ -30,13 +30,14 @@ static int n_past = 0;
 static int n_threads = 4;
 static int n_batch = 8;
 static bool useSmartContext = false;
+static int blasbatchsize = 512;
 static std::string modelname;
 static std::vector<gpt_vocab::id> last_n_tokens;
 static std::vector<gpt_vocab::id> current_context_tokens;
 static size_t mem_per_token = 0;
 static std::vector<float> logits;
-
 static std::vector<int> smartcontext;
+static std::vector<std::string> stop_sequence;
 
 inline bool IsNanCheck(float f)
 {
@@ -53,6 +54,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     n_batch = params.n_batch = inputs.batch_size;
     modelname = params.model = inputs.model_filename;
     useSmartContext = inputs.use_smartcontext;
+    blasbatchsize = inputs.blasbatchsize;
     params.memory_f16 = inputs.f16_kv;
     params.n_ctx = inputs.max_context_length;
     model_v1.hparams.n_ctx = model_v2.hparams.n_ctx = model_gpt2_v1.hparams.n_ctx = model_gpt2_v2.hparams.n_ctx = params.n_ctx;
@@ -152,6 +154,15 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
 generation_outputs gpttype_generate(const generation_inputs inputs, generation_outputs &output)
 {
+    stop_sequence.clear();
+    for(int x=0;x<stop_token_max;++x)
+    {
+        std::string stopper = inputs.stop_sequence[x];
+        if(stopper!="")
+        {
+            stop_sequence.push_back(stopper);
+        }
+    }
     params.prompt = inputs.prompt;
     params.seed = inputs.seed;
     params.n_predict = inputs.max_length;
@@ -201,14 +212,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     ContextFastForward(current_context_tokens, embd_inp, n_past, last_n_tokens, nctx, smartcontext, useSmartContext);
 
     //if using BLAS and prompt is big enough, switch to single thread and use a huge batch
-    // bool approved_format = (file_format!=FileFormat::GPT2_1 && file_format!=FileFormat::GPTJ_1 && file_format!=FileFormat::GPTJ_2);
-    // bool blasmode = (approved_format && embd_inp.size() >= 32 && ggml_cpu_has_blas());
-    bool blasmode = false;
+    bool approved_format = (file_format!=FileFormat::GPT2_1 && file_format!=FileFormat::GPTJ_1 && file_format!=FileFormat::GPTJ_2);
+    bool blasmode = (approved_format && embd_inp.size() >= 32 && ggml_cpu_has_blas());
+    // bool blasmode = false;
     int original_batch = params.n_batch;
     int original_threads = params.n_threads;
     if (blasmode)
     {
-        params.n_batch = 512; //received reports of 1024 and above crashing on some models
+        //for gpttype, GPT2 crashes above 256.
+        int bbs = (blasbatchsize>256?256:blasbatchsize);
+        params.n_batch = bbs; //received reports of 1024 and above crashing on some models
         params.n_threads = 1;
     }
 
@@ -331,9 +344,19 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
 
             // decrement remaining sampling budget
             --remaining_tokens;
-            
-            for (auto id : embd) {
+
+            for (auto id : embd)
+            {
                 concat_output += vocab.id_to_token[id].c_str();
+                for (const auto &matched : stop_sequence)
+                {
+                    if (concat_output.find(matched) != std::string::npos)
+                    {
+                        remaining_tokens = 0;
+                        printf("\n(Stop sequence triggered: <%s>)",matched.c_str());
+                        break;
+                    }
+                }
             }
         }
         else

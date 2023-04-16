@@ -28,11 +28,13 @@ static int n_past = 0;
 static int n_threads = 4;
 static int n_batch = 8;
 static bool useSmartContext = false;
+static int blasbatchsize = 512;
 static std::string modelname;
 static llama_context *ctx;
 static std::vector<llama_token> last_n_tokens;
 static std::vector<llama_token> current_context_tokens;
 static std::vector<llama_token> smartcontext;
+static std::vector<std::string> stop_sequence;
 
 bool llama_load_model(const load_model_inputs inputs, FileFormat in_file_format)
 {
@@ -44,6 +46,7 @@ bool llama_load_model(const load_model_inputs inputs, FileFormat in_file_format)
     n_batch = inputs.batch_size;
     modelname = inputs.model_filename;
     useSmartContext = inputs.use_smartcontext;
+    blasbatchsize = inputs.blasbatchsize;
 
     ctx_params.n_ctx = inputs.max_context_length;
     ctx_params.n_parts = -1;//inputs.n_parts_overwrite;
@@ -79,6 +82,15 @@ bool llama_load_model(const load_model_inputs inputs, FileFormat in_file_format)
 
 generation_outputs llama_generate(const generation_inputs inputs, generation_outputs &output)
 {
+    stop_sequence.clear();
+    for(int x=0;x<stop_token_max;++x)
+    {
+        std::string stopper = inputs.stop_sequence[x];
+        if(stopper!="")
+        {
+            stop_sequence.push_back(stopper);
+        }
+    }
     params.prompt = inputs.prompt;
     params.seed = inputs.seed;
     params.n_predict = inputs.max_length;
@@ -143,7 +155,7 @@ generation_outputs llama_generate(const generation_inputs inputs, generation_out
     int original_threads = params.n_threads;
     if (blasmode)
     {
-        params.n_batch = 512; //received reports of 1024 and above crashing on some models
+        params.n_batch = blasbatchsize; //received reports of 1024 and above crashing on some models
         params.n_threads = 1;
     }
 
@@ -228,7 +240,16 @@ generation_outputs llama_generate(const generation_inputs inputs, generation_out
             // decrement remaining sampling budget
             --remaining_tokens;
             //printf("\nid:%d word:%s\n",id,llama_token_to_str(ctx, id));
-            concat_output += llama_token_to_str(ctx, id);
+            concat_output += llama_token_to_str(ctx, id);           
+            for (const auto &matched : stop_sequence)
+            {
+                if (concat_output.find(matched) != std::string::npos)
+                {
+                    remaining_tokens = 0;
+                    printf("\n(Stop sequence triggered: <%s>)",matched.c_str());
+                    break;
+                }
+            }
         }
         else
         {
