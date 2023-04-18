@@ -8,6 +8,7 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 
 # Highlights
 - Now has experimental CLBlast support.
+- Now supports RWKV models WITHOUT pytorch or tokenizers! Yep, just GGML!
 
 ## Usage
 - [Download the latest release here](https://github.com/LostRuins/koboldcpp/releases/latest) or clone the repo.
@@ -17,6 +18,14 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 - By default, you can connect to http://localhost:5001 
 - You can also run it using the command line `koboldcpp.exe [ggml_model.bin] [port]`. For info, please check `koboldcpp.exe --help` 
 - If you are having crashes or issues with OpenBLAS, please try the `--noblas` flag.
+
+## Compiling at Windows
+- If you want to compile your binaries from source at Windows, the easiest way is:
+  - Use the latest release of w64devkit (https://github.com/skeeto/w64devkit). Be sure to use the "vanilla one", not i686 or other different stuff. If you try they will conflit with the precompiled libs!
+  - Make sure you are using the w64devkit integrated terminal, then run 'make' at the KoboldCpp source folder. This will create the .dll files.
+  - If you want to generate the .exe file, make sure you have the python module PyInstaller installed with pip ('pip install PyInstaller').
+  - Run the script make_pyinstaller.bat at a regular terminal (or Windows Explorer).
+  - The koboldcpp.exe file will be at your dist folder.
 
 ## OSX and Linux
 - You will have to compile your binaries from source. A makefile is provided, simply run `make`
@@ -42,3 +51,9 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 ## Notes
 - Generation delay scales linearly with original prompt length. If OpenBLAS is enabled then prompt ingestion becomes about 2-3x faster. This is automatic on windows, but will require linking on OSX and Linux.
 - I have heard of someone claiming a false AV positive report. The exe is a simple pyinstaller bundle that includes the necessary python scripts and dlls to run. If this still concerns you, you might wish to rebuild everything from source code using the makefile, and you can rebuild the exe yourself with pyinstaller by using `make_pyinstaller.bat`
+- Supported GGML models: 
+  - LLAMA (All versions including ggml, ggmf, ggjt, gpt4all). Supports CLBlast and OpenBLAS acceleration for all versions.
+  - GPT-2 (All versions, including legacy f16, newer format + quanitzed, cerebras) Supports OpenBLAS acceleration only for newer format. 
+  - GPT-J (All versions including legacy f16, newer format + quantized, pyg.cpp, new pygmalion, janeway etc.) Supports OpenBLAS acceleration only for newer format. 
+  - RWKV (f16 GGMF format), unaccelerated due to RNN properties.
+  - Basically every single current and historical GGML format that has ever existed should be supported, except for bloomz.cpp due to lack of demand.
