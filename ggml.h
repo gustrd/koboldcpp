@@ -204,7 +204,8 @@ enum ggml_type {
     GGML_TYPE_F16  = 1,
     GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q4_1 = 3,
-    GGML_TYPE_Q8_0 = 4,
+    GGML_TYPE_Q4_2 = 4,
+    GGML_TYPE_Q8_0 = 5,
     GGML_TYPE_I8,
     GGML_TYPE_I16,
     GGML_TYPE_I32,
@@ -806,6 +807,7 @@ enum ggml_opt_result ggml_opt(
 
 size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int64_t * hist);
 size_t ggml_quantize_q4_1(const float * src, void * dst, int n, int k, int64_t * hist);
+size_t ggml_quantize_q4_2(const float * src, void * dst, int n, int k, int64_t * hist);
 
 //
 // system info
@@ -823,6 +825,7 @@ int ggml_cpu_has_f16c(void);
 int ggml_cpu_has_fp16_va(void);
 int ggml_cpu_has_wasm_simd(void);
 int ggml_cpu_has_blas(void);
+int ggml_cpu_has_cublas(void);
 int ggml_cpu_has_sse3(void);
 int ggml_cpu_has_vsx(void);
 
