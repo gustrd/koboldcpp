@@ -371,7 +371,7 @@ bool gpt2_eval(
     const int n_vocab = hparams.n_vocab;
 
     //todo: there is a bug that causes the buffer to oom and I cannot figure it out, hack to increase size for now  
-    static size_t buf_size = 1600u*1024*1024;
+    static size_t buf_size = 256u*1024*1024;
     static void * buf = malloc(buf_size);
 
     if (mem_per_token > 0 && mem_per_token*N*1.6 > buf_size) {
@@ -453,10 +453,11 @@ bool gpt2_eval(
         {
             struct ggml_tensor * Qcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 0*sizeof(float)*n_embd);
             struct ggml_tensor * Kcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 1*sizeof(float)*n_embd);
-            struct ggml_tensor * Vcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
-
+            
             // store key and value to memory
             if (N >= 1) {
+                struct ggml_tensor * Vcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
+
                 struct ggml_tensor * k = ggml_view_1d(ctx0, model.memory_k, N*n_embd, (ggml_element_size(model.memory_k)*n_embd)*(il*n_ctx + n_past));
                 struct ggml_tensor * v = ggml_view_1d(ctx0, model.memory_v, N*n_embd, (ggml_element_size(model.memory_v)*n_embd)*(il*n_ctx + n_past));
 

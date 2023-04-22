@@ -9,6 +9,7 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 # Highlights
 - Now has experimental CLBlast support.
 - Now supports RWKV models WITHOUT pytorch or tokenizers! Yep, just GGML!
+- Now supports GPT-NeoX / Pythia models
 
 ## Usage
 - [Download the latest release here](https://github.com/LostRuins/koboldcpp/releases/latest) or clone the repo.
@@ -26,12 +27,19 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
   - If you want to generate the .exe file, make sure you have the python module PyInstaller installed with pip ('pip install PyInstaller').
   - Run the script make_pyinstaller.bat at a regular terminal (or Windows Explorer).
   - The koboldcpp.exe file will be at your dist folder.
+- If you wish to use your own version of the additional Windows libraries (OpenCL, CLBlast and OpenBLAS), you can do it with:
+  - OpenCL - tested with https://github.com/KhronosGroup/OpenCL-SDK . If you wish to compile it, follow the repository instructions. You will need vcpkg.
+  - CLBlast - tested with https://github.com/CNugteren/CLBlast . If you wish to compile it you will need to reference the OpenCL files. It will only generate the ".lib" file if you compile using MSVC.
+  - OpenBLAS - tested with https://github.com/xianyi/OpenBLAS . 
+  - Move the respectives .lib files to the /lib folder of your project, overwriting the older files.
+  - Make the KoboldCPP project using the instructions above. 
 
 ## OSX and Linux
 - You will have to compile your binaries from source. A makefile is provided, simply run `make`
 - If you want you can also link your own install of OpenBLAS manually with `make LLAMA_OPENBLAS=1`
 - Alternatively, if you want you can also link your own install of CLBlast manually with `make LLAMA_CLBLAST=1`, for this you will need to obtain and link OpenCL and CLBlast libraries.
-  - For Arch Linux: Install `cblas` and `openblas`. In the makefile, find the `ifdef LLAMA_OPENBLAS` conditional and add `-lcblas` to `LDFLAGS`.
+- For a full featured build, do `make LLAMA_OPENBLAS=1 LLAMA_CLBLAST=1`
+  - For Arch Linux: Install `cblas` and `openblas`. 
   - For Debian: Install `libclblast-dev` and `libopenblas-dev`.
 - After all binaries are built, you can run the python script with the command `koboldcpp.py [ggml_model.bin] [port]`
 
@@ -56,4 +64,5 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
   - GPT-2 (All versions, including legacy f16, newer format + quanitzed, cerebras) Supports OpenBLAS acceleration only for newer format. 
   - GPT-J (All versions including legacy f16, newer format + quantized, pyg.cpp, new pygmalion, janeway etc.) Supports OpenBLAS acceleration only for newer format. 
   - RWKV (f16 GGMF format), unaccelerated due to RNN properties.
+  - GPT-NeoX / Pythia
   - Basically every single current and historical GGML format that has ever existed should be supported, except for bloomz.cpp due to lack of demand.

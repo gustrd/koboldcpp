@@ -24,6 +24,10 @@
 #include <memory>
 #include <algorithm>
 #include <initializer_list>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <sstream>
 
 #define LLAMA_USE_SCRATCH
 #define LLAMA_MAX_SCRATCH_BUFFERS 16
@@ -64,7 +68,7 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
         { MODEL_65B,   512ull * MB },
     };
     return _MEM_REQ_SCRATCH1;
-};
+}
 
 // 2*n_embd*n_ctx*n_layer*sizeof(float16)
 static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
@@ -76,7 +80,7 @@ static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
         { MODEL_65B,  5120ull * MB },
     };
     return _MEM_REQ_KV_SELF;
-};
+}
 
 // this is mostly needed for temporary mul_mat buffers to dequantize the data
 // not actually needed if BLAS is disabled
@@ -89,7 +93,7 @@ static const std::map<e_model, size_t> & MEM_REQ_EVAL()
         { MODEL_65B, 1536ull * MB },
     };
     return _MEM_REQ_EVAL;
-};
+}
 
 // default hparams (LLaMA 7B)
 struct llama_hparams {
@@ -486,6 +490,7 @@ struct llama_file_loader {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q4_2:
+                case GGML_TYPE_Q4_3:
                     break;
                 default: {
                     throw format("unrecognized tensor type %u\n", shard.type);
@@ -559,6 +564,7 @@ struct llama_file_saver {
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q4_1:
             case GGML_TYPE_Q4_2:
+            case GGML_TYPE_Q4_3:
                 break;
             default: LLAMA_ASSERT(false);
         }
@@ -848,6 +854,7 @@ static const char *llama_ftype_name(enum llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_1_SOME_F16:
                                       return "mostly Q4_1, some F16";
         case LLAMA_FTYPE_MOSTLY_Q4_2: return "mostly Q4_2";
+        case LLAMA_FTYPE_MOSTLY_Q4_3: return "mostly Q4_3";
         default:                      return "unknown, may not work";
     }
 }
@@ -1576,14 +1583,19 @@ static llama_vocab::id llama_sample_top_p_top_k(
 // quantization
 //
 
-static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, enum llama_ftype ftype) {
+static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, enum llama_ftype ftype, int nthread) {
     ggml_type quantized_type;
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: quantized_type = GGML_TYPE_Q4_0; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: quantized_type = GGML_TYPE_Q4_1; break;
         case LLAMA_FTYPE_MOSTLY_Q4_2: quantized_type = GGML_TYPE_Q4_2; break;
+        case LLAMA_FTYPE_MOSTLY_Q4_3: quantized_type = GGML_TYPE_Q4_3; break;
         default: throw format("invalid output file type %d\n", ftype);
     };
+
+    if (nthread <= 0) {
+        nthread = std::thread::hardware_concurrency();
+    }
 
     std::unique_ptr<llama_model_loader> model_loader(new llama_model_loader(fname_inp.c_str(), /*use_mmap*/ false,
                                                                             /*vocab_only*/ false));
@@ -1592,6 +1604,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     size_t total_size_org = 0;
     size_t total_size_new = 0;
     std::vector<int64_t> hist_all(1 << 4, 0);
+
+    std::vector<std::thread> workers;
+    std::mutex mutex;
 
     size_t idx = 0;
     for (llama_load_tensor & tensor : model_loader->tensors_map.tensors) {
@@ -1610,6 +1625,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // quantize only 2D tensors
         quantize &= (tensor.ne.size() == 2);
+
+        // uncomment this to keep the output layer in FP16
+        //if (tensor.name == "output.weight") {
+        //    quantize = false;
+        //}
 
         enum ggml_type new_type;
         void * new_data;
@@ -1646,21 +1666,37 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             new_data = work.addr;
             std::vector<int64_t> hist_cur(1 << 4, 0);
 
-            switch (new_type) {
-                case GGML_TYPE_Q4_0:
-                    {
-                        new_size = ggml_quantize_q4_0(f32_data, new_data, nelements, (int) tensor.ne.at(0), hist_cur.data());
-                    } break;
-                case GGML_TYPE_Q4_1:
-                    {
-                        new_size = ggml_quantize_q4_1(f32_data, new_data, nelements, (int) tensor.ne.at(0), hist_cur.data());
-                    } break;
-                case GGML_TYPE_Q4_2:
-                    {
-                        new_size = ggml_quantize_q4_2(f32_data, new_data, nelements, (int) tensor.ne.at(0), hist_cur.data());
-                    } break;
-                default:
-                    LLAMA_ASSERT(false);
+            int chunk_size = 32 * 512;
+            const int nchunk = (nelements + chunk_size - 1)/chunk_size;
+            const int nthread_use = nthread > 1 ? std::max(1, std::min(nthread, nchunk)) : 1;
+            if (nthread_use < 2) {
+                new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nelements, hist_cur.data());
+            } else {
+                size_t counter = 0;
+                new_size = 0;
+                auto compute = [&mutex, &counter, &hist_cur, &new_size, new_type, f32_data, new_data, nelements, chunk_size] () {
+                    std::vector<int64_t> local_hist;
+                    size_t local_size = 0;
+                    while (true) {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        size_t first = counter; counter += chunk_size;
+                        if (first >= nelements) {
+                            if (!local_hist.empty()) {
+                                for (int j=0; j<int(local_hist.size()); ++j) hist_cur[j] += local_hist[j];
+                                new_size += local_size;
+                            }
+                            break;
+                        }
+                        lock.unlock();
+                        size_t last = std::min(nelements, first + chunk_size);
+                        if (local_hist.empty()) local_hist.resize(hist_cur.size(), 0);
+                        local_size += ggml_quantize_chunk(new_type, f32_data, new_data, first, last - first, local_hist.data());
+                    }
+                };
+                if (int(workers.size()) < nthread_use - 1) workers.resize(nthread_use - 1);
+                for (int it = 0; it < nthread_use - 1; ++it) workers[it] = std::thread(compute);
+                compute();
+                for (int it = 0; it < nthread_use - 1; ++it) workers[it].join();
             }
 
             printf("size = %8.2f MB -> %8.2f MB | hist: ", tensor.size/1024.0/1024.0, new_size/1024.0/1024.0);
@@ -1759,7 +1795,7 @@ struct llama_context * llama_init_from_file(
         if (params.logits_all) {
             ctx->logits.reserve(hparams.n_ctx*hparams.n_vocab);
         } else {
-            ctx->logits.reserve(hparams.n_ctx);
+            ctx->logits.reserve(hparams.n_vocab);
         }
 
         if (params.embedding){
@@ -1782,9 +1818,10 @@ void llama_free(struct llama_context * ctx) {
 int llama_model_quantize(
         const char * fname_inp,
         const char * fname_out,
-  enum llama_ftype   ftype) {
+  enum llama_ftype   ftype,
+        int          nthread) {
     try {
-        llama_model_quantize_internal(fname_inp, fname_out, ftype);
+        llama_model_quantize_internal(fname_inp, fname_out, ftype, nthread);
         return 0;
     } catch (const std::string & err) {
         fprintf(stderr, "%s: failed to quantize: %s\n", __func__, err.c_str());
@@ -1970,7 +2007,7 @@ int llama_apply_lora_from_file_internal(struct llama_context * ctx, const char *
                 base_t = dest_t;
             }
 
-            if (base_t->type == GGML_TYPE_Q4_0 || base_t->type == GGML_TYPE_Q4_1 || base_t->type == GGML_TYPE_Q4_2) {
+            if (ggml_is_quantized(base_t->type)) {
                 if (!warned) {
                     fprintf(stderr, "%s: warning: using a lora adapter with a quantized model may result in poor quality, "
                                     "use a f16 or f32 base model with --lora-base\n", __func__);
@@ -2063,7 +2100,11 @@ void llama_set_kv_cache(
                          int   n_token_count) {
     // Make sure we have the same kv cache setup
     LLAMA_ASSERT(ctx->model.kv_self.buf.size == n_size);
+    void * k_data = ctx->model.kv_self.k->data; // remember data pointers
+    void * v_data = ctx->model.kv_self.v->data; // because their value is stored in buf and overwritten by memcpy
     memcpy(ctx->model.kv_self.buf.addr, kv_cache, n_size);
+    ctx->model.kv_self.k->data = k_data; // restore correct data pointers
+    ctx->model.kv_self.v->data = v_data;
     ctx->model.kv_self.n = n_token_count;
 }
 
@@ -2218,4 +2259,123 @@ const char * llama_print_system_info(void) {
 // For internal test use
 std::vector<std::pair<std::string, struct ggml_tensor *>>& llama_internal_get_tensor_map(struct llama_context * ctx) {
     return ctx->model.tensors_by_name;
+}
+
+// Returns the size of the state
+size_t llama_get_state_size(struct llama_context * ctx) {
+    const size_t s_bool = sizeof(int32_t);
+    // we don't know size of rng until we actually serialize it. so reserve more than enough memory for its serialized state.
+    // for reference, std::mt19937(1337) serializes to 6701 bytes.
+    const size_t s_rng_size = sizeof(size_t);
+    const size_t s_rng = 64*1024;
+    const size_t s_logits_capacity = sizeof(size_t);
+    const size_t s_logits_size = sizeof(size_t);
+    const size_t s_logits = ctx->logits.capacity() * sizeof(float);
+    const size_t s_embedding_size = sizeof(size_t);
+    const size_t s_embedding = ctx->embedding.size() * sizeof(float);
+    const size_t s_kv_size = sizeof(size_t);
+    const size_t s_kv_ntok = sizeof(int);
+    const size_t s_kv = llama_get_kv_cache_size(ctx);
+    const size_t s_total = (
+        + s_rng_size
+        + s_rng
+        + s_logits_capacity
+        + s_logits_size
+        + s_logits
+        + s_embedding_size
+        + s_embedding
+        + s_kv_size
+        + s_kv_ntok
+        + s_kv
+    );
+    return s_total;
+}
+
+// Copies the state to the specified destination address
+size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dest) {
+    std::stringstream rng_ss;
+    rng_ss << ctx->rng;
+    const size_t rng_size = rng_ss.str().size();
+    char rng_buf[64*1024];
+    memset(&rng_buf[0], 0, 64*1024);
+    memcpy(&rng_buf[0], rng_ss.str().data(), rng_ss.str().size());
+    const size_t logits_capacity = ctx->logits.capacity();
+    const size_t logits_size = ctx->logits.size();
+    const size_t embedding_size = ctx->embedding.size();
+    const size_t kv_size = llama_get_kv_cache_size(ctx);
+    const int kv_ntok = llama_get_kv_cache_token_count(ctx);
+
+    uint8_t * out = dest;
+    memcpy(out, &rng_size, sizeof(size_t)); out += sizeof(size_t);
+    memcpy(out, &rng_buf[0], 64*1024); out += 64*1024;
+    memcpy(out, &logits_capacity, sizeof(size_t)); out += sizeof(size_t);
+    memcpy(out, &logits_size, sizeof(size_t)); out += sizeof(size_t);
+    if (logits_size) {
+        memcpy(out, ctx->logits.data(), logits_size * sizeof(float));
+    }
+    out += logits_capacity * sizeof(float);
+    memcpy(out, &embedding_size, sizeof(size_t)); out += sizeof(size_t);
+    if (embedding_size) {
+        memcpy(out, ctx->embedding.data(), embedding_size * sizeof(float)); out += embedding_size * sizeof(float);
+    }
+    memcpy(out, &kv_size, sizeof(size_t)); out += sizeof(size_t);
+    memcpy(out, &kv_ntok, sizeof(int)); out += sizeof(int);
+    if (kv_size) {
+        memcpy(out, llama_get_kv_cache(ctx), kv_size); out += kv_size;
+    }
+    const size_t written = out - dest;
+    const size_t expected = llama_get_state_size(ctx);
+    LLAMA_ASSERT(written == expected);
+    return written;
+}
+
+// Sets the state reading from the specified source address
+size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
+    size_t rng_size;
+    char rng_buf[64*1024];
+    std::stringstream rng_ss;
+
+    const uint8_t * in = src;
+    memcpy(&rng_size, in, sizeof(size_t)); in += sizeof(size_t);
+    memcpy(&rng_buf[0], in, 64*1024); in += 64*1024;
+    rng_ss.str(std::string(&rng_buf[0], rng_size));
+    rng_ss >> ctx->rng;
+    LLAMA_ASSERT(rng_ss.fail() == false);
+
+    size_t logits_capacity;
+    size_t logits_size;
+    size_t embedding_size;
+    size_t kv_size;
+    int kv_ntok;
+
+    memcpy(&logits_capacity, in, sizeof(size_t)); in += sizeof(size_t);
+    memcpy(&logits_size, in, sizeof(size_t)); in += sizeof(size_t);
+    LLAMA_ASSERT(ctx->logits.capacity() == logits_capacity);
+    if (logits_size) {
+        ctx->logits.resize(logits_size);
+        memcpy(ctx->logits.data(), in, logits_size * sizeof(float));
+    }
+    in += logits_capacity * sizeof(float);
+    memcpy(&embedding_size, in, sizeof(size_t)); in += sizeof(size_t);
+    LLAMA_ASSERT(ctx->embedding.capacity() == embedding_size);
+    if (embedding_size) {
+        memcpy(ctx->embedding.data(), in, embedding_size * sizeof(float));
+        in += embedding_size * sizeof(float);
+    }
+    memcpy(&kv_size, in, sizeof(size_t)); in += sizeof(size_t);
+    memcpy(&kv_ntok, in, sizeof(int)); in += sizeof(int);
+    if (kv_size) {
+        LLAMA_ASSERT(ctx->model.kv_self.buf.size == kv_size);
+        void * k_data = ctx->model.kv_self.k->data; // remember data pointers
+        void * v_data = ctx->model.kv_self.v->data; // because their value is stored in buf and overwritten by memcpy
+        memcpy(ctx->model.kv_self.buf.addr, in, kv_size);
+        ctx->model.kv_self.k->data = k_data; // restore correct data pointers
+        ctx->model.kv_self.v->data = v_data;
+        in += kv_size;
+    }
+    ctx->model.kv_self.n = kv_ntok;
+    const size_t nread = in - src;
+    const size_t expected = llama_get_state_size(ctx);
+    LLAMA_ASSERT(nread == expected);
+    return nread;
 }
