@@ -133,6 +133,8 @@ def init_library():
     handle.generate.restype = generation_outputs
 
 def load_model(model_filename):
+    global maxctx
+
     inputs = load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
     inputs.lora_filename = args.lora.encode("UTF-8")
@@ -162,7 +164,7 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
     
     # enforce the maximum lenght of generated tokens and context informed at program arguments, 
     # useful to do avoid timeouts when using this program with KoboldHorde
-    global maxlen, ctxlen
+    global maxlen, maxctx
     if max_length > maxlen:
         max_length = maxlen
     if max_context_length > maxctx:
@@ -202,8 +204,8 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
 #################################################################
 friendlymodelname = "concedo/koboldcpp"  # local KoboldAI-United API needs a model name registered at HuggingFace. This is the placeholder: https://huggingface.co/concedo/koboldcpp
-maxctx = 2048
-maxlen = 128
+maxctx = 1024
+maxlen = 80
 modelbusy = False
 defaultport = 5001
 KcppVersion = "1.21.3"
@@ -517,6 +519,10 @@ def main(args):
 
     #gustrd fork
     global friendlymodelname, maxctx, maxlen
+
+    if args.contextsize:  
+        maxctx = args.contextsize
+    
     # parameters useful when joining the KoboldHorde
     if args.kobold_horde_model_name:
         friendlymodelname = "KoboldCPP/" + args.kobold_horde_model_name
@@ -558,9 +564,6 @@ def main(args):
                 print("High Priority for Other OS Set :" + str(oldprio) + " to " + str(process.nice()))
         except Exception as ex:
              print("Error, Could not change process priority: " + str(ex))
-
-    if args.contextsize:  
-        maxctx = args.contextsize
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
     print("==========")
