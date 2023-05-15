@@ -158,7 +158,7 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85, rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
+def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85, typical_p=1, tfs=1.0, rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
     
     # enforce the maximum lenght of generated tokens and context informed at program arguments, 
     # useful to do avoid timeouts when using this program with KoboldHorde
