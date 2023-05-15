@@ -73,7 +73,6 @@ lib_openblas = pick_existant_file("koboldcpp_openblas.dll","koboldcpp_openblas.s
 lib_openblas_noavx2 = pick_existant_file("koboldcpp_openblas_noavx2.dll","koboldcpp_openblas_noavx2.so")
 lib_clblast = pick_existant_file("koboldcpp_clblast.dll","koboldcpp_clblast.so")
 
-
 def init_library():
     global handle
     global lib_default,lib_noavx2,lib_openblas,lib_openblas_noavx2,lib_clblast
@@ -203,8 +202,8 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
 #################################################################
 friendlymodelname = "concedo/koboldcpp"  # local KoboldAI-United API needs a model name registered at HuggingFace. This is the placeholder: https://huggingface.co/concedo/koboldcpp
-# maxctx = 2048 #gustrd fork
-# maxlen = 128 #gustrd fork
+maxctx = 2048
+maxlen = 128
 modelbusy = False
 defaultport = 5001
 KcppVersion = "1.21.3"
