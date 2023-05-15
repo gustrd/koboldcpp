@@ -4,6 +4,7 @@ const int stop_token_max = 10;
 struct load_model_inputs
 {
     const int threads;
+    const int blasthreads;
     const int max_context_length;
     const int batch_size;
     const bool f16_kv;
@@ -11,10 +12,13 @@ struct load_model_inputs
     const char * model_filename;
     const char * lora_filename;
     const bool use_mmap;
+    const bool use_mlock;
     const bool use_smartcontext;
     const bool unban_tokens;
     const int clblast_info = 0;
     const int blasbatchsize = 512;
+    const bool debugmode;
+    const int forceversion = 0;
 };
 struct generation_inputs
 {
@@ -25,8 +29,13 @@ struct generation_inputs
     const float temperature;
     const int top_k;
     const float top_p;
+    const float typical_p;
+    const float tfs;
     const float rep_pen;
     const int rep_pen_range;
+    const int mirostat = 0;
+    const float mirostat_eta;
+    const float mirostat_tau;
     const char * stop_sequence[stop_token_max];
 };
 struct generation_outputs

@@ -130,7 +130,7 @@ void print_tok_vec(std::vector<float> &embd)
        else if(vocabsiz < 31998 || vocabsiz > 33000)
        {
            //anything outside the llama v1 range is assumed to be NeoX
-           fileformat = FileFormat::NEOX_1;
+           fileformat = FileFormat::NEOX_2;
        }
     }
     else if(magic == 0x67676d66) //v2 format ggmf
@@ -145,7 +145,21 @@ void print_tok_vec(std::vector<float> &embd)
     }
     else if(magic == 0x67676a74) //v3 format ggjt
     {
-        fileformat = FileFormat::GGJT; //ggjt by default
+        fileformat = FileFormat::GGJT_2; //ggjt by default
+        uint32_t ver, temp, ftype;
+        fin.read((char *)&ver, sizeof(ver)); //file version
+        fin.read((char *)&temp, sizeof(temp));//vocab
+        fin.read((char *)&temp, sizeof(temp)); //embd
+        fin.read((char *)&temp, sizeof(temp)); //mult
+        fin.read((char *)&temp, sizeof(temp));//head
+        fin.read((char *)&temp, sizeof(temp));//layer
+        fin.read((char *)&temp, sizeof(temp));//rot
+        fin.read((char *)&ftype, sizeof(ftype));//filetype
+
+        if(ver==1 || ftype==7) //q8 formats treat as old one
+        {
+            fileformat = FileFormat::GGJT;
+        }
     }
     fin.close();
     

@@ -15,12 +15,15 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 - [Download the latest release here](https://github.com/LostRuins/koboldcpp/releases/latest) or clone the repo.
 - Windows binaries are provided in the form of **koboldcpp.exe**, which is a pyinstaller wrapper for a few **.dll** files and **koboldcpp.py**. If you feel concerned, you may prefer to rebuild it yourself with the provided makefiles and scripts.
 - Weights are not included, you can use the official llama.cpp `quantize.exe` to generate them from your official weight files (or download them from other places).
-- To run, execute **koboldcpp.exe** or drag and drop your quantized `ggml_model.bin` file onto the .exe, and then connect with Kobold or Kobold Lite. 
+- To run, execute **koboldcpp.exe** or drag and drop your quantized `ggml_model.bin` file onto the .exe, and then connect with Kobold or Kobold Lite. If you're not on windows, then run the script **KoboldCpp.py** after compiling the libraries.
 - By default, you can connect to http://localhost:5001 
 - You can also run it using the command line `koboldcpp.exe [ggml_model.bin] [port]`. For info, please check `koboldcpp.exe --help` 
-- If you are having crashes or issues with OpenBLAS, please try the `--noblas` flag.
+- If you are having crashes or issues, you can try turning off BLAS with the `--noblas` flag. You can also try running in a non-avx2 compatibility mode with `--noavx2`. Lastly, you can try turning off mmap with `--nommap`. 
+- Big context still too slow? Try the `--smartcontext` flag to reduce prompt processing frequency. Also, you can try to run with your GPU using CLBlast, with `--useclblast` flag for a speedup
 
-## Compiling at Windows
+For more information, be sure to run the program with the --help flag.
+
+## Compiling on Windows
 - If you want to compile your binaries from source at Windows, the easiest way is:
   - Use the latest release of w64devkit (https://github.com/skeeto/w64devkit). Be sure to use the "vanilla one", not i686 or other different stuff. If you try they will conflit with the precompiled libs!
   - Make sure you are using the w64devkit integrated terminal, then run 'make' at the KoboldCpp source folder. This will create the .dll files.
@@ -40,9 +43,10 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
 - If you want you can also link your own install of OpenBLAS manually with `make LLAMA_OPENBLAS=1`
 - Alternatively, if you want you can also link your own install of CLBlast manually with `make LLAMA_CLBLAST=1`, for this you will need to obtain and link OpenCL and CLBlast libraries.
 - For a full featured build, do `make LLAMA_OPENBLAS=1 LLAMA_CLBLAST=1`
-  - For Arch Linux: Install `cblas` and `openblas`. 
+  - For Arch Linux: Install `cblas` `openblas` and `clblast`. 
   - For Debian: Install `libclblast-dev` and `libopenblas-dev`.
 - After all binaries are built, you can run the python script with the command `koboldcpp.py [ggml_model.bin] [port]`
+- Note: Many OSX users have found that the using Accelerate is actually faster than OpenBLAS. To try, you may wish to run with `--noblas` and compare speeds.
 
 ## Considerations
 - ZERO or MINIMAL changes as possible to parent repo files - do not move their function declarations elsewhere! We want to be able to update the repo and pull any changes automatically.
@@ -64,6 +68,6 @@ What does it mean? You get llama.cpp with a fancy UI, persistent stories, editin
   - LLAMA (All versions including ggml, ggmf, ggjt, gpt4all). Supports CLBlast and OpenBLAS acceleration for all versions.
   - GPT-2 (All versions, including legacy f16, newer format + quanitzed, cerebras) Supports OpenBLAS acceleration only for newer format. 
   - GPT-J (All versions including legacy f16, newer format + quantized, pyg.cpp, new pygmalion, janeway etc.) Supports OpenBLAS acceleration only for newer format. 
-  - RWKV (f16 GGMF format), unaccelerated due to RNN properties.
-  - GPT-NeoX / Pythia
+  - RWKV (all formats except Q4_1_O).
+  - GPT-NeoX / Pythia / StableLM / Dolly / RedPajama
   - Basically every single current and historical GGML format that has ever existed should be supported, except for bloomz.cpp due to lack of demand.

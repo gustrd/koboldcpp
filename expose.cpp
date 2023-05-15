@@ -35,19 +35,30 @@ extern "C"
     {
         std::string model = inputs.model_filename;
         lora_filename = inputs.lora_filename;
-        file_format = check_file_format(model.c_str());
+
+        int forceversion = inputs.forceversion;
+
+        if(forceversion==0)
+        {
+            file_format = check_file_format(model.c_str());
+        }
+        else
+        {
+            printf("\nWARNING: FILE FORMAT FORCED TO VER %d\nIf incorrect, loading may fail or crash.\n",forceversion);
+            file_format = (FileFormat)forceversion;
+        }
 
         //first digit is whether configured, second is platform, third is devices
         int parseinfo = inputs.clblast_info;
 
-        std::string usingclblast = "KCPP_CLBLAST_CONFIGURED="+std::to_string(parseinfo>0?1:0);
+        std::string usingclblast = "GGML_CLBLAST_CONFIGURED="+std::to_string(parseinfo>0?1:0);
         putenv((char*)usingclblast.c_str());
 
         parseinfo = parseinfo%100; //keep last 2 digits
         int platform = parseinfo/10;
         int devices = parseinfo%10;
-        platformenv = "KCPP_CLBLAST_PLATFORM="+std::to_string(platform);
-        deviceenv = "KCPP_CLBLAST_DEVICES="+std::to_string(devices);
+        platformenv = "GGML_CLBLAST_PLATFORM="+std::to_string(platform);
+        deviceenv = "GGML_CLBLAST_DEVICE="+std::to_string(devices);
         putenv((char*)platformenv.c_str());
         putenv((char*)deviceenv.c_str());
         executable_path = inputs.executable_path;
@@ -117,10 +128,22 @@ extern "C"
                 return true;
             }
         }
-        else if(file_format==FileFormat::NEOX_1)
+        else if(file_format==FileFormat::NEOX_1 || file_format==FileFormat::NEOX_2 || file_format==FileFormat::NEOX_3)
         {
             printf("\n---\nIdentified as GPT-NEO-X model: (ver %d)\nAttempting to Load...\n---\n", file_format);
-            ModelLoadResult lr = gpttype_load_model(inputs, file_format);          
+            ModelLoadResult lr = gpttype_load_model(inputs, file_format);
+            if (lr == ModelLoadResult::RETRY_LOAD)
+            {
+                file_format = FileFormat::NEOX_3;
+                printf("\n---\nRetrying as GPT-NEO-X model: (ver %d)\nAttempting to Load...\n---\n", file_format);
+                lr = gpttype_load_model(inputs, file_format);
+            }
+            if (lr == ModelLoadResult::RETRY_LOAD)
+            {
+                file_format = FileFormat::NEOX_1;
+                printf("\n---\nRetrying as GPT-NEO-X model: (ver %d)\nAttempting to Load...\n---\n", file_format);
+                lr = gpttype_load_model(inputs, file_format);
+            }    
             if (lr == ModelLoadResult::FAIL || lr == ModelLoadResult::RETRY_LOAD)
             {
                 return false;

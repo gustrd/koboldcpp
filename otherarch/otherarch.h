@@ -23,7 +23,7 @@ struct gptj_hparams {
     int32_t n_head  = 16;
     int32_t n_layer = 28;
     int32_t n_rot   = 64;
-    int32_t f16     = 1;
+    int32_t ftype   = 1;
 };
 
 struct gptj_layer {
@@ -120,7 +120,7 @@ struct gpt2_hparams {
     int32_t n_embd  = 768;
     int32_t n_head  = 12;
     int32_t n_layer = 12;
-    int32_t f16     = 1;
+    int32_t ftype     = 1;
 };
 
 struct gpt2_v1_layer {
@@ -271,61 +271,4 @@ struct stablelm_model {
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
-struct rwkv_layer {
-    struct ggml_rwkv_tensor * ln1_weight;
-    struct ggml_rwkv_tensor * ln1_bias;
 
-    // RWKV, also called "attention" by the author.
-    struct ggml_rwkv_tensor * att_time_mix_k;
-    struct ggml_rwkv_tensor * att_time_mix_v;
-    struct ggml_rwkv_tensor * att_time_mix_r;
-    struct ggml_rwkv_tensor * att_time_first;
-    struct ggml_rwkv_tensor * att_time_decay;
-    struct ggml_rwkv_tensor * att_key;
-    struct ggml_rwkv_tensor * att_value;
-    struct ggml_rwkv_tensor * att_receptance;
-    struct ggml_rwkv_tensor * att_output;
-
-    struct ggml_rwkv_tensor * ln2_weight;
-    struct ggml_rwkv_tensor * ln2_bias;
-
-    // FFN.
-    struct ggml_rwkv_tensor * ffn_time_mix_k;
-    struct ggml_rwkv_tensor * ffn_time_mix_r;
-    struct ggml_rwkv_tensor * ffn_key;
-    struct ggml_rwkv_tensor * ffn_value;
-    struct ggml_rwkv_tensor * ffn_receptance;
-};
-
-struct rwkv_model {
-    int32_t n_vocab;
-    int32_t n_layer;
-    int32_t n_embed;
-    // 0 for float32, 1 for float16.
-    int32_t data_type;
-
-    struct ggml_rwkv_tensor * emb;
-
-    struct ggml_rwkv_tensor * ln0_weight;
-    struct ggml_rwkv_tensor * ln0_bias;
-
-    std::vector<rwkv_layer> layers;
-
-    struct ggml_rwkv_tensor * ln_out_weight;
-    struct ggml_rwkv_tensor * ln_out_bias;
-
-    struct ggml_rwkv_tensor * head;
-};
-struct rwkv_context {
-    struct rwkv_model * model;
-    struct ggml_rwkv_tensor * token_index;
-    struct ggml_rwkv_tensor * state;
-    struct ggml_rwkv_tensor ** state_parts;
-    struct ggml_rwkv_tensor * logits;
-    struct ggml_rwkv_context * ctx;
-    struct ggml_rwkv_cgraph * graph;
-    bool freed;
-    float * state_in = 0; //stores input state, or use null for a new state
-    float * state_out = 0; //stores address of output state buffer
-    float * logits_out = 0; //stores address of output logit buffer
-};

@@ -2,6 +2,7 @@
 #include "otherarch.h"
 
 #include "utils.h"
+#include "common-ggml.h"
 
 #include <cassert>
 #include <cmath>
@@ -17,13 +18,13 @@
 
 
 // load the model's weights from a file
-bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_vocab & vocab) {
+ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_vocab & vocab, FileFormat file_format) {
     printf("%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
     if (!fin) {
         fprintf(stderr, "%s: failed to open '%s'\n", __func__, fname.c_str());
-        return false;
+        return ModelLoadResult::FAIL;
     }
 
     // verify magic
@@ -32,7 +33,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         fin.read((char *) &magic, sizeof(magic));
         if (magic != 0x67676d6c) {
             fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", __func__, fname.c_str());
-            return false;
+            return ModelLoadResult::FAIL;
         }
     }
 
@@ -76,23 +77,12 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
 
     // for the big tensors, we have the option to store the data in 16-bit floats or quantized
     // in order to save memory and also to speed up the computation
-    ggml_type wtype = GGML_TYPE_COUNT;
-    switch (model.hparams.ftype) {
-        case 0: wtype = GGML_TYPE_F32;  break;
-        case 1: wtype = GGML_TYPE_F16;  break;
-        case 2: wtype = GGML_TYPE_Q4_0; break;
-        case 3: wtype = GGML_TYPE_Q4_1; break;
-        case 5: wtype = GGML_TYPE_Q4_2; break;
-        case 6: wtype = GGML_TYPE_Q4_3; break;
-        default:
-                {
-                    fprintf(stderr, "%s: invalid model file '%s' (bad ftype value %d)\n",
-                            __func__, fname.c_str(), model.hparams.ftype);
-                    return false;
-                }
+    ggml_type wtype = ggml_ftype_to_ggml_type((ggml_ftype) (model.hparams.ftype));
+    if (wtype == GGML_TYPE_COUNT) {
+        fprintf(stderr, "%s: invalid model file '%s' (bad ftype value %d)\n",
+                __func__, fname.c_str(), model.hparams.ftype);
+        return ModelLoadResult::FAIL;
     }
-
-    const ggml_type wtype2 = GGML_TYPE_F32;
 
     auto & ctx = model.ctx;
 
@@ -151,7 +141,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         model.ctx = ggml_init(params);
         if (!model.ctx) {
             fprintf(stderr, "%s: ggml_init() failed\n", __func__);
-            return false;
+            return ModelLoadResult::FAIL;
         }
     }
 
@@ -276,19 +266,19 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
 
             if (model.tensors.find(name.data()) == model.tensors.end()) {
                 fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
-                return false;
+                return ModelLoadResult::FAIL;
             }
 
             auto tensor = model.tensors[name.data()];
             if (ggml_nelements(tensor) != nelements) {
                 fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
-                return false;
+                return ModelLoadResult::FAIL;
             }
 
             if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1]) {
                 fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%5d, %5d], expected [%5d, %5d]\n",
                         __func__, name.data(), (int) tensor->ne[0], (int) tensor->ne[1], ne[0], ne[1]);
-                return false;
+                return ModelLoadResult::FAIL;
             }
 
             // for debugging
@@ -296,12 +286,30 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
                 printf("%24s - [%5d, %5d], type = %6s, %6.2f MB, %9zu bytes\n", name.data(), ne[0], ne[1], ggml_type_name(ggml_type(ttype)), ggml_nbytes(tensor)/1024.0/1024.0, ggml_nbytes(tensor));
             }
 
-            const size_t bpe = ggml_type_size(ggml_type(ttype));
+            size_t bpe = ggml_type_size(ggml_type(ttype));
+
+            if(file_format==FileFormat::NEOX_1)
+            {
+                switch (ttype) {
+                    case 0: bpe = ggml_type_size(GGML_TYPE_F32);  break;
+                    case 1: bpe = ggml_type_size(GGML_TYPE_F16);  break;
+                    case 2: bpe = ggml_type_size(GGML_TYPE_Q4_0); assert(ne[0] % 64 == 0); break;
+                    case 3: bpe = ggml_type_size(GGML_TYPE_Q4_1); assert(ne[0] % 64 == 0); break;
+                    case 5: bpe = ggml_type_size(GGML_TYPE_Q4_2); assert(ne[0] % 64 == 0); break;
+                    case 6: bpe = ggml_type_size(GGML_TYPE_Q4_3); assert(ne[0] % 64 == 0); break;
+                    default:
+                    {
+                        fprintf(stderr, "%s: unknown ftype %d in model file\n", __func__, ttype);
+                        return ModelLoadResult::FAIL;
+                    }
+                };
+            }
 
             if ((nelements*bpe)/ggml_blck_size(tensor->type) != ggml_nbytes(tensor)) {
                 fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %zu, expected %zu\n",
                         __func__, name.data(), ggml_nbytes(tensor), nelements*bpe);
-                return false;
+                 ggml_free(ctx);
+                 return ModelLoadResult::RETRY_LOAD;
             }
 
             fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
@@ -320,7 +328,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
 
     fin.close();
 
-    return true;
+    return ModelLoadResult::SUCCESS;
 }
 
 // evaluate the transformer
@@ -337,7 +345,8 @@ bool stablelm_eval(
         const int n_past,
         const std::vector<gpt_vocab::id> & embd_inp,
               std::vector<float>         & embd_w,
-              size_t                     & mem_per_token) {
+              size_t                     & mem_per_token,
+              FileFormat file_format) {
     const int N = embd_inp.size();
 
     const auto & hparams = model.hparams;
@@ -352,8 +361,8 @@ bool stablelm_eval(
     static size_t buf_size = 256u*1024*1024;
     static void * buf = malloc(buf_size);
 
-    if (mem_per_token > 0 && mem_per_token*N*1.9 > buf_size) {
-        const size_t buf_size_new = 320u*1024*1024 + 2*(mem_per_token*N); // add 10% to account for ggml object overhead
+    if (mem_per_token > 0 && (mem_per_token*N*2 + 48u*1024*1024) > buf_size) {
+        const size_t buf_size_new = 360u*1024*1024 + 2*(mem_per_token*N); // add 10% to account for ggml object overhead
         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
         // reallocate
@@ -486,6 +495,12 @@ bool stablelm_eval(
             }
         }
 
+        if(file_format==FileFormat::NEOX_3)
+        {
+            // layer input + Attn
+            cur  = ggml_add(ctx0, cur, inpL);
+        }
+
         struct ggml_tensor * inpFF = cur;
 
         // feed-forward network
@@ -494,7 +509,7 @@ bool stablelm_eval(
             // post attention layer norm
             // note here we pass inpL instead of cur
             {
-                cur = ggml_norm(ctx0, inpL);
+                cur = ggml_norm(ctx0, (file_format==FileFormat::NEOX_3?cur:inpL));
 
                 cur = ggml_add(ctx0,
                     ggml_mul(ctx0,
@@ -525,11 +540,17 @@ bool stablelm_eval(
                     cur);
         }
 
-        // layer input + FF
-        cur  = ggml_add(ctx0, cur, inpFF);
-
-        // input for next layer
-        inpL = ggml_add(ctx0, cur, inpL);
+        if (file_format == FileFormat::NEOX_3)
+        {
+            // layer input + FF
+            inpL = ggml_add(ctx0, cur, inpFF);
+        }
+        else
+        {
+            cur = ggml_add(ctx0, cur, inpFF);
+            // input for next layer
+            inpL = ggml_add(ctx0, cur, inpL);
+        }
     }
 
     // norm
