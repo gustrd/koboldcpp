@@ -559,8 +559,7 @@ def main(args):
         except Exception as ex:
              print("Error, Could not change process priority: " + str(ex))
 
-    if args.contextsize:
-        global maxctx       
+    if args.contextsize:  
         maxctx = args.contextsize
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
