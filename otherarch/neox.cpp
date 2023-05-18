@@ -2,7 +2,6 @@
 #include "otherarch.h"
 
 #include "utils.h"
-#include "common-ggml.h"
 
 #include <cassert>
 #include <cmath>
@@ -13,12 +12,11 @@
 #include <string>
 #include <vector>
 #include <iostream>
-#include <unistd.h>
 
 
 
 // load the model's weights from a file
-ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_vocab & vocab, FileFormat file_format) {
+ModelLoadResult gpt_neox_model_load(const std::string & fname, gpt_neox_model & model, gpt_vocab & vocab, FileFormat file_format) {
     printf("%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
@@ -40,14 +38,24 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
     // load hparams
     {
         auto & hparams = model.hparams;
-
+        hparams.par_res = 1; //true
         fin.read((char *) &hparams.n_vocab, sizeof(hparams.n_vocab));
         fin.read((char *) &hparams.n_ctx,   sizeof(hparams.n_ctx));
         fin.read((char *) &hparams.n_embd,  sizeof(hparams.n_embd));
         fin.read((char *) &hparams.n_head,  sizeof(hparams.n_head));
         fin.read((char *) &hparams.n_layer, sizeof(hparams.n_layer));
         fin.read((char *) &hparams.n_rot,   sizeof(hparams.n_rot));
+        if(file_format!=FileFormat::NEOX_1 && file_format!=FileFormat::NEOX_2 && file_format!=FileFormat::NEOX_3)
+        {
+            fin.read((char *) &hparams.par_res, sizeof(hparams.par_res));
+        }
+        if(file_format==FileFormat::NEOX_3)
+        {
+            hparams.par_res = 0;
+        }
         fin.read((char *) &hparams.ftype,   sizeof(hparams.ftype));
+
+        const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
 
         printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
         printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
@@ -55,7 +63,11 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
         printf("%s: n_head  = %d\n", __func__, hparams.n_head);
         printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
         printf("%s: n_rot   = %d\n", __func__, hparams.n_rot);
+        printf("%s: par_res = %d\n", __func__, hparams.par_res);
         printf("%s: ftype   = %d\n", __func__, hparams.ftype);
+        printf("%s: qntvr   = %d\n", __func__, qntvr);
+
+        hparams.ftype %= GGML_QNT_VERSION_FACTOR;
     }
 
     // load vocab
@@ -125,19 +137,18 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
         ctx_size += n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32); // memory_k
         ctx_size += n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32); // memory_v
 
-        ctx_size += (6 + 16*n_layer)*256; // object overhead
+        ctx_size += (6 + 16*n_layer)*512; // object overhead
 
         printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
 
     // create the ggml context
     {
-        struct ggml_init_params params = {
-            .mem_size   = ctx_size,
-            .mem_buffer = NULL,
-            .no_alloc   = false,
-        };
-
+        struct ggml_init_params params;
+        params.mem_size   = ctx_size;
+        params.mem_buffer = NULL;
+        params.no_alloc   = false;
+        
         model.ctx = ggml_init(params);
         if (!model.ctx) {
             fprintf(stderr, "%s: ggml_init() failed\n", __func__);
@@ -151,7 +162,6 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
 
         const int n_embd  = hparams.n_embd;
         const int n_layer = hparams.n_layer;
-        const int n_ctx   = hparams.n_ctx;
         const int n_vocab = hparams.n_vocab;
 
         model.layers.resize(n_layer);
@@ -223,15 +233,15 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
         const int n_layer = hparams.n_layer;
         const int n_ctx   = hparams.n_ctx;
 
-        const int n_mem      = n_layer*n_ctx;
-        const int n_elements = n_embd*n_mem;
+        const int64_t n_mem      = n_layer*n_ctx;
+        const int64_t n_elements = n_embd*n_mem;
 
         model.memory_k = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n_elements);
         model.memory_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n_elements);
 
         const size_t memory_size = ggml_nbytes(model.memory_k) + ggml_nbytes(model.memory_v);
 
-        printf("%s: memory_size = %8.2f MB, n_mem = %d\n", __func__, memory_size/1024.0/1024.0, n_mem);
+        printf("%s: memory_size = %8.2f MB, n_mem = %" PRId64 "\n", __func__, memory_size/1024.0/1024.0, n_mem);
     }
 
     // load weights
@@ -331,6 +341,43 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
     return ModelLoadResult::SUCCESS;
 }
 
+
+// feed-forward network
+ggml_tensor * gpt_neox_ff(
+        const gpt_neox_layer &layer,
+        ggml_context * ctx0,
+        ggml_tensor * inp) {
+    ggml_tensor * cur = ggml_norm(ctx0, inp);
+
+    cur = ggml_add(ctx0,
+        ggml_mul(ctx0,
+            ggml_repeat(ctx0, layer.ln_2_g, cur),
+            cur),
+        ggml_repeat(ctx0, layer.ln_2_b, cur));
+
+    cur = ggml_mul_mat(ctx0,
+            layer.c_mlp_fc_w,
+            cur);
+
+    cur = ggml_add(ctx0,
+            ggml_repeat(ctx0, layer.c_mlp_fc_b, cur),
+            cur);
+
+    // GELU activation
+    cur = ggml_gelu(ctx0, cur);
+
+    // projection
+    // cur = proj_w*cur + proj_b
+    cur = ggml_mul_mat(ctx0,
+            layer.c_mlp_proj_w,
+            cur);
+
+    cur = ggml_add(ctx0,
+            ggml_repeat(ctx0, layer.c_mlp_proj_b, cur),
+            cur);
+    return cur;
+}
+
 // evaluate the transformer
 //
 //   - model:     the model
@@ -339,14 +386,13 @@ ModelLoadResult stablelm_model_load(const std::string & fname, stablelm_model & 
 //   - embd_inp:  the embeddings of the tokens in the context
 //   - embd_w:    the predicted logits for the next token
 //
-bool stablelm_eval(
-        const stablelm_model & model,
+bool gpt_neox_eval(
+        const gpt_neox_model & model,
         const int n_threads,
         const int n_past,
         const std::vector<gpt_vocab::id> & embd_inp,
               std::vector<float>         & embd_w,
-              size_t                     & mem_per_token,
-              FileFormat file_format) {
+              size_t                     & mem_per_token) {
     const int N = embd_inp.size();
 
     const auto & hparams = model.hparams;
@@ -361,7 +407,7 @@ bool stablelm_eval(
     static size_t buf_size = 256u*1024*1024;
     static void * buf = malloc(buf_size);
 
-    if (mem_per_token > 0 && (mem_per_token*N*2 + 48u*1024*1024) > buf_size) {
+    if (mem_per_token > 0 && (mem_per_token*N*2 + 64u*1024*1024) > buf_size) {
         const size_t buf_size_new = 360u*1024*1024 + 2*(mem_per_token*N); // add 10% to account for ggml object overhead
         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
@@ -374,14 +420,15 @@ bool stablelm_eval(
         }
     }
 
-    struct ggml_init_params params = {
-        .mem_size   = buf_size,
-        .mem_buffer = buf,
-        .no_alloc   = false,
-    };
+    struct ggml_init_params params;
+    params.mem_size   = buf_size;
+    params.mem_buffer = buf;
+    params.no_alloc   = false;
+    
 
     struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph gf = { .n_threads = n_threads };
+    struct ggml_cgraph gf = {};
+    gf.n_threads = n_threads;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     memcpy(embd->data, embd_inp.data(), N*ggml_element_size(embd));
@@ -420,8 +467,8 @@ bool stablelm_eval(
             struct ggml_tensor * Vcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd/n_head, n_head, N, cur->nb[1]/n_head, cur->nb[1], 2*sizeof(float)*n_embd/n_head));
 
             // using mode = 2 for GPT-NeoX mode
-            Qcur = ggml_rope(ctx0, Qcur, n_past, n_rot, 2);
-            Kcur = ggml_rope(ctx0, Kcur, n_past, n_rot, 2);
+            Qcur = ggml_rope_inplace(ctx0, Qcur, n_past, n_rot, 2);
+            Kcur = ggml_rope_inplace(ctx0, Kcur, n_past, n_rot, 2);
 
             // store key and value to memory
             {
@@ -455,16 +502,16 @@ bool stablelm_eval(
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
             struct ggml_tensor * KQ_scaled =
-                ggml_scale(ctx0,
+                ggml_scale_inplace(ctx0,
                         KQ,
                         ggml_new_f32(ctx0, 1.0f/sqrt(float(n_embd)/n_head))
                         );
 
             // KQ_masked = mask_past(KQ_scaled)
-            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
+            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, n_past);
 
             // KQ = soft_max(KQ_masked)
-            struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_masked);
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
             struct ggml_tensor * V =
@@ -495,59 +542,23 @@ bool stablelm_eval(
             }
         }
 
-        if(file_format==FileFormat::NEOX_3)
-        {
-            // layer input + Attn
-            cur  = ggml_add(ctx0, cur, inpL);
-        }
+        if (hparams.par_res == 0) {
+            struct ggml_tensor * inpFF = ggml_add(ctx0, cur, inpL);
 
-        struct ggml_tensor * inpFF = cur;
+            cur = gpt_neox_ff(model.layers[il], ctx0, inpFF);
 
-        // feed-forward network
-        // this is independent of the self-attention result, so it could be done in parallel to the self-attention
-        {
-            // post attention layer norm
-            // note here we pass inpL instead of cur
-            {
-                cur = ggml_norm(ctx0, (file_format==FileFormat::NEOX_3?cur:inpL));
-
-                cur = ggml_add(ctx0,
-                    ggml_mul(ctx0,
-                        ggml_repeat(ctx0, model.layers[il].ln_2_g, cur),
-                        cur),
-                    ggml_repeat(ctx0, model.layers[il].ln_2_b, cur));
-            }
-
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_fc_w,
-                    cur);
-
-            cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, model.layers[il].c_mlp_fc_b, cur),
-                    cur);
-
-            // GELU activation
-            cur = ggml_gelu(ctx0, cur);
-
-            // projection
-            // cur = proj_w*cur + proj_b
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_proj_w,
-                    cur);
-
-            cur = ggml_add(ctx0,
-                    ggml_repeat(ctx0, model.layers[il].c_mlp_proj_b, cur),
-                    cur);
-        }
-
-        if (file_format == FileFormat::NEOX_3)
-        {
-            // layer input + FF
+            // input for next layer
             inpL = ggml_add(ctx0, cur, inpFF);
-        }
-        else
-        {
-            cur = ggml_add(ctx0, cur, inpFF);
+        } else {
+            struct ggml_tensor * inpFF = cur;
+
+            // this is independent of the self-attention result, so it could be done in parallel to the self-attention
+            // note here we pass inpL instead of cur
+            cur = gpt_neox_ff(model.layers[il], ctx0, inpL);
+
+            // layer input + FF
+            cur  = ggml_add(ctx0, cur, inpFF);
+
             // input for next layer
             inpL = ggml_add(ctx0, cur, inpL);
         }
@@ -575,7 +586,7 @@ bool stablelm_eval(
     }
 
     // logits -> probs
-    //inpL = ggml_soft_max(ctx0, inpL);
+    //inpL = ggml_soft_max_inplace(ctx0, inpL);
 
     // run the computation
     ggml_build_forward_expand(&gf, inpL);

@@ -2,7 +2,6 @@
 #include "otherarch.h"
 
 #include "utils.h"
-#include "common-ggml.h"
 
 #include <cassert>
 #include <cmath>
@@ -13,14 +12,15 @@
 #include <string>
 #include <vector>
 #include <iostream>
-#include <unistd.h>
 
 #include "model_adapter.h"
 
-
+#if defined(GGML_USE_CLBLAST)
+#include "ggml-opencl.h"
+#endif
 
 // load the model's weights from a file
-ModelLoadResult gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & vocab, FileFormat file_format) {
+ModelLoadResult gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & vocab, FileFormat file_format, int gpulayers) {
     printf("%s: loading model from '%s'\n", __func__, fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
@@ -50,12 +50,17 @@ ModelLoadResult gpt2_model_load(const std::string & fname, gpt2_model & model, g
         fin.read((char *) &hparams.n_layer, sizeof(hparams.n_layer));
         fin.read((char *) &hparams.ftype,   sizeof(hparams.ftype));
 
+        const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
+
         printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
         printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
         printf("%s: n_embd  = %d\n", __func__, hparams.n_embd);
         printf("%s: n_head  = %d\n", __func__, hparams.n_head);
         printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
         printf("%s: ftype   = %d\n", __func__, hparams.ftype);
+        printf("%s: qntvr   = %d\n", __func__, qntvr);
+
+        hparams.ftype %= GGML_QNT_VERSION_FACTOR;
     }
 
     // load vocab
@@ -133,18 +138,19 @@ ModelLoadResult gpt2_model_load(const std::string & fname, gpt2_model & model, g
         ctx_size += 1.5*(n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32)); // memory_k
         ctx_size += 1.5*(n_ctx*n_layer*n_embd*ggml_type_sizef(GGML_TYPE_F32)); // memory_v
 
-        ctx_size += (6 + 12*n_layer)*256; // object overhead
+        ctx_size += (6 + 12*n_layer)*512; // object overhead
 
+        printf("%s: ggml tensor size = %d bytes\n", __func__, (int) sizeof(ggml_tensor));
         printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
     }
 
     // create the ggml context
     {
-        struct ggml_init_params params = {
-            .mem_size   = ctx_size,
-            .mem_buffer = NULL,
-            .no_alloc   = false,
-        };
+        struct ggml_init_params params;
+        params.mem_size   = ctx_size;
+        params.mem_buffer = NULL;
+        params.no_alloc   = false;
+       
 
         model.ctx = ggml_init(params);
         if (!model.ctx) {
@@ -318,6 +324,51 @@ ModelLoadResult gpt2_model_load(const std::string & fname, gpt2_model & model, g
 
     fin.close();
 
+
+//     //gpu offload for gpt2
+// #if defined(GGML_USE_CLBLAST)
+//     if(gpulayers>0)
+//     {
+//         const auto & hparams = model.hparams;
+//         const int n_gpu = std::min(gpulayers, int(hparams.n_layer));
+//         if(GetQuantsUnshuffled())
+//         {
+//         SetGPULayers(n_gpu);
+
+//         fprintf(stderr, "%s: [opencl] offloading %d layers to GPU\n", __func__, n_gpu);
+
+//         size_t vram_total = 0;
+
+//         for (int i = 0; i < n_gpu; ++i) {
+//             const auto & layer = model.layers[i];
+            
+//             ggml_cl_transform_tensor(layer.ln_1_g); vram_total += ggml_nbytes(layer.ln_1_g);
+//             ggml_cl_transform_tensor(layer.ln_1_b); vram_total += ggml_nbytes(layer.ln_1_b);
+//             ggml_cl_transform_tensor(layer.ln_2_g); vram_total += ggml_nbytes(layer.ln_2_g);
+//             ggml_cl_transform_tensor(layer.ln_2_b); vram_total += ggml_nbytes(layer.ln_2_b);
+//             ggml_cl_transform_tensor(layer.c_attn_attn_w); vram_total += ggml_nbytes(layer.c_attn_attn_w);
+//             ggml_cl_transform_tensor(layer.c_attn_attn_b); vram_total += ggml_nbytes(layer.c_attn_attn_b);
+//             ggml_cl_transform_tensor(layer.c_attn_proj_w); vram_total += ggml_nbytes(layer.c_attn_proj_w);
+//             ggml_cl_transform_tensor(layer.c_attn_proj_b); vram_total += ggml_nbytes(layer.c_attn_proj_b);
+//             ggml_cl_transform_tensor(layer.c_mlp_fc_w); vram_total += ggml_nbytes(layer.c_mlp_fc_w);
+//             ggml_cl_transform_tensor(layer.c_mlp_fc_b); vram_total += ggml_nbytes(layer.c_mlp_fc_b);
+//             ggml_cl_transform_tensor(layer.c_mlp_proj_w); vram_total += ggml_nbytes(layer.c_mlp_proj_w);
+//             ggml_cl_transform_tensor(layer.c_mlp_proj_b); vram_total += ggml_nbytes(layer.c_mlp_proj_b);
+//         }
+
+//         fprintf(stderr, "%s: [opencl] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
+//         }
+//         else
+//         {
+//             if(n_gpu>0)
+//             {
+//                 printf("\n[WARNING: Old format does not support GPU offloading! It will be deactivated!]\n");
+//             }
+//         }
+//     }
+// #endif
+
+
     return ModelLoadResult::SUCCESS;
 }
 
@@ -350,7 +401,7 @@ bool gpt2_eval(
     static size_t buf_size = 256u*1024*1024;
     static void * buf = malloc(buf_size);
 
-    if (mem_per_token > 0 && (mem_per_token*N*2 + 48u*1024*1024) > buf_size) {
+    if (mem_per_token > 0 && (mem_per_token*N*2 + 64u*1024*1024) > buf_size) {
         const size_t buf_size_new = 320u*1024*1024 + 2*(mem_per_token*N); // add 10% to account for ggml object overhead
         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
@@ -367,14 +418,15 @@ bool gpt2_eval(
         }
     }
 
-    struct ggml_init_params params = {
-        .mem_size   = buf_size,
-        .mem_buffer = buf,
-        .no_alloc   = false,
-    };
+    struct ggml_init_params params;
+    params.mem_size   = buf_size;
+    params.mem_buffer = buf;
+    params.no_alloc   = false;
+    
 
     struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph gf = { .n_threads = n_threads };
+    struct ggml_cgraph gf = {};
+    gf.n_threads = n_threads;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     memcpy(embd->data, embd_inp.data(), N*ggml_element_size(embd));
@@ -429,11 +481,10 @@ bool gpt2_eval(
         {
             struct ggml_tensor * Qcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 0*sizeof(float)*n_embd);
             struct ggml_tensor * Kcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 1*sizeof(float)*n_embd);
-            
+            struct ggml_tensor * Vcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
+
             // store key and value to memory
             if (N >= 1) {
-                struct ggml_tensor * Vcur = ggml_view_2d(ctx0, cur, n_embd, N, cur->nb[1], 2*sizeof(float)*n_embd);
-
                 struct ggml_tensor * k = ggml_view_1d(ctx0, model.memory_k, N*n_embd, (ggml_element_size(model.memory_k)*n_embd)*(il*n_ctx + n_past));
                 struct ggml_tensor * v = ggml_view_1d(ctx0, model.memory_v, N*n_embd, (ggml_element_size(model.memory_v)*n_embd)*(il*n_ctx + n_past));
 
@@ -478,18 +529,18 @@ bool gpt2_eval(
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
             // [n_past + N, N, 12]
             struct ggml_tensor * KQ_scaled =
-                ggml_scale(ctx0,
+                ggml_scale_inplace(ctx0,
                         KQ,
                         ggml_new_f32(ctx0, 1.0f/sqrt(float(n_embd)/n_head))
                         );
 
             // KQ_masked = mask_past(KQ_scaled)
             // [n_past + N, N, 12]
-            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
+            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, n_past);
 
             // KQ = soft_max(KQ_masked)
             // [n_past + N, N, 12]
-            struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_masked);
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
             // [n_past + N, 64, 12]
@@ -616,7 +667,7 @@ bool gpt2_eval(
     inpL = ggml_mul_mat(ctx0, model.lm_head, inpL);
 
     // logits -> probs
-    //inpL = ggml_soft_max(ctx0, inpL);
+    //inpL = ggml_soft_max_inplace(ctx0, inpL);
 
     // run the computation
     ggml_build_forward_expand(&gf, inpL);

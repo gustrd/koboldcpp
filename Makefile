@@ -2,6 +2,7 @@ default: koboldcpp koboldcpp_noavx2 koboldcpp_openblas koboldcpp_openblas_noavx2
 simple: koboldcpp koboldcpp_noavx2
 tools: quantize_gpt2 quantize_gptj quantize_llama quantize_neox
 dev: koboldcpp_openblas
+dev2: koboldcpp_clblast
 
 
 ifndef UNAME_S
@@ -42,7 +43,7 @@ endif
 
 # keep standard at C11 and C++11
 CFLAGS   = -I.              -I./include -I./include/CL -I./otherarch -I./otherarch/tools -Ofast -DNDEBUG -std=c11   -fPIC
-CXXFLAGS = -I. -I./examples -I./include -I./include/CL -I./otherarch -I./otherarch/tools -Ofast -DNDEBUG -std=c++11 -fPIC
+CXXFLAGS = -I. -I./examples -I./include -I./include/CL -I./otherarch -I./otherarch/tools -O3 -DNDEBUG -std=c++11 -fPIC
 LDFLAGS  =
 
 # these are used on windows, to build some libraries with extra old device compatibility
@@ -82,6 +83,15 @@ endif
 ifeq ($(UNAME_S),Haiku)
 	CFLAGS   += -pthread
 	CXXFLAGS += -pthread
+endif
+
+ifdef LLAMA_GPROF
+	CFLAGS   += -pg
+	CXXFLAGS += -pg
+endif
+ifdef LLAMA_PERF
+	CFLAGS   += -DGGML_PERF
+	CXXFLAGS += -DGGML_PERF
 endif
 
 # Architecture specific
@@ -216,8 +226,8 @@ ggml_openblas_noavx2.o: ggml.c ggml.h
 	$(CC)  $(CFLAGS) $(OPENBLAS_FLAGS) -c $< -o $@
 ggml_clblast.o: ggml.c ggml.h
 	$(CC)  $(CFLAGS) $(BONUSCFLAGS1) $(BONUSCFLAGS2) $(CLBLAST_FLAGS) -c $< -o $@
-ggml-opencl.o: ggml-opencl.c ggml-opencl.h
-	$(CC) $(CFLAGS) -c $< -o $@
+ggml-opencl.o: ggml-opencl.cpp ggml-opencl.h
+	$(CXX) $(CXXFLAGS) $(CLBLAST_FLAGS) -c $< -o $@
 ggml-opencl-legacy.o: ggml-opencl-legacy.c ggml-opencl-legacy.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -238,6 +248,8 @@ expose.o: expose.cpp expose.h
 
 gpttype_adapter.o: gpttype_adapter.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+gpttype_adapter_clblast.o: gpttype_adapter.cpp
+	$(CXX) $(CXXFLAGS) $(CLBLAST_FLAGS) -c $< -o $@
 
 clean:
 	rm -vf *.o main quantize_llama quantize_gpt2 quantize_gptj quantize_neox quantize-stats perplexity embedding benchmark-matmult save-load-state build-info.h main.exe quantize_llama.exe quantize_gptj.exe quantize_gpt2.exe quantize_neox.exe koboldcpp.dll koboldcpp_openblas.dll koboldcpp_noavx2.dll koboldcpp_openblas_noavx2.dll koboldcpp_clblast.dll koboldcpp.so koboldcpp_openblas.so koboldcpp_noavx2.so koboldcpp_openblas_noavx2.so koboldcpp_clblast.so gptj.exe gpt2.exe
@@ -252,7 +264,7 @@ main: examples/main/main.cpp build-info.h ggml.o llama.o common.o $(OBJS)
 	@echo '====  Run ./main -h for help.  ===='
 	@echo
 
-koboldcpp: ggml.o ggml_v1.o expose.o common.o gpttype_adapter.o
+koboldcpp: ggml.o ggml_v1.o expose.o common.o gpttype_adapter.o $(OBJS)
 	$(DEFAULT_BUILD)
 
 koboldcpp_openblas: ggml_openblas.o ggml_v1.o expose.o common.o gpttype_adapter.o 
@@ -264,7 +276,7 @@ koboldcpp_noavx2: ggml_noavx2.o ggml_v1_noavx2.o expose.o common.o gpttype_adapt
 koboldcpp_openblas_noavx2: ggml_openblas_noavx2.o ggml_v1_noavx2.o expose.o common.o gpttype_adapter.o 
 	$(OPENBLAS_NOAVX2_BUILD)
 
-koboldcpp_clblast: ggml_clblast.o ggml_v1.o expose.o common.o gpttype_adapter.o ggml-opencl.o ggml-opencl-legacy.o
+koboldcpp_clblast: ggml_clblast.o ggml_v1.o expose.o common.o gpttype_adapter_clblast.o ggml-opencl.o ggml-opencl-legacy.o
 	$(CLBLAST_BUILD)
 		
 quantize_llama: examples/quantize/quantize.cpp ggml.o llama.o
