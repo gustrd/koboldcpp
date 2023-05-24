@@ -17,45 +17,45 @@
 #define CL_DMMV_BLOCK_SIZE 32;
 
 #define MULTILINE_QUOTE(...) #__VA_ARGS__
-std::string program_source = MULTILINE_QUOTE(
+static std::string program_source = MULTILINE_QUOTE(
 
 typedef char int8_t;
 typedef uchar uint8_t;
 typedef int int32_t;
 typedef uint uint32_t;
 
-struct block_q4_0
+struct __attribute__ ((packed)) block_q4_0
 {
-    float d;
-    uint8_t qs[16];
+    half d;
+    uint8_t qs[QK4_0 / 2];
 };
 
-struct block_q4_1
+struct __attribute__ ((packed)) block_q4_1
 {
-    float d;
-    float m;
-    uint8_t qs[16];
+    half d;
+    half m;
+    uint8_t qs[QK4_1 / 2];
 };
 
 struct __attribute__ ((packed)) block_q5_0
 {
     half d;
     uint32_t qh;
-    uint8_t qs[16];
+    uint8_t qs[QK5_0 / 2];
 };
 
-struct block_q5_1
+struct __attribute__ ((packed)) block_q5_1
 {
     half d;
     half m;
     uint32_t qh;
-    uint8_t qs[16];
+    uint8_t qs[QK5_1 / 2];
 };
 
-struct block_q8_0
+struct __attribute__ ((packed)) block_q8_0
 {
-    float d;
-    uint8_t qs[32];
+    half d;
+    int8_t qs[QK8_0];
 };
 
 
@@ -66,7 +66,7 @@ __kernel void convert_fp16_to_fp32(__global half* x, __global float* y) {
 }
 
 void dequantize_q4_0(__global const struct block_q4_0* x, const int ib, const int iqs, float* v0, float* v1) {
-    const float d = x[ib].d;
+    const float d = vload_half(0, &x[ib].d);
 
     const uint8_t vui = x[ib].qs[iqs];
 
@@ -77,8 +77,8 @@ void dequantize_q4_0(__global const struct block_q4_0* x, const int ib, const in
     *v1 = (vi1 - 8)*d;
 }
 void dequantize_q4_1(__global const struct block_q4_1* x, const int ib, const int iqs, float* v0, float* v1) {
-    const float d = x[ib].d;
-    const float m = x[ib].m;
+    const float d = vload_half(0, &x[ib].d);
+    const float m = vload_half(0, &x[ib].m);
 
     const uint8_t vui = x[ib].qs[iqs];
 
@@ -89,7 +89,7 @@ void dequantize_q4_1(__global const struct block_q4_1* x, const int ib, const in
     *v1 = vi1*d + m;
 }
 void dequantize_q5_0(__global const struct block_q5_0* x, const int ib, const int iqs, float* v0, float* v1) {
-    const float d = vload_half(0, (__global half*) &x[ib].d);
+    const float d = vload_half(0, &x[ib].d);
 
     uint32_t qh = x[ib].qh;
 
@@ -103,8 +103,8 @@ void dequantize_q5_0(__global const struct block_q5_0* x, const int ib, const in
     *v1 = x1*d;
 }
 void dequantize_q5_1(__global const struct block_q5_1* x, const int ib, const int iqs, float* v0, float* v1) {
-    const float d = vload_half(0, (__global half*) &x[ib].d);
-    const float m = vload_half(0, (__global half*) &x[ib].m);
+    const float d = vload_half(0, &x[ib].d);
+    const float m = vload_half(0, &x[ib].m);
 
     uint32_t qh = x[ib].qh;
 
@@ -118,7 +118,7 @@ void dequantize_q5_1(__global const struct block_q5_1* x, const int ib, const in
     *v1 = x1*d + m;
 }
 void dequantize_q8_0(__global const struct block_q8_0* x, const int ib, const int iqs, float* v0, float* v1) {
-    const float d = x[ib].d;
+    const float d = vload_half(0, &x[ib].d);
 
     const int8_t vi0 = x[ib].qs[iqs + 0];
     const int8_t vi1 = x[ib].qs[iqs + 1];
@@ -198,29 +198,51 @@ __kernel void KERNEL_NAME(__global X_TYPE* x, __local float* tmp, __global float
 }
 );
 
+#define CL_CHECK(err)                                               \
+    do {                                                            \
+        cl_int err_ = (err);                                        \
+        if (err_ != CL_SUCCESS) {                                   \
+            fprintf(stderr, "ggml_opencl: %s error %d at %s:%d\n",  \
+                #err, err_, __FILE__, __LINE__);                    \
+            fprintf(stderr, "You may be out of VRAM. Please check if you have enough.\n");\
+            exit(1);                                                \
+        }                                                           \
+    } while (0)
+
+#define CLBLAST_CHECK(err)                                          \
+    do {                                                            \
+        CLBlastStatusCode err_ = (err);                             \
+        if (err_ != CLBlastSuccess) {                               \
+            fprintf(stderr, "ggml_opencl: %s error %d at %s:%d\n",  \
+                #err, err_, __FILE__, __LINE__);                    \
+            fprintf(stderr, "You may be out of VRAM. Please check if you have enough.\n");\
+            exit(1);                                                \
+        }                                                           \
+    } while (0)
+
 std::array<std::string, 5> dequant_str_keys = {
     "KERNEL_NAME", "X_TYPE", "QUANT_K", "QUANT_R", "DEQUANT_FUNC"
 };
 
 std::array<std::string, 30> dequant_str_values = {
-    "dequantize_row_q4_0", "struct block_q4_0", "32", "2", "dequantize_q4_0",
-    "dequantize_row_q4_1", "struct block_q4_1", "32", "2", "dequantize_q4_1",
-    "dequantize_row_q5_0", "struct block_q5_0", "32", "2", "dequantize_q5_0",
-    "dequantize_row_q5_1", "struct block_q5_1", "32", "2", "dequantize_q5_1",
-    "dequantize_row_q8_0", "struct block_q8_0", "32", "1", "dequantize_q8_0",
+    "dequantize_row_q4_0", "struct block_q4_0", "QK4_0", "QR4_0", "dequantize_q4_0",
+    "dequantize_row_q4_1", "struct block_q4_1", "QK4_1", "QR4_1", "dequantize_q4_1",
+    "dequantize_row_q5_0", "struct block_q5_0", "QK5_0", "QR5_0", "dequantize_q5_0",
+    "dequantize_row_q5_1", "struct block_q5_1", "QK5_1", "QR5_1", "dequantize_q5_1",
+    "dequantize_row_q8_0", "struct block_q8_0", "QK8_0", "QR8_0", "dequantize_q8_0",
     "convert_row_f16", "half", "1", "1", "convert_f16"
 };
 
 std::array<std::string, 30> dequant_mul_mat_vec_str_values = {
-    "dequantize_mul_mat_vec_q4_0", "struct block_q4_0", "32", "2", "dequantize_q4_0",
-    "dequantize_mul_mat_vec_q4_1", "struct block_q4_1", "32", "2", "dequantize_q4_1",
-    "dequantize_mul_mat_vec_q5_0", "struct block_q5_0", "32", "2", "dequantize_q5_0",
-    "dequantize_mul_mat_vec_q5_1", "struct block_q5_1", "32", "2", "dequantize_q5_1",
-    "dequantize_mul_mat_vec_q8_0", "struct block_q8_0", "32", "1", "dequantize_q8_0",
+    "dequantize_mul_mat_vec_q4_0", "struct block_q4_0", "QK4_0", "QR4_0", "dequantize_q4_0",
+    "dequantize_mul_mat_vec_q4_1", "struct block_q4_1", "QK4_1", "QR4_1", "dequantize_q4_1",
+    "dequantize_mul_mat_vec_q5_0", "struct block_q5_0", "QK5_0", "QR5_0", "dequantize_q5_0",
+    "dequantize_mul_mat_vec_q5_1", "struct block_q5_1", "QK5_1", "QR5_1", "dequantize_q5_1",
+    "dequantize_mul_mat_vec_q8_0", "struct block_q8_0", "QK8_0", "QR8_0", "dequantize_q8_0",
     "convert_mul_mat_vec_f16", "half", "1", "1", "convert_f16"
 };
 
-static std::string& sreplace(std::string& s, const std::string& from, const std::string& to) {
+std::string& replace(std::string& s, const std::string& from, const std::string& to) {
     size_t pos = 0;
     while ((pos = s.find(from, pos)) != std::string::npos) {
          s.replace(pos, from.length(), to);
@@ -229,15 +251,15 @@ static std::string& sreplace(std::string& s, const std::string& from, const std:
     return s;
 }
 
-static std::string generate_kernels() {
+std::string generate_kernels() {
     std::stringstream src;
     src << program_source << '\n';
     for (size_t i = 0; i < dequant_str_values.size(); i += dequant_str_keys.size()) {
         std::string dequant_kernel = dequant_template;
         std::string dmmv_kernel = dequant_mul_mat_vec_template;
         for (size_t j = 0; j < dequant_str_keys.size(); j++) {
-            sreplace(dequant_kernel, dequant_str_keys[j], dequant_str_values[i + j]);
-            sreplace(dmmv_kernel, dequant_str_keys[j], dequant_mul_mat_vec_str_values[i + j]);
+            replace(dequant_kernel, dequant_str_keys[j], dequant_str_values[i + j]);
+            replace(dmmv_kernel, dequant_str_keys[j], dequant_mul_mat_vec_str_values[i + j]);
         }
         src << dequant_kernel << '\n';
         src << dmmv_kernel << '\n';
@@ -245,32 +267,21 @@ static std::string generate_kernels() {
     return src.str();
 }
 
-#define CL_CHECK(err, name)                                                                     \
-    do {                                                                                        \
-        cl_int err_ = (err);                                                                    \
-        if (err_ != CL_SUCCESS) {                                                               \
-            fprintf(stderr, "OpenCL %s error %d at %s:%d\n", name, err_, __FILE__, __LINE__);   \
-            fprintf(stderr, "You may be out of VRAM. Please check if you have enough.\n");      \
-            exit(1);                                                                            \
-        }                                                                                       \
-    } while (0)
-
 static cl_platform_id platform;
 static cl_device_id device;
 static cl_context context;
 static cl_command_queue queue;
 static cl_program program;
-static cl_mem cl_buffer_a, cl_buffer_qb, cl_buffer_b, cl_buffer_c;
-static size_t cl_size_a = 0, cl_size_qb = 0, cl_size_b = 0, cl_size_c = 0;
 static cl_kernel convert_row_f16_cl;
 static cl_kernel dequantize_row_q4_0_cl, dequantize_row_q4_1_cl, dequantize_row_q5_0_cl, dequantize_row_q5_1_cl, dequantize_row_q8_0_cl;
 static cl_kernel dequantize_mul_mat_vec_q4_0_cl, dequantize_mul_mat_vec_q4_1_cl, dequantize_mul_mat_vec_q5_0_cl, dequantize_mul_mat_vec_q5_1_cl, dequantize_mul_mat_vec_q8_0_cl, convert_mul_mat_vec_f16_cl;
-static bool fp16_support = false;
+static bool fp16_support;
 
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer) {
     cl_program p;
     char *program_log;
-    size_t program_size, log_size;
+    size_t program_size;
+    size_t log_size;
     int err;
 
     program_size = strlen(program_buffer);
@@ -281,14 +292,17 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
         exit(1);
     }
 
-    err = clBuildProgram(p, 0, NULL, NULL, NULL, NULL);
+    const char* compile_opts = "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math "
+                               "-DQK4_0=32 -DQR4_0=2 -DQK4_1=32 -DQR4_1=2 -DQK5_0=32 -DQR5_0=2 -DQK5_1=32 -DQR5_1=2 -DQK8_0=32 -DQR8_0=1";
+
+    err = clBuildProgram(p, 0, NULL, compile_opts, NULL, NULL);
     if(err < 0) {
 
         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
         program_log = (char*) malloc(log_size + 1);
         program_log[log_size] = '\0';
         clGetProgramBuildInfo(p, dev, CL_PROGRAM_BUILD_LOG, log_size + 1, program_log, NULL);
-        printf("%s\n", program_log);
+        fprintf(stderr, "ggml_opencl: kernel compile error:\n\n%s\n", program_log);
         free(program_log);
         exit(1);
     }
@@ -297,27 +311,168 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
 }
 
 void ggml_cl_init(void) {
-    cl_int err = 0;
-    char * GGML_CLBLAST_PLATFORM = getenv("GGML_CLBLAST_PLATFORM");
-    char * GGML_CLBLAST_DEVICE = getenv("GGML_CLBLAST_DEVICE");
-    int plat_num = (GGML_CLBLAST_PLATFORM == NULL ? 0 : atoi(GGML_CLBLAST_PLATFORM));
-    int dev_num = (GGML_CLBLAST_DEVICE == NULL ? 0 : atoi(GGML_CLBLAST_DEVICE));
-    printf("\nInitializing CLBlast (First Run)...");
-    printf("\nAttempting to use: Platform=%d, Device=%d (If invalid, program will crash)\n",plat_num,dev_num);
-    cl_uint num_platforms;
-    clGetPlatformIDs(0, NULL, &num_platforms);
-    cl_platform_id* platforms = (cl_platform_id*)malloc(num_platforms*sizeof(cl_platform_id));
-    clGetPlatformIDs(num_platforms, platforms, NULL);
-    platform = platforms[plat_num];
-    char platform_buffer[1024];
-    clGetPlatformInfo(platform, CL_PLATFORM_NAME, sizeof(platform_buffer), &platform_buffer, NULL);
-    cl_uint num_devices;
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &num_devices);
-    cl_device_id* devices = (cl_device_id*)malloc(num_devices*sizeof(cl_device_id));
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, num_devices, devices, NULL);
-    device = devices[dev_num];
-    char device_buffer[1024];
-    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_buffer), &device_buffer, NULL);
+    cl_int err;
+
+    struct cl_device;
+    struct cl_platform {
+        cl_platform_id id;
+        unsigned number;
+        char name[128];
+        char vendor[128];
+        struct cl_device * devices;
+        unsigned n_devices;
+        struct cl_device * default_device;
+    };
+
+    struct cl_device {
+        struct cl_platform * platform;
+        cl_device_id id;
+        unsigned number;
+        cl_device_type type;
+        char name[128];
+    };
+
+    enum { NPLAT = 16, NDEV = 16 };
+
+    struct cl_platform platforms[NPLAT];
+    unsigned n_platforms = 0;
+    struct cl_device devices[NDEV];
+    unsigned n_devices = 0;
+    struct cl_device * default_device = NULL;
+
+    platform = NULL;
+    device = NULL;
+
+    cl_platform_id platform_ids[NPLAT];
+    CL_CHECK(clGetPlatformIDs(NPLAT, platform_ids, &n_platforms));
+
+    for (unsigned i = 0; i < n_platforms; i++) {
+        struct cl_platform * p = &platforms[i];
+        p->number = i;
+        p->id = platform_ids[i];
+        CL_CHECK(clGetPlatformInfo(p->id, CL_PLATFORM_NAME, sizeof(p->name), &p->name, NULL));
+        CL_CHECK(clGetPlatformInfo(p->id, CL_PLATFORM_VENDOR, sizeof(p->vendor), &p->vendor, NULL));
+
+        cl_device_id device_ids[NDEV];
+        cl_int clGetDeviceIDsError = clGetDeviceIDs(p->id, CL_DEVICE_TYPE_ALL, NDEV, device_ids, &p->n_devices);
+        if (clGetDeviceIDsError == CL_DEVICE_NOT_FOUND) {
+            p->n_devices = 0;
+        } else {
+            CL_CHECK(clGetDeviceIDsError);
+        }
+        p->devices = p->n_devices > 0 ? &devices[n_devices] : NULL;
+        p->default_device = NULL;
+
+        for (unsigned j = 0; j < p->n_devices; j++) {
+            struct cl_device * d = &devices[n_devices];
+            d->number = n_devices++;
+            d->id = device_ids[j];
+            d->platform = p;
+            CL_CHECK(clGetDeviceInfo(d->id, CL_DEVICE_NAME, sizeof(d->name), &d->name, NULL));
+            CL_CHECK(clGetDeviceInfo(d->id, CL_DEVICE_TYPE, sizeof(d->type), &d->type, NULL));
+            printf("\nPlatform:%d Device:%d  - %s with %s",i,j,p->name,d->name);
+
+            if (p->default_device == NULL && d->type == CL_DEVICE_TYPE_GPU) {
+                p->default_device = d;
+            }
+        }
+
+        if (default_device == NULL && p->default_device != NULL) {
+            default_device = p->default_device;
+        }
+    }
+
+    printf("\n\n");
+
+    if (n_devices == 0) {
+        fprintf(stderr, "ggml_opencl: could find any OpenCL devices.\n");
+        exit(1);
+    }
+
+    char * user_platform_string = getenv("GGML_OPENCL_PLATFORM");
+    char * user_device_string = getenv("GGML_OPENCL_DEVICE");
+    int user_platform_number = -1;
+    int user_device_number = -1;
+
+    unsigned n;
+    if (user_platform_string != NULL && sscanf(user_platform_string, " %u", &n) == 1 && n < n_platforms) {
+        user_platform_number = (int)n;
+    }
+    if (user_device_string != NULL && sscanf(user_device_string, " %u", &n) == 1 && n < n_devices) {
+        user_device_number = (int)n;
+    }
+    if (user_platform_number != -1 && user_device_number != -1) {
+        cl_platform* platform = &platforms[user_platform_number];
+        if ((unsigned)user_device_number >= platform->n_devices) {
+            fprintf(stderr, "ggml_opencl: invalid device number %d\n", user_device_number);
+            exit(1);
+        }
+        default_device = &platform->devices[user_device_number];
+    } else {
+
+        struct cl_device * selected_devices = devices;
+        unsigned n_selected_devices = n_devices;
+
+        if (user_platform_number == -1 && user_platform_string != NULL && user_platform_string[0] != 0) {
+            for (unsigned i = 0; i < n_platforms; i++) {
+                struct cl_platform * p = &platforms[i];
+                if (strstr(p->name, user_platform_string) != NULL ||
+                    strstr(p->vendor, user_platform_string) != NULL) {
+                    user_platform_number = (int)i;
+                    break;
+                }
+            }
+            if (user_platform_number == -1) {
+                fprintf(stderr, "ggml_opencl: no platform matching '%s' was found.\n", user_platform_string);
+                exit(1);
+            }
+        }
+        if (user_platform_number != -1) {
+            struct cl_platform * p = &platforms[user_platform_number];
+            selected_devices = p->devices;
+            n_selected_devices = p->n_devices;
+            default_device = p->default_device;
+            if (n_selected_devices == 0) {
+                fprintf(stderr, "ggml_opencl: selected platform '%s' does not have any devices.\n", p->name);
+                exit(1);
+            }
+        }
+
+        if (user_device_number == -1 && user_device_string != NULL && user_device_string[0] != 0) {
+            for (unsigned i = 0; i < n_selected_devices; i++) {
+                struct cl_device * d = &selected_devices[i];
+                if (strstr(d->name, user_device_string) != NULL) {
+                    user_device_number = d->number;
+                    break;
+                }
+            }
+            if (user_device_number == -1) {
+                fprintf(stderr, "ggml_opencl: no device matching '%s' was found.\n", user_device_string);
+                exit(1);
+            }
+        }
+        if (user_device_number != -1) {
+            selected_devices = &devices[user_device_number];
+            n_selected_devices = 1;
+            default_device = &selected_devices[0];
+        }
+
+        GGML_ASSERT(n_selected_devices > 0);
+
+        if (default_device == NULL) {
+            default_device = &selected_devices[0];
+        }
+    }
+
+    fprintf(stderr, "ggml_opencl: selecting platform: '%s'\n", default_device->platform->name);
+    fprintf(stderr, "ggml_opencl: selecting device: '%s'\n", default_device->name);
+    if (default_device->type != CL_DEVICE_TYPE_GPU) {
+        fprintf(stderr, "ggml_opencl: warning, not a GPU: '%s'.\n", default_device->name);
+    }
+
+    platform = default_device->platform->id;
+    device = default_device->id;
+
     size_t ext_str_size;
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
     char* ext_buffer = (char*) malloc(sizeof(char) * ext_str_size);
@@ -330,65 +485,42 @@ void ggml_cl_init(void) {
         }
     }
     free(ext_buffer);
-    printf("Using Platform: %s Device: %s FP16: %d\n", platform_buffer, device_buffer, fp16_support);
+    fprintf(stderr, "ggml_opencl: device FP16 support: %s\n", fp16_support ? "true" : "false");
     fp16_support = false;
     printf("CL FP16 temporarily disabled pending further optimization.\n");
-    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
-    CL_CHECK(err, "clCreateContext");
-    queue = clCreateCommandQueue(context, device, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err);
-    CL_CHECK(err, "clCreateCommandQueue");
 
-    free(platforms);
-    free(devices);
+    cl_context_properties properties[] = {
+        (intptr_t)CL_CONTEXT_PLATFORM, (intptr_t)platform, 0
+    };
 
-    std::string kernel_src = generate_kernels();
+    CL_CHECK((context = clCreateContext(properties, 1, &device, NULL, NULL, &err), err));
+
+    CL_CHECK((queue = clCreateCommandQueue(context, device, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &err),
+        (err != CL_INVALID_QUEUE_PROPERTIES && err != CL_INVALID_VALUE ? err :
+        (queue = clCreateCommandQueue(context, device, 0, &err), err)
+    )));
+
+    const std::string kernel_src = generate_kernels();
 
     program = build_program_from_source(context, device, kernel_src.c_str());
 
     // FP16 to FP32 kernel
-    convert_row_f16_cl = clCreateKernel(program, "convert_row_f16", &err);
-    CL_CHECK(err, "clCreateKernel");
+    CL_CHECK((convert_row_f16_cl = clCreateKernel(program, "convert_row_f16", &err), err));
 
     // Dequantize kernels
-    dequantize_row_q4_0_cl = clCreateKernel(program, "dequantize_row_q4_0", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_row_q4_1_cl = clCreateKernel(program, "dequantize_row_q4_1", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_row_q5_0_cl = clCreateKernel(program, "dequantize_row_q5_0", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_row_q5_1_cl = clCreateKernel(program, "dequantize_row_q5_1", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_row_q8_0_cl = clCreateKernel(program, "dequantize_row_q8_0", &err);
-    CL_CHECK(err, "clCreateKernel");
+    CL_CHECK((dequantize_row_q4_0_cl = clCreateKernel(program, "dequantize_row_q4_0", &err), err));
+    CL_CHECK((dequantize_row_q4_1_cl = clCreateKernel(program, "dequantize_row_q4_1", &err), err));
+    CL_CHECK((dequantize_row_q5_0_cl = clCreateKernel(program, "dequantize_row_q5_0", &err), err));
+    CL_CHECK((dequantize_row_q5_1_cl = clCreateKernel(program, "dequantize_row_q5_1", &err), err));
+    CL_CHECK((dequantize_row_q8_0_cl = clCreateKernel(program, "dequantize_row_q8_0", &err), err));
 
     // dequant mul mat kernel
-    dequantize_mul_mat_vec_q4_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q4_0", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_mul_mat_vec_q4_1_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q4_1", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_mul_mat_vec_q5_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q5_0", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_mul_mat_vec_q5_1_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q5_1", &err);
-    CL_CHECK(err, "clCreateKernel");
-    dequantize_mul_mat_vec_q8_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q8_0", &err);
-    CL_CHECK(err, "clCreateKernel");
-    convert_mul_mat_vec_f16_cl = clCreateKernel(program, "convert_mul_mat_vec_f16", &err);
-    CL_CHECK(err, "clCreateKernel");
-}
-
-static void ggml_cl_malloc(size_t req_size, size_t* cur_size, cl_mem_flags flags, cl_mem* buf) {
-    if (req_size <= *cur_size) {
-        return;
-    }
-
-    // Reallocate buffer with enough space
-    if (*cur_size > 0) {
-        clReleaseMemObject(*buf);
-    }
-    cl_int err;
-    *buf = clCreateBuffer(context, flags, req_size, NULL, &err);
-    *cur_size = req_size;
-    CL_CHECK(err, "clCreateBuffer");
+    CL_CHECK((dequantize_mul_mat_vec_q4_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q4_0", &err), err));
+    CL_CHECK((dequantize_mul_mat_vec_q4_1_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q4_1", &err), err));
+    CL_CHECK((dequantize_mul_mat_vec_q5_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q5_0", &err), err));
+    CL_CHECK((dequantize_mul_mat_vec_q5_1_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q5_1", &err), err));
+    CL_CHECK((dequantize_mul_mat_vec_q8_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q8_0", &err), err));
+    CL_CHECK((convert_mul_mat_vec_f16_cl = clCreateKernel(program, "convert_mul_mat_vec_f16", &err), err));
 }
 
 static cl_kernel* ggml_get_to_fp32_cl(ggml_type type) {
@@ -467,8 +599,8 @@ static cl_mem ggml_cl_pool_malloc(size_t size, size_t * actual_size, cl_mem_flag
             return mem;
         }
     }
-    cl_mem mem = clCreateBuffer(context, flags, size, NULL, &err);
-    CL_CHECK(err, "clCreateBuffer");
+    cl_mem mem;
+    CL_CHECK((mem = clCreateBuffer(context, flags, size, NULL, &err), err));
     *actual_size = size;
     return mem;
 }
@@ -543,25 +675,30 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
     const int y_ne = ne11 * ne10;
     const int d_ne = ne11 * ne01;
 
-    size_t x_size, y_size, d_size;
-    cl_mem d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    size_t x_size;
+    size_t y_size;
+    size_t d_size;
+    cl_mem d_X;
+    if (src0->backend == GGML_BACKEND_CL) {
+        d_X = *(cl_mem*) src0->data;
+    } else {
+        d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    }
     cl_mem d_Y = ggml_cl_pool_malloc(sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
     cl_mem d_D = ggml_cl_pool_malloc(sizeof(float) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
-
-    cl_int err;
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy data to device
-            err = ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL);
-            err |= ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            if (src0->backend != GGML_BACKEND_CL) {
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+            }
+            CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
 
-            CL_CHECK(clFinish(queue), "clFinish");
+            CL_CHECK(clFinish(queue));
 
             // compute
             cl_event ev_sgemm;
-
             clblast::StatusCode status = (clblast::StatusCode)CLBlastSgemm((CLBlastLayout)clblast::Layout::kColMajor,
                                             (CLBlastTranspose)clblast::Transpose::kYes, (CLBlastTranspose)clblast::Transpose::kNo,
                                             ne01, ne11, ne10,
@@ -573,18 +710,19 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
                                             &queue, &ev_sgemm);
 
             if (status != clblast::StatusCode::kSuccess) {
-                printf("\nF32 Matmul Failed (%d): You may be out of VRAM. Please check if you have enough.\n",status);
+ 				printf("\nF32 Matmul Failed (%d): [dims: %lld,%lld,%lld,%lld] You may be out of VRAM. Please check if you have enough.\n",status,ne00,ne01,ne10,ne11);
                 GGML_ASSERT(false);
             }
 
             // copy dst to host
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
-            err = clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL);
-            CL_CHECK(err, "clEnqueueReadBuffer");
+            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL));
         }
     }
 
-    ggml_cl_pool_free(d_X, x_size);
+    if (src0->backend != GGML_BACKEND_CL) {
+        ggml_cl_pool_free(d_X, x_size);
+    }
     ggml_cl_pool_free(d_Y, y_size);
     ggml_cl_pool_free(d_D, d_size);
 }
@@ -614,12 +752,17 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     const int y_ne = ne11 * ne10;
     const int d_ne = ne11 * ne01;
 
-    size_t x_size, y_size, d_size;
-    cl_mem d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    size_t x_size;
+    size_t y_size;
+    size_t d_size;
+    cl_mem d_X;
+    if (src0->backend == GGML_BACKEND_CL) {
+        d_X = *(cl_mem*) src0->data;
+    } else {
+        d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
+    }
     cl_mem d_Y = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * y_ne, &y_size, CL_MEM_READ_ONLY);
     cl_mem d_D = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * d_ne, &d_size, CL_MEM_WRITE_ONLY);
-
-    cl_int err;
 
     bool src1_cont_rows = nb10 == sizeof(float);
     bool src1_cont_cols = (size_t)nb11 == ne11*sizeof(float);
@@ -627,8 +770,9 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy src0 to device
-            err = ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            if (src0->backend != GGML_BACKEND_CL) {
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+            }
 
             // convert src1 to fp16
             // TODO: use multiple threads
@@ -654,10 +798,9 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
             }
 
             // copy src1 to device
-            err |= clEnqueueWriteBuffer(queue, d_Y, false, 0, sizeof(ggml_fp16_t) * y_ne, tmp, 0, NULL, NULL);
-            CL_CHECK(err, "ggml_cl_h2d_tensor_2d");
+            CL_CHECK(clEnqueueWriteBuffer(queue, d_Y, false, 0, sizeof(ggml_fp16_t) * y_ne, tmp, 0, NULL, NULL));
 
-            CL_CHECK(clFinish(queue), "clFinish");
+            CL_CHECK(clFinish(queue));
 
             // compute
             cl_event ev_sgemm;
@@ -672,12 +815,12 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
                                             &queue, &ev_sgemm);
 
             if (status != clblast::StatusCode::kSuccess) {
-                printf("\nF16 Matmul Failed (%d): You may be out of VRAM. Please check if you have enough.\n",status);
+				printf("\nF16 Matmul Failed (%d): [dims: %lld,%lld,%lld,%lld] You may be out of VRAM. Please check if you have enough.\n",status,ne00,ne01,ne10,ne11);
                 GGML_ASSERT(false);
             }
 
             // copy dst to host, then convert to float
-            err = clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(ggml_fp16_t) * d_ne, tmp, 1, &ev_sgemm, NULL);
+            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(ggml_fp16_t) * d_ne, tmp, 1, &ev_sgemm, NULL));
 
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
 
@@ -685,7 +828,9 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
         }
     }
 
-    ggml_cl_pool_free(d_X, x_size);
+    if (src0->backend != GGML_BACKEND_CL) {
+        ggml_cl_pool_free(d_X, x_size);
+    }
     ggml_cl_pool_free(d_Y, y_size);
     ggml_cl_pool_free(d_D, d_size);
 }
@@ -711,7 +856,10 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
     const int d_ne = ne11 * ne01;
     const size_t q_sz = ggml_type_size(type) * x_ne / ggml_blck_size(type);
 
-    size_t x_size, y_size, d_size, q_size;
+    size_t x_size;
+    size_t y_size;
+    size_t d_size;
+    size_t q_size;
     cl_mem d_X;
     if (!mul_mat_vec) {
         d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size, CL_MEM_READ_WRITE);
@@ -733,7 +881,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
 
             // copy src0 to device if necessary
             if (src0->backend == GGML_BACKEND_CPU) {
-                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Q, 0, src0, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Q, 0, src0, i03, i02, NULL));
             } else if (src0->backend == GGML_BACKEND_CL) {
                 d_Q = *(cl_mem*) src0->data;
             } else {
@@ -741,32 +889,32 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
             }
             if (mul_mat_vec) { // specialized dequantize_mul_mat_vec kernel
                 // copy src1 to device
-                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
 
                 // compute
                 const size_t global = ne01 * CL_DMMV_BLOCK_SIZE;
                 const size_t local = CL_DMMV_BLOCK_SIZE;
                 const cl_int ncols = ne00;
-                CL_CHECK(clSetKernelArg(*dmmv, 0, sizeof(cl_mem), &d_Q), "clSetKernelArg");
-                CL_CHECK(clSetKernelArg(*dmmv, 1, sizeof(float) * local, NULL), "clSetKernelArg");
-                CL_CHECK(clSetKernelArg(*dmmv, 2, sizeof(cl_mem), &d_Y), "clSetKernelArg");
-                CL_CHECK(clSetKernelArg(*dmmv, 3, sizeof(cl_mem), &d_D), "clSetKernelArg");
-                CL_CHECK(clSetKernelArg(*dmmv, 4, sizeof(cl_int), &ncols), "clSetKernelArg");
-                CL_CHECK(clFinish(queue), "clFinish");
-                CL_CHECK(clEnqueueNDRangeKernel(queue, *dmmv, 1, NULL, &global, &local, 0, NULL, &ev_sgemm), "clEnqueueNDRangeKernel");
+                CL_CHECK(clSetKernelArg(*dmmv, 0, sizeof(cl_mem), &d_Q));
+                CL_CHECK(clSetKernelArg(*dmmv, 1, sizeof(float) * local, NULL));
+                CL_CHECK(clSetKernelArg(*dmmv, 2, sizeof(cl_mem), &d_Y));
+                CL_CHECK(clSetKernelArg(*dmmv, 3, sizeof(cl_mem), &d_D));
+                CL_CHECK(clSetKernelArg(*dmmv, 4, sizeof(cl_int), &ncols));
+                CL_CHECK(clFinish(queue));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, *dmmv, 1, NULL, &global, &local, 0, NULL, &ev_sgemm));
             } else { // general dequantization kernel + CLBlast matrix matrix multiplication
                 // convert src0 to fp32 on device
                 const size_t global = x_ne;
-                CL_CHECK(clSetKernelArg(*to_fp32_cl, 0, sizeof(cl_mem), &d_Q), "clSetKernelArg");
-                CL_CHECK(clSetKernelArg(*to_fp32_cl, 1, sizeof(cl_mem), &d_X), "clSetKernelArg");
-                CL_CHECK(clFinish(queue), "clFinish");
-                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, NULL, &global, NULL, 0, NULL, NULL), "clEnqueueNDRangeKernel");
+                CL_CHECK(clSetKernelArg(*to_fp32_cl, 0, sizeof(cl_mem), &d_Q));
+                CL_CHECK(clSetKernelArg(*to_fp32_cl, 1, sizeof(cl_mem), &d_X));
+                CL_CHECK(clFinish(queue));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, NULL, &global, NULL, 0, NULL, NULL));
 
                 // copy src1 to device
-                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL), "ggml_cl_h2d_tensor_2d");
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
 
                 // wait for conversion
-                CL_CHECK(clFinish(queue), "clFinish");
+                CL_CHECK(clFinish(queue));
 
                 // compute
                 clblast::StatusCode status = (clblast::StatusCode)CLBlastSgemm((CLBlastLayout)clblast::Layout::kColMajor,
@@ -780,14 +928,14 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
                                             &queue, &ev_sgemm);
 
                 if (status != clblast::StatusCode::kSuccess) {
-                    printf("\nQF32 Matmul Failed (%d): You may be out of VRAM. Please check if you have enough.\n",status);
+					printf("\nQF32 Matmul Failed (%d): [dims: %lld,%lld,%lld,%lld] You may be out of VRAM. Please check if you have enough.\n",status,ne00,ne01,ne10,ne11);
                     GGML_ASSERT(false);
                 }
             }
 
             // copy dst to host
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
-            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL), "clEnqueueReadBuffer");
+            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL));
             clReleaseEvent(ev_sgemm);
         }
     }
@@ -813,7 +961,7 @@ bool ggml_cl_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
     if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
         src1->type == GGML_TYPE_F32 &&
         dst->type == GGML_TYPE_F32 &&
-        ((GetQuantsUnshuffled() && GetGPULayers()>0 && ne0 >= 32 && ne1 >= 32 && ne10 >= 32) || src0->backend == GGML_BACKEND_CL)) {
+        ((ne0 >= 32 && ne1 >= 32 && ne10 >= 32) || src0->backend == GGML_BACKEND_CL)) {
         return true;
     }
 
@@ -886,120 +1034,12 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             int i = i3*ne2 + i2;
-            CL_CHECK(ggml_cl_h2d_tensor_2d(queue, *dst, i*ne0*ne1, tensor, i3, i2, NULL), "ggml_cl_h2d_tensor_2d");
+            CL_CHECK(ggml_cl_h2d_tensor_2d(queue, *dst, i*ne0*ne1, tensor, i3, i2, NULL));
         }
     }
 
-    CL_CHECK(clFinish(queue), "clFinish");
+    CL_CHECK(clFinish(queue));
 
     tensor->data = dst;
     tensor->backend = GGML_BACKEND_CL;
-}
-
-void ggml_cl_sgemm_wrapper(
-        const enum ggml_blas_order order, const enum ggml_blas_op trans_a, const enum ggml_blas_op trans_b,
-        const int m, const int n, const int k,
-        const float alpha, const void *host_a, const int lda,
-        const float *host_b, const int ldb, const float beta,
-        float *host_c, const int ldc, const int btype) {
-    cl_int err = 0;
-
-    cl_kernel * kernel = ggml_get_to_fp32_cl((ggml_type)btype);
-    size_t global = n * k, local, size_qb;
-    bool dequant;
-
-    switch (btype) {
-    case GGML_TYPE_F32:
-        dequant = false;
-        break;
-    case GGML_TYPE_Q4_0:
-        dequant = true;
-        local = 16;
-        size_qb = global * (sizeof(float) + local) / 32;
-        break;
-    case GGML_TYPE_Q4_1:
-        dequant = true;
-        local = 16;
-        size_qb = global * (sizeof(float) * 2 + local) / 32;
-        break;
-    case GGML_TYPE_Q5_0:
-        dequant = true;
-        local = 16;
-        size_qb = global * (sizeof(ggml_fp16_t) + sizeof(uint32_t) + local) / 32;
-        break;
-    case GGML_TYPE_Q5_1:
-        dequant = true;
-        local = 16;
-        size_qb = global * (sizeof(ggml_fp16_t) * 2 + sizeof(uint32_t) + local) / 32;
-        break;
-    case GGML_TYPE_Q8_0:
-        dequant = true;
-        local = 32;
-        size_qb = global * (sizeof(float) + local) / 32;
-        break;
-    default:
-        fprintf(stderr, "Error: Unsupported OpenCL btype %d\n", btype);
-        abort();
-    }
-
-    const size_t size_a =  m * k * sizeof(float);
-    const size_t size_b =  n * k * sizeof(float);
-    const size_t size_c =  m * n * sizeof(float);
-
-    // Prepare buffers
-    ggml_cl_malloc(size_a, &cl_size_a, CL_MEM_READ_ONLY, &cl_buffer_a);
-    if (dequant) {
-        ggml_cl_malloc(size_qb, &cl_size_qb, CL_MEM_READ_ONLY, &cl_buffer_qb);
-    }
-    ggml_cl_malloc(size_b, &cl_size_b, CL_MEM_READ_WRITE, &cl_buffer_b);
-    ggml_cl_malloc(size_c, &cl_size_c, CL_MEM_WRITE_ONLY, &cl_buffer_c);
-
-    cl_event ev_a, ev_qb, ev_b;
-
-    if (dequant) {
-        err = clSetKernelArg(*kernel, 0, sizeof(cl_mem), &cl_buffer_qb);
-        err |= clSetKernelArg(*kernel, 1, sizeof(cl_mem), &cl_buffer_b);
-        CL_CHECK(err, "clSetKernelArg");
-        err = clEnqueueWriteBuffer(queue, cl_buffer_qb, CL_FALSE, 0, size_qb, host_b, 0, NULL, &ev_qb);
-        CL_CHECK(err, "clEnqueueWriteBuffer qb");
-    } else {
-        err = clEnqueueWriteBuffer(queue, cl_buffer_b, CL_FALSE, 0, size_b, host_b, 0, NULL, &ev_b);
-        CL_CHECK(err, "clEnqueueWriteBuffer b");
-    }
-
-    err = clEnqueueWriteBuffer(queue, cl_buffer_a, CL_FALSE, 0, size_a, host_a, 0, NULL, &ev_a);
-    CL_CHECK(err, "clEnqueueWriteBuffer a");
-    if (dequant) {
-        err = clEnqueueNDRangeKernel(queue, *kernel, 1, NULL, &global, &local, 1, &ev_qb, &ev_b);
-        CL_CHECK(err, "clEnqueueNDRangeKernel");
-        clReleaseEvent(ev_qb);
-    }
-    clWaitForEvents(1, &ev_a);
-    clWaitForEvents(1, &ev_b);
-    clReleaseEvent(ev_a);
-    clReleaseEvent(ev_b);
-
-    cl_event ev_sgemm;
-    CLBlastStatusCode status = CLBlastSgemm((CLBlastLayout)order,
-                                            (CLBlastTranspose)trans_a, (CLBlastTranspose)trans_b,
-                                            m, n, k,
-                                            alpha,
-                                            cl_buffer_a, 0, lda,
-                                            cl_buffer_b, 0, ldb,
-                                            beta,
-                                            cl_buffer_c, 0, ldc,
-                                            &queue, &ev_sgemm);
-
-    if (status != CLBlastSuccess) {
-        fprintf(stderr, "Error: CLBlast SGEMM %d\n", status);
-        abort();
-    }
-
-    cl_event ev_c;
-    clEnqueueReadBuffer(queue, cl_buffer_c, CL_TRUE, 0, size_c, host_c, 1, &ev_sgemm, &ev_c);
-
-    // Wait for completion
-    clWaitForEvents(1, &ev_c);
-    clReleaseEvent(ev_sgemm);
-    clReleaseEvent(ev_c);
 }

@@ -285,6 +285,14 @@ target_compile_features(ggml_v1 PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml_v1 PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
 set_target_properties(ggml_v1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(ggml_v2 OBJECT
+            otherarch/ggml_v2.c
+            otherarch/ggml_v2.h)
+target_include_directories(ggml_v2 PUBLIC . ./otherarch ./otherarch/tools)
+target_compile_features(ggml_v2 PUBLIC c_std_11) # don't bump
+target_link_libraries(ggml_v2 PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+set_target_properties(ggml_v2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(common2
             examples/common.cpp
             examples/common.h)
@@ -314,6 +322,6 @@ target_compile_features(${TARGET} PUBLIC cxx_std_11) # don't bump
 set_target_properties(${TARGET} PROPERTIES PREFIX "")
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "koboldcpp")
 set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(${TARGET} PUBLIC ggml ggml_v1 common2 gpttype_adapter ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC ggml ggml_v1 ggml_v2 common2 gpttype_adapter ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
 

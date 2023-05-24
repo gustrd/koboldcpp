@@ -69,14 +69,14 @@ def pick_existant_file(ntoption,nonntoption):
         return nonntoption
 
 lib_default = pick_existant_file("koboldcpp.dll","koboldcpp.so")
-lib_noavx2 = pick_existant_file("koboldcpp_noavx2.dll","koboldcpp_noavx2.so")
+lib_failsafe = pick_existant_file("koboldcpp_failsafe.dll","koboldcpp_failsafe.so")
 lib_openblas = pick_existant_file("koboldcpp_openblas.dll","koboldcpp_openblas.so")
 lib_openblas_noavx2 = pick_existant_file("koboldcpp_openblas_noavx2.dll","koboldcpp_openblas_noavx2.so")
 lib_clblast = pick_existant_file("koboldcpp_clblast.dll","koboldcpp_clblast.so")
 
 def init_library():
     global handle
-    global lib_default,lib_noavx2,lib_openblas,lib_openblas_noavx2,lib_clblast
+    global lib_default,lib_failsafe,lib_openblas,lib_openblas_noavx2,lib_clblast
 
     libname = ""
     use_blas = False # if true, uses OpenBLAS for acceleration. libopenblas.dll must exist in the same dir.
@@ -88,7 +88,7 @@ def init_library():
         if not file_exists(lib_openblas_noavx2) or (os.name=='nt' and not file_exists("libopenblas.dll")):
             print("Warning: OpenBLAS library file not found. Non-BLAS library will be used.")
         elif args.noblas:
-            print("Attempting to use non-avx2 compatibility library without OpenBLAS.")
+            print("!!! Attempting to use FAILSAFE MODE !!!")
         else:
             use_blas = True
             print("Attempting to use non-avx2 compatibility library with OpenBLAS. A compatible libopenblas will be required.")
@@ -113,7 +113,7 @@ def init_library():
         if use_blas:
             libname = lib_openblas_noavx2
         else:
-            libname = lib_noavx2
+            libname = lib_failsafe            
     else:
         if use_clblast:
             libname = lib_clblast
@@ -201,6 +201,14 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
         return ret.text.decode("UTF-8","ignore")
     return ""
 
+def utfprint(str):
+    try:
+        print(str)
+    except UnicodeEncodeError:
+        # Replace or omit the problematic character
+        utf_string = str.encode('ascii', 'ignore').decode('ascii')
+        print(utf_string)
+
 #################################################################
 ### A hacky simple HTTP server simulating a kobold api by Concedo
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
@@ -210,7 +218,7 @@ maxctx = 1024
 maxlen = 80
 modelbusy = False
 defaultport = 5001
-KcppVersion = "1.23.1"
+KcppVersion = "1.25"
 
 class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     sys_version = ""
@@ -311,7 +319,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(503)
                 self.end_headers()
                 return
-            print("\nInput: " + json.dumps(genparams))
+            utfprint("\nInput: " + json.dumps(genparams))
 
             modelbusy = True
             if kai_api_flag:
@@ -334,10 +342,10 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     tfs=genparams.get('tfs', 1.0),
                     rep_pen=genparams.get('rep_pen', 1.1),
                     rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=-1,
+                    seed=genparams.get('sampler_seed', -1),
                     stop_sequence=genparams.get('stop_sequence', [])
                     )
-                print("\nOutput: " + recvtxt)
+                utfprint("\nOutput: " + recvtxt)
                 res = {"results": [{"text": recvtxt}]}
             else:
                 recvtxt = generate(
@@ -350,10 +358,10 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     tfs=genparams.get('tfs', 1.0),
                     rep_pen=genparams.get('rep_pen', 1.1),
                     rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=-1,
+                    seed=genparams.get('sampler_seed', -1),
                     stop_sequence=genparams.get('stop_sequence', [])
                     )
-                print("\nOutput: " + recvtxt)
+                utfprint("\nOutput: " + recvtxt)
                 res = {"data": {"seqs":[recvtxt]}}
 
             try:
@@ -452,7 +460,7 @@ def show_gui():
                 font = ("Arial", 9)).pack()
 
 
-        opts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use No BLAS","Use OpenBLAS (Old Devices)","Use No BLAS (Old Devices)"]
+        opts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use No BLAS","Use OpenBLAS (Old CPU, noavx2)","Failsafe Mode (Old CPU, noavx)"]
         runchoice = tk.StringVar()
         runchoice.set("Use OpenBLAS")
         tk.OptionMenu( root , runchoice , *opts ).pack()
@@ -494,10 +502,12 @@ def show_gui():
         if selchoice==opts[4]:
             args.noblas = True
         if selchoice==opts[5]:
-            args.nonoavx2 = True
+            args.noavx2 = True
         if selchoice==opts[6]:
-            args.nonoavx2 = True
+            args.noavx2 = True
             args.noblas = True
+            args.nommap = True
+            print("[Failsafe Mode : mmap is disabled.]")
 
         root = tk.Tk()
         root.attributes("-alpha", 0)
