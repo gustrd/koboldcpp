@@ -540,8 +540,6 @@ def main(args):
         maxctx = args.contextsize
     
     # parameters useful when joining the KoboldHorde
-    if args.kobold_horde_model_name:
-        friendlymodelname = "KoboldCPP/" + args.kobold_horde_model_name
     if args.maxctx:
         maxctx = args.maxctx
     if args.maxlen:
@@ -664,7 +662,6 @@ if __name__ == '__main__':
     parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores", type=int, default=default_threads)
     
     #gustrd fork
-    parser.add_argument("--kobold_horde_model_name", help="Use a custom name for the model at KoboldAI API. Use only for KoboldHorde! It breaks KoboldAI-United compability.", type=str, action='store')
     parser.add_argument("--maxctx", help="Maximum context size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
     parser.add_argument("--maxlen", help="Maximum lenght size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
 
