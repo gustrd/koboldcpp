@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <sstream>
+#include <vector>
 
 #define CL_TARGET_OPENCL_VERSION 110
 #include <clblast.h>
@@ -475,16 +476,11 @@ void ggml_cl_init(void) {
 
     size_t ext_str_size;
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
-    char* ext_buffer = (char*) malloc(sizeof(char) * ext_str_size);
+    char *ext_buffer = (char *)alloca(ext_str_size + 1);
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_str_size, ext_buffer, NULL);
+    ext_buffer[ext_str_size] = '\0'; // ensure it is null terminated
     // Check if ext_buffer contains cl_khr_fp16
-    for (size_t i = 0; i < ext_str_size - 12; i++) {
-        if (memcmp(ext_buffer + i, "cl_khr_fp16", 11) == 0) {
-            fp16_support = true;
-            break;
-        }
-    }
-    free(ext_buffer);
+    fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
     fprintf(stderr, "ggml_opencl: device FP16 support: %s\n", fp16_support ? "true" : "false");
     fp16_support = false;
     printf("CL FP16 temporarily disabled pending further optimization.\n");
@@ -680,7 +676,7 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
     size_t d_size;
     cl_mem d_X;
     if (src0->backend == GGML_BACKEND_CL) {
-        d_X = *(cl_mem*) src0->data;
+        d_X = (cl_mem) src0->data;
     } else {
         d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
     }
@@ -757,7 +753,7 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     size_t d_size;
     cl_mem d_X;
     if (src0->backend == GGML_BACKEND_CL) {
-        d_X = *(cl_mem*) src0->data;
+        d_X = (cl_mem) src0->data;
     } else {
         d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size, CL_MEM_READ_ONLY);
     }
@@ -877,41 +873,45 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
-            cl_event ev_sgemm;
+            size_t ev_idx = 0;
+            std::vector<cl_event> events;
 
             // copy src0 to device if necessary
             if (src0->backend == GGML_BACKEND_CPU) {
-                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Q, 0, src0, i03, i02, NULL));
+                events.emplace_back();
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Q, 0, src0, i03, i02, events.data() + ev_idx++));
             } else if (src0->backend == GGML_BACKEND_CL) {
-                d_Q = *(cl_mem*) src0->data;
+                d_Q = (cl_mem) src0->data;
             } else {
                 GGML_ASSERT(false);
             }
             if (mul_mat_vec) { // specialized dequantize_mul_mat_vec kernel
                 // copy src1 to device
-                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
+                events.emplace_back();
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, events.data() + ev_idx++));
 
                 // compute
                 const size_t global = ne01 * CL_DMMV_BLOCK_SIZE;
                 const size_t local = CL_DMMV_BLOCK_SIZE;
                 const cl_int ncols = ne00;
+                events.emplace_back();
                 CL_CHECK(clSetKernelArg(*dmmv, 0, sizeof(cl_mem), &d_Q));
                 CL_CHECK(clSetKernelArg(*dmmv, 1, sizeof(float) * local, NULL));
                 CL_CHECK(clSetKernelArg(*dmmv, 2, sizeof(cl_mem), &d_Y));
                 CL_CHECK(clSetKernelArg(*dmmv, 3, sizeof(cl_mem), &d_D));
                 CL_CHECK(clSetKernelArg(*dmmv, 4, sizeof(cl_int), &ncols));
-                CL_CHECK(clFinish(queue));
-                CL_CHECK(clEnqueueNDRangeKernel(queue, *dmmv, 1, NULL, &global, &local, 0, NULL, &ev_sgemm));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, *dmmv, 1, NULL, &global, &local, events.size() - 1, events.data(), events.data() + ev_idx++));
             } else { // general dequantization kernel + CLBlast matrix matrix multiplication
                 // convert src0 to fp32 on device
                 const size_t global = x_ne;
                 CL_CHECK(clSetKernelArg(*to_fp32_cl, 0, sizeof(cl_mem), &d_Q));
                 CL_CHECK(clSetKernelArg(*to_fp32_cl, 1, sizeof(cl_mem), &d_X));
-                CL_CHECK(clFinish(queue));
-                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, NULL, &global, NULL, 0, NULL, NULL));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, NULL, &global, NULL, events.size(), !events.empty() ? events.data() : NULL, NULL));
 
                 // copy src1 to device
                 CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
+
+                events.emplace_back();
 
                 // wait for conversion
                 CL_CHECK(clFinish(queue));
@@ -925,7 +925,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
                                             d_Y, 0, ne10,
                                             beta,
                                             d_D, 0, ne01,
-                                            &queue, &ev_sgemm);
+                                            &queue, events.data() + ev_idx++);
 
                 if (status != clblast::StatusCode::kSuccess) {
 					printf("\nQF32 Matmul Failed (%d): [dims: %lld,%lld,%lld,%lld] You may be out of VRAM. Please check if you have enough.\n",status,ne00,ne01,ne10,ne11);
@@ -935,8 +935,10 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
 
             // copy dst to host
             float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
-            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &ev_sgemm, NULL));
-            clReleaseEvent(ev_sgemm);
+            CL_CHECK(clEnqueueReadBuffer(queue, d_D, true, 0, sizeof(float) * d_ne, d, 1, &events[events.size() - 1], NULL));
+            for (auto *event : events) {
+                clReleaseEvent(event);
+            }
         }
     }
 
@@ -1027,14 +1029,13 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
     const size_t q_sz = ggml_type_size(type) * ne0 * ne1 * ne2 * ne3 / ggml_blck_size(type);
 
     size_t q_size;
-    cl_mem* dst = (cl_mem*) malloc(sizeof(cl_mem));
-    *dst = ggml_cl_pool_malloc(q_sz, &q_size, CL_MEM_READ_ONLY);
+    cl_mem dst = ggml_cl_pool_malloc(q_sz, &q_size, CL_MEM_READ_ONLY);
 
     // copy tensor to device
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             int i = i3*ne2 + i2;
-            CL_CHECK(ggml_cl_h2d_tensor_2d(queue, *dst, i*ne0*ne1, tensor, i3, i2, NULL));
+            CL_CHECK(ggml_cl_h2d_tensor_2d(queue, dst, i*ne0*ne1, tensor, i3, i2, NULL));
         }
     }
 

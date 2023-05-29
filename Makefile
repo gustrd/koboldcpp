@@ -53,6 +53,7 @@ NONECFLAGS =
 
 OPENBLAS_FLAGS = -DGGML_USE_OPENBLAS -I/usr/local/include/openblas
 CLBLAST_FLAGS = -DGGML_USE_CLBLAST
+FAILSAFE_FLAGS = -DUSE_FAILSAFE
 
 #lets try enabling everything
 CFLAGS   += -pthread -s
@@ -138,9 +139,19 @@ ifdef LLAMA_CUBLAS
 	OBJS      += ggml-cuda.o
 	NVCC      = nvcc
 	NVCCFLAGS = --forward-unknown-to-host-compiler -arch=native
+ifdef LLAMA_CUDA_DMMV_X
+	NVCCFLAGS += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
+else
+	NVCCFLAGS += -DGGML_CUDA_DMMV_X=32
+endif # LLAMA_CUDA_DMMV_X
+ifdef LLAMA_CUDA_DMMV_Y
+	NVCCFLAGS += -DGGML_CUDA_DMMV_Y=$(LLAMA_CUDA_DMMV_Y)
+else
+	NVCCFLAGS += -DGGML_CUDA_DMMV_Y=1
+endif # LLAMA_CUDA_DMMV_Y
 ggml-cuda.o: ggml-cuda.cu ggml-cuda.h
 	$(NVCC) $(NVCCFLAGS) $(CXXFLAGS) -Wno-pedantic -c $< -o $@
-endif
+endif # LLAMA_CUBLAS
 
 ifdef LLAMA_GPROF
 	CFLAGS   += -pg
@@ -262,6 +273,8 @@ common.o: examples/common.cpp examples/common.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 expose.o: expose.cpp expose.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+gpttype_adapter_failsafe.o: gpttype_adapter.cpp
+	$(CXX) $(CXXFLAGS) $(FAILSAFE_FLAGS) -c $< -o $@
 gpttype_adapter.o: gpttype_adapter.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 gpttype_adapter_clblast.o: gpttype_adapter.cpp
@@ -280,7 +293,7 @@ koboldcpp: ggml.o ggml_v2.o ggml_v1.o expose.o common.o gpttype_adapter.o $(OBJS
 	$(DEFAULT_BUILD)
 koboldcpp_openblas: ggml_openblas.o ggml_v2_openblas.o ggml_v1.o expose.o common.o gpttype_adapter.o 
 	$(OPENBLAS_BUILD)	
-koboldcpp_failsafe: ggml_failsafe.o ggml_v2_failsafe.o ggml_v1_failsafe.o expose.o common.o gpttype_adapter.o 
+koboldcpp_failsafe: ggml_failsafe.o ggml_v2_failsafe.o ggml_v1_failsafe.o expose.o common.o gpttype_adapter_failsafe.o 
 	$(FAILSAFE_BUILD)
 koboldcpp_openblas_noavx2: ggml_openblas_noavx2.o ggml_v2_openblas_noavx2.o ggml_v1_failsafe.o expose.o common.o gpttype_adapter.o 
 	$(OPENBLAS_NOAVX2_BUILD)

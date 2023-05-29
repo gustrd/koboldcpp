@@ -23,6 +23,7 @@
 #include "gpt2_v2.cpp"
 #include "gpt2_v3.cpp"
 #include "rwkv_v2.cpp"
+#include "rwkv_v3.cpp"
 #include "neox_v2.cpp"
 #include "neox_v3.cpp"
 
@@ -43,7 +44,8 @@ static gpt2_model gpt2_ctx_v3;
 static gpt_neox_v2_model neox_ctx_v2;
 static gpt_neox_model neox_ctx_v3;
 
-static rwkv_context * rwkv_ctx_v1;
+static rwkv_v2_context * rwkv_ctx_v2;
+static rwkv_context * rwkv_ctx_v3;
 static llama_v2_context_params llama_ctx_params_v2;
 static llama_context_params llama_ctx_params;
 static llama_v2_context * llama_ctx_v2;
@@ -65,6 +67,7 @@ static size_t mem_per_token = 0;
 static std::vector<float> logits;
 static std::vector<int> smartcontext;
 static std::vector<std::string> stop_sequence;
+static std::vector<llama_token_data> top_picks;
 
 inline bool IsNanCheck(float f)
 {
@@ -96,11 +99,26 @@ llama_token sample_token(llama_token_data_array * candidates, std::mt19937 & rng
     llama_sample_softmax(nullptr, candidates);
     std::vector<float> probs;
     probs.reserve(candidates->size);
+    top_picks.clear();
     for (size_t i = 0; i < candidates->size; ++i) {
-        probs.push_back(candidates->data[i].p);
+        probs.push_back(candidates->data[i].p);        
     }
+
     std::discrete_distribution<> dist(probs.begin(), probs.end());
     int idx = dist(rng);
+
+    if(debugmode)
+    {
+        top_picks.push_back(candidates->data[idx]);
+        for (size_t i = 0; (i < candidates->size && i<4); ++i) 
+        {          
+            if(i!=idx)
+            {
+                top_picks.push_back(candidates->data[i]);
+            }
+        }        
+    }
+
     llama_token result = candidates->data[idx].id;
     return result;
 }
@@ -159,7 +177,37 @@ llama_token sample_token_mirostat_v2(llama_token_data_array * candidates, std::m
     return X;
 }
 
-int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float top_k, float top_p, float typical_p, float tfs, float temp, std::mt19937 & rng,
+// Top-a (remove all tokens that have softmax probability less than top_a*m^2 where m is the maximum softmax probability)
+// top-a 0 is off (no effect)
+void sample_top_a(llama_token_data_array * candidates, float a, size_t min_keep) {
+    if (a <= 0.0f || candidates->size<=1) {
+        return;
+    }
+
+    llama_sample_softmax(nullptr, candidates);
+
+    // Compute the cumulative probabilities
+    float maxprob = candidates->data[0].p;
+    
+    float threshold = a * maxprob * maxprob; //tokens with probs less than this are removed
+    size_t last_idx = candidates->size;
+
+    for (size_t i = 0; i < candidates->size; ++i) {       
+        // Go until we reach a value under the threshold
+        float checkprob = candidates->data[i].p;
+        if (checkprob < threshold && i >= min_keep) {
+            last_idx = i;
+            break;
+        }
+    }
+    // printf("\n\nCandidates: %d, A:%f, MaxProb: %f, Threshold: %f, LastIdx: %d",candidates->size,a,maxprob,threshold,last_idx);
+    // printf("\nCandidates: %f %f %f %f\n",candidates->data[0].p,candidates->data[1].p,candidates->data[2].p,candidates->data[3].p);
+
+    // Resize the output vector to keep only the selected tokens
+    candidates->size = last_idx;
+}
+
+int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float top_k, float top_a, float top_p, float typical_p, float tfs, float temp, std::mt19937 & rng,
 int mirostat, float mirostat_tau, float mirostat_eta)
 {
     int id = 0;
@@ -205,6 +253,7 @@ int mirostat, float mirostat_tau, float mirostat_eta)
         {
             // Temperature sampling
             llama_sample_top_k(nullptr, &candidates_p, top_k,1);
+            sample_top_a(&candidates_p,top_a,1);
             llama_sample_tail_free(nullptr, &candidates_p, tfs,1);
             llama_sample_typical(nullptr, &candidates_p, typical_p,1);
             llama_sample_top_p(nullptr, &candidates_p, top_p,1);
@@ -214,6 +263,22 @@ int mirostat, float mirostat_tau, float mirostat_eta)
     }
 
     return id;
+}
+
+static std::string FileFormatTokenizeID(int id, FileFormat file_format)
+{
+    if (file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2)
+    {
+        return std::string(llama_v2_token_to_str(llama_ctx_v2, id));
+    }
+    else if (file_format == FileFormat::GGJT_3)
+    {
+        return std::string(llama_token_to_str(llama_ctx_v3, id));
+    }
+    else
+    {
+        return vocab.id_to_token[id];
+    }
 }
 
 ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in_file_format)
@@ -325,45 +390,78 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         return ModelLoadResult::SUCCESS;
     }
-    else if (file_format == FileFormat::RWKV_1)
+    else if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
     {
-        rwkv_ctx_v1 = rwkv_init_from_file(modelname.c_str(), n_threads);
-
-        //setup buffers for rwkv state
-        auto padding = 512u;
-        auto statebufsiz = rwkv_get_state_buffer_element_count(rwkv_ctx_v1) * sizeof(float) + padding;
-        auto logitbufsiz = rwkv_get_logits_buffer_element_count(rwkv_ctx_v1) * sizeof(float) + padding;
-
-        printf("\nRWKV Init: State Buffer:%u, Logit Buffer:%u\n", statebufsiz, logitbufsiz);
-        rwkv_ctx_v1->state_out = (float *)malloc(statebufsiz);
-        rwkv_ctx_v1->logits_out = (float *)malloc(logitbufsiz);
-        rwkv_ctx_v1->state_in = nullptr;
         n_batch = 1;
-
         std::string word;
         read_rwkv_vocab();
         int vocabsiz = rwkv_vocab.size();
-        for (int i = 0; i < vocabsiz; i++) {
+        for (int i = 0; i < vocabsiz; i++)
+        {
             uint32_t len;
             word = rwkv_vocab[i];
             vocab.token_to_id[word] = i;
             vocab.id_to_token[i] = word;
         }
-        printf("\nRWKV Vocab: %u\n",vocabsiz);
-
-        bool testeval = rwkv_eval(rwkv_ctx_v1, 0, rwkv_ctx_v1->state_in, rwkv_ctx_v1->state_out, rwkv_ctx_v1->logits_out);
-        if(!testeval)
-        {
-            printf("\nError: RWKV Init Eval Failed!\n");
-        }
+        printf("\nRWKV Vocab: %u\n", vocabsiz);
         logits.resize(vocabsiz);
-        memcpy(logits.data(), rwkv_ctx_v1->logits_out, sizeof(float)*vocabsiz);
 
-        if (rwkv_ctx_v1 == NULL)
+        if (file_format == FileFormat::RWKV_1)
         {
-            return ModelLoadResult::FAIL;
+            rwkv_ctx_v2 = rwkv_v2_init_from_file(modelname.c_str(), n_threads);
+
+            //setup buffers for rwkv state
+            auto padding = 512u;
+            auto statebufsiz = rwkv_v2_get_state_buffer_element_count(rwkv_ctx_v2) * sizeof(float) + padding;
+            auto logitbufsiz = rwkv_v2_get_logits_buffer_element_count(rwkv_ctx_v2) * sizeof(float) + padding;
+
+            printf("\nRWKV old Init: State Buffer:%u, Logit Buffer:%u\n", statebufsiz, logitbufsiz);
+            rwkv_ctx_v2->state_out = (float *)malloc(statebufsiz);
+            rwkv_ctx_v2->logits_out = (float *)malloc(logitbufsiz);
+            rwkv_ctx_v2->state_in = nullptr;
+
+            bool testeval = rwkv_v2_eval(rwkv_ctx_v2, 0, rwkv_ctx_v2->state_in, rwkv_ctx_v2->state_out, rwkv_ctx_v2->logits_out);
+            if (!testeval)
+            {
+                printf("\nError: RWKV old Init Eval Failed!\n");
+            }
+
+            memcpy(logits.data(), rwkv_ctx_v2->logits_out, sizeof(float) * vocabsiz);
+
+            if (rwkv_ctx_v2 == NULL)
+            {
+                return ModelLoadResult::FAIL;
+            }
+            return ModelLoadResult::SUCCESS;
         }
-        return ModelLoadResult::SUCCESS;
+        else
+        {
+            rwkv_ctx_v3 = rwkv_init_from_file(modelname.c_str(), n_threads);
+
+            //setup buffers for rwkv state
+            auto padding = 512u;
+            auto statebufsiz = rwkv_get_state_buffer_element_count(rwkv_ctx_v3) * sizeof(float) + padding;
+            auto logitbufsiz = rwkv_get_logits_buffer_element_count(rwkv_ctx_v3) * sizeof(float) + padding;
+
+            printf("\nRWKV Init: State Buffer:%u, Logit Buffer:%u\n", statebufsiz, logitbufsiz);
+            rwkv_ctx_v3->state_out = (float *)malloc(statebufsiz);
+            rwkv_ctx_v3->logits_out = (float *)malloc(logitbufsiz);
+            rwkv_ctx_v3->state_in = nullptr;
+
+            bool testeval = rwkv_eval(rwkv_ctx_v3, 0, rwkv_ctx_v3->state_in, rwkv_ctx_v3->state_out, rwkv_ctx_v3->logits_out);
+            if (!testeval)
+            {
+                printf("\nError: RWKV Init Eval Failed!\n");
+            }
+
+            memcpy(logits.data(), rwkv_ctx_v3->logits_out, sizeof(float) * vocabsiz);
+
+            if (rwkv_ctx_v3 == NULL)
+            {
+                return ModelLoadResult::FAIL;
+            }
+            return ModelLoadResult::SUCCESS;
+        }
     }
     else if (file_format == FileFormat::GPT2_1)
     {
@@ -593,7 +691,6 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 }
 
 
-
 generation_outputs gpttype_generate(const generation_inputs inputs, generation_outputs &output)
 {
     stop_sequence.clear();
@@ -678,7 +775,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
     n_past = 0;
 
-    if (file_format == FileFormat::RWKV_1)
+    if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
     {
         ContextFastForward(current_context_tokens, embd_inp, n_past, last_n_tokens, nctx, smartcontext, false, true);
     }
@@ -692,7 +789,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                             file_format == FileFormat::GPT2_1 || 
                             file_format == FileFormat::GPTJ_1 ||
                             file_format == FileFormat::GPTJ_2 || 
-                            file_format == FileFormat::RWKV_1);
+                            file_format == FileFormat::RWKV_1 || 
+                            file_format==FileFormat::RWKV_2);
     bool blasmode = (approved_format && embd_inp.size() >= 32 && ggml_cpu_has_blas());
     // bool blasmode = false;
     int original_batch = params.n_batch;
@@ -771,16 +869,31 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     {
         n_vocab = neox_ctx_v3.hparams.n_vocab;
     }
-    else if(file_format == FileFormat::RWKV_1)
+    else if(file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
     {
         n_vocab = vocab.id_to_token.size(); //handled seperately
         if(n_past==0)
         {
-            rwkv_ctx_v1->state_in = nullptr;
+            if(file_format == FileFormat::RWKV_1)
+            {
+                rwkv_ctx_v2->state_in = nullptr;
+            }
+            else
+            {
+                rwkv_ctx_v3->state_in = nullptr;
+            }
         }
         else
         {
-            rwkv_ctx_v1->state_in = rwkv_ctx_v1->state_out;
+            if (file_format == FileFormat::RWKV_1)
+            {
+                rwkv_ctx_v2->state_in = rwkv_ctx_v2->state_out;
+            }
+            else
+            {
+                rwkv_ctx_v3->state_in = rwkv_ctx_v3->state_out;
+            }
+
             //if it's empty, push in the final previous token
             if(embd_inp.size()==0 && current_context_tokens.size()>0)
             {
@@ -795,66 +908,46 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
 
     printf("\n");
 
-    if(debugmode)
+    if (debugmode)
     {
-        printf("\n[Debug: Dump Input Tokens, format: %d]\n",file_format);
-        if (file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2)
-        {
-            for (auto id : embd_inp)
-            {
-                printf("'%s (%d)', ",llama_v2_token_to_str(llama_ctx_v2, id),id);
-            }
+        std::string outstr = "";
+        printf("\n[Debug: Dump Input Tokens, format: %d]\n", file_format);
 
-            printf("\n\n[Debug: Context Size = %d]\n",current_context_tokens.size());
-            for (auto id : current_context_tokens)
-            {
-                printf("'%s (%d)', ",llama_v2_token_to_str(llama_ctx_v2, id),id);
-            }
-        }
-        else if (file_format == FileFormat::GGJT_3)
+        std::string tmp = "";
+        for (auto id : embd_inp)
         {
-            for (auto id : embd_inp)
-            {
-                printf("'%s (%d)', ",llama_token_to_str(llama_ctx_v3, id),id);
-            }
-            printf("\n\n[Debug: Context Size = %d]\n",current_context_tokens.size());
-            for (auto id : current_context_tokens)
-            {
-                printf("'%s (%d)', ",llama_token_to_str(llama_ctx_v3, id),id);
-            }
+            tmp += "'" + FileFormatTokenizeID(id, file_format) + " (" + std::to_string(id) + ")', ";
         }
-        else
+        ::utreplace(tmp, "\n", "\\n");
+        outstr += tmp;
+
+        outstr += "\n\n[Debug: Context Size = " + std::to_string(current_context_tokens.size()) + "]\n";
+        tmp = "";
+        for (auto id : current_context_tokens)
         {
-            for (auto id : embd_inp)
-            {
-                printf("'%s (%d)', ",vocab.id_to_token[id].c_str(),id);
-            }
-            printf("\n\n[Debug: Context Size = %d]\n",current_context_tokens.size());
-             for (auto id : current_context_tokens)
-            {
-                printf("'%s (%d)', ",vocab.id_to_token[id].c_str(),id);
-            }
+            tmp += "'" + FileFormatTokenizeID(id, file_format) + " (" + std::to_string(id) + ")', ";
         }
+        ::utreplace(tmp, "\n", "\\n");
+        outstr += tmp;
+        printf(outstr.c_str());
+
         printf("\n\n");
     }
-    
+
     while (remaining_tokens > 0)
     {
         gpt_vocab::id id = 0;
         // predict
         unsigned int embdsize = embd.size();
+        //print progress
+        if (!startedsampling)
+        {
+            printf("\rProcessing Prompt%s (%d / %d tokens)", (blasmode ? " [BLAS]" : ""), input_consumed, embd_inp.size());
+        }        
+        fflush(stdout);
+
         if (embdsize > 0)
         {
-            //print progress
-            if (!startedsampling)
-            {
-                printf("\rProcessing Prompt%s (%d / %d tokens)", (blasmode ? " [BLAS]" : ""), input_consumed, embd_inp.size());
-            }
-            else
-            {
-                printf("\rGenerating (%d / %d tokens)", (1 + params.n_predict - remaining_tokens), params.n_predict);
-            }
-            fflush(stdout);
 
             bool evalres = false;
 
@@ -866,11 +959,20 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             {
                 evalres = (llama_eval(llama_ctx_v3, embd.data(), embdsize, n_past, params.n_threads)==0);
             }
-            else if(file_format==FileFormat::RWKV_1)
+            else if(file_format==FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
             {
-                evalres = rwkv_eval(rwkv_ctx_v1, embd[0], rwkv_ctx_v1->state_in, rwkv_ctx_v1->state_out, rwkv_ctx_v1->logits_out);
-                memcpy(logits.data(), rwkv_ctx_v1->logits_out, sizeof(float)*rwkv_vocab.size());
-                rwkv_ctx_v1->state_in = rwkv_ctx_v1->state_out;
+                if (file_format == FileFormat::RWKV_1)
+                {
+                    evalres = rwkv_v2_eval(rwkv_ctx_v2, embd[0], rwkv_ctx_v2->state_in, rwkv_ctx_v2->state_out, rwkv_ctx_v2->logits_out);
+                    memcpy(logits.data(), rwkv_ctx_v2->logits_out, sizeof(float) * rwkv_vocab.size());
+                    rwkv_ctx_v2->state_in = rwkv_ctx_v2->state_out;
+                }
+                else
+                {
+                    evalres = rwkv_eval(rwkv_ctx_v3, embd[0], rwkv_ctx_v3->state_in, rwkv_ctx_v3->state_out, rwkv_ctx_v3->logits_out);
+                    memcpy(logits.data(), rwkv_ctx_v3->logits_out, sizeof(float) * rwkv_vocab.size());
+                    rwkv_ctx_v3->state_in = rwkv_ctx_v3->state_out;
+                }
             }
             else if(file_format==FileFormat::GPT2_1)
             {
@@ -926,6 +1028,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             const float top_k = params.top_k;
             const float top_p = params.top_p;
             const float temp = params.temp;
+            const float top_a = inputs.top_a;
             const float repeat_penalty = params.repeat_penalty;
             const float typical_p = params.typical_p;
             const float tfs_z = params.tfs_z;
@@ -940,38 +1043,35 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                 printf("\n");
             }
 
+            unsigned int eosID = 0;
+            float * logitsPtr;
             if(file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2 || file_format == FileFormat::GGJT_3)
             {
-                float * logits;
                 if(file_format == FileFormat::GGJT_3)
                 {
-                    logits = llama_get_logits(llama_ctx_v3);
+                    logitsPtr = llama_get_logits(llama_ctx_v3);
                 }
                 else
                 {
-                    logits = llama_v2_get_logits(llama_ctx_v2);
+                    logitsPtr = llama_v2_get_logits(llama_ctx_v2);
                 }
 
+                eosID = llama_token_eos();
+               
                 if (!unbanTokens)
                 {
                     // set the logit of the eos token (2) to zero to avoid sampling it
-                    logits[llama_token_eos()] = 0;
-                    //set logits of opening square bracket to zero.
-                    logits[518] = 0;
-                    logits[29961] = 0;
+                    logitsPtr[eosID] = 0;
                 }
-
-                id = SampleLogits(logits, nctx, n_vocab, last_n_size, repeat_penalty, 
-                top_k, top_p, typical_p, tfs_z, temp, rng,
-                params.mirostat,params.mirostat_tau,params.mirostat_eta);
-
             }
             else
             {
+                logitsPtr = logits.data();
                 if (!unbanTokens)
                 {
-                    // set the logit of the eos token (2) to zero to avoid sampling it
-                    if ((file_format == FileFormat::GPT2_1 ||
+                    //gpt2 uses negative logits, so we cant zero it
+                    // set the logit of the eos token to minimum to avoid sampling it
+                    if (file_format == FileFormat::GPT2_1 ||
                          file_format == FileFormat::GPT2_2 ||
                          file_format == FileFormat::GPT2_3 ||
                          file_format == FileFormat::GPT2_4 ||
@@ -979,19 +1079,39 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                          file_format == FileFormat::GPTJ_2 ||
                          file_format == FileFormat::GPTJ_3 ||
                          file_format == FileFormat::GPTJ_4 ||
-                         file_format == FileFormat::GPTJ_5) &&
-                        logits.size() > 50256)
+                         file_format == FileFormat::GPTJ_5)
                     {
-                        logits[50256] = (logits[50256] < 0 ? logits[50256] : 0);
+                        eosID = 50256;
+                        if(logits.size() > eosID)
+                        {
+                            int topid = std::min_element(logits.begin(),logits.end())-logits.begin();
+                            logits[eosID] = (logits[topid] < 0 ? logits[topid] : 0);
+                        }
                     }
-                    //gpt2 uses negative logits, so we cant zero it
+                        
+                     // set the logit of the eos token (0) to minimum to avoid sampling it
+                    if (file_format == FileFormat::RWKV_1 ||
+                        file_format == FileFormat::RWKV_2 ||
+                        file_format == FileFormat::NEOX_1 ||
+                         file_format == FileFormat::NEOX_2 ||
+                         file_format == FileFormat::NEOX_3 ||
+                         file_format == FileFormat::NEOX_4 ||
+                         file_format == FileFormat::NEOX_5 ||
+                         file_format == FileFormat::NEOX_6 ||
+                         file_format == FileFormat::NEOX_7)
+                    {
+                        eosID = 0;
+                        int topid = std::min_element(logits.begin(),logits.end())-logits.begin();
+                        logits[eosID] = (logits[topid] < 0 ? logits[topid] : 0);
+                    }
                 }
-
-                id = SampleLogits(logits.data(), nctx, n_vocab, last_n_size, repeat_penalty, 
-                top_k, top_p, typical_p, tfs_z, temp, rng,
-                params.mirostat,params.mirostat_tau,params.mirostat_eta);
+              
             }
-
+         
+            id = SampleLogits(logitsPtr, nctx, n_vocab, last_n_size, repeat_penalty, 
+            top_k, top_a, top_p, typical_p, tfs_z, temp, rng,
+            params.mirostat,params.mirostat_tau,params.mirostat_eta);
+            
             last_n_tokens.erase(last_n_tokens.begin());
             last_n_tokens.push_back(id);
             current_context_tokens.push_back(id);
@@ -1002,30 +1122,39 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             // decrement remaining sampling budget
             --remaining_tokens;
 
-            if (file_format == FileFormat::GGML || file_format == FileFormat::GGHF || file_format == FileFormat::GGJT || file_format == FileFormat::GGJT_2|| file_format == FileFormat::GGJT_3)
+            for (auto id : embd)
             {
-                if(file_format == FileFormat::GGJT_3)
-                {
-                    concat_output += llama_token_to_str(llama_ctx_v3, id);
-                }
-                else
-                {
-                    concat_output += llama_v2_token_to_str(llama_ctx_v2, id);
-                }
-                
-                if(unbanTokens && id==llama_token_eos())
-                {
-                     printf("\n(EOS token triggered!)");
-                     remaining_tokens = 0;
-                }
+                concat_output += FileFormatTokenizeID(id,file_format);
             }
-            else
+           
+            if (startedsampling)
+            {                
+                printf("\rGenerating (%d / %d tokens)", (params.n_predict - remaining_tokens), params.n_predict);
+            }          
+            if(debugmode && top_picks.size()>0)
             {
-                for (auto id : embd)
+                printf(" [");
+                bool firstloop = true;
+                for (auto & pick : top_picks)
                 {
-                    concat_output += vocab.id_to_token[id].c_str();
+                    if (!firstloop)
+                    {                            
+                        printf(" ");
+                    }
+                    firstloop = false;
+                    std::string tokenizedstr = FileFormatTokenizeID(pick.id, file_format);                        
+                    ::utreplace(tokenizedstr, "\n", "\\n");
+                    printf("(%s %.2f%%)", tokenizedstr.c_str(), pick.p*100);
                 }
+                printf("]\n");
             }
+
+            if(unbanTokens && id==eosID)
+            {
+                printf("\n(EOS token triggered!)");
+                remaining_tokens = 0;
+            }      
+
             for (const auto &matched : stop_sequence)
             {
                 if (concat_output.find(matched) != std::string::npos)
@@ -1036,6 +1165,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                     break;
                 }
             }
+            fflush(stdout);
         }
         else
         {

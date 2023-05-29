@@ -126,7 +126,7 @@ void print_tok_vec(std::vector<float> &embd)
                fileformat = FileFormat::GPTJ_3; //quantized format cannot be legacy type
            }
        }
-       else if(vocabsiz==50257)
+       else if(vocabsiz==50257 || (vocabsiz>=49152&&vocabsiz<=49157)) //49152-6 is starcoder
        {
            fileformat = FileFormat::GPT2_1;
            uint32_t temp;
@@ -211,6 +211,10 @@ void print_tok_vec(std::vector<float> &embd)
         if(temp==100)
         {
             fileformat = FileFormat::RWKV_1;
+        }
+        else if(temp==101)
+        {
+            fileformat = FileFormat::RWKV_2;
         }
     }
     else if(magic == 0x67676a74) //v3 format ggjt

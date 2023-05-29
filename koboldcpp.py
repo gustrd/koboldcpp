@@ -35,6 +35,7 @@ class generation_inputs(ctypes.Structure):
                 ("max_length", ctypes.c_int),
                 ("temperature", ctypes.c_float),
                 ("top_k", ctypes.c_int),
+                ("top_a", ctypes.c_float),
                 ("top_p", ctypes.c_float),
                 ("typical_p", ctypes.c_float),
                 ("tfs", ctypes.c_float),
@@ -162,8 +163,8 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=100,top_p=0.85, typical_p=1, tfs=1.0, rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
-    
+def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=300, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
+
     # enforce the maximum lenght of generated tokens and context informed at program arguments, 
     # useful to do avoid timeouts when using this program with KoboldHorde
     global maxlen, maxctx
@@ -179,6 +180,7 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
     inputs.max_length = max_length
     inputs.temperature = temperature
     inputs.top_k = top_k
+    inputs.top_a = top_a
     inputs.top_p = top_p
     inputs.typical_p = typical_p
     inputs.tfs = tfs
@@ -218,7 +220,7 @@ maxctx = 1024
 maxlen = 80
 modelbusy = False
 defaultport = 5001
-KcppVersion = "1.25"
+KcppVersion = "1.27"
 
 class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     sys_version = ""
@@ -336,7 +338,8 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     max_context_length=genparams.get('max_context_length', maxctx),
                     max_length=genparams.get('max_length', 50),
                     temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 200),
+                    top_k=genparams.get('top_k', 300),
+                    top_a=genparams.get('top_a', 0.0),
                     top_p=genparams.get('top_p', 0.85),
                     typical_p=genparams.get('typical', 1.0),
                     tfs=genparams.get('tfs', 1.0),
@@ -352,7 +355,8 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     prompt=newprompt,
                     max_length=genparams.get('max', 50),
                     temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 200),
+                    top_k=genparams.get('top_k', 300),
+                    top_a=genparams.get('top_a', 0.0),
                     top_p=genparams.get('top_p', 0.85),
                     typical_p=genparams.get('typical', 1.0),
                     tfs=genparams.get('tfs', 1.0),
@@ -558,6 +562,10 @@ def main(args):
             time.sleep(2)
             sys.exit(2)
 
+    if args.renamemodel and args.renamemodel!="":
+        global friendlymodelname
+        friendlymodelname = "koboldcpp/"+args.renamemodel
+
     if args.highpriority:
         print("Setting process to Higher Priority - Use Caution")
         try:
@@ -638,6 +646,7 @@ def main(args):
 
 if __name__ == '__main__':
     print("Welcome to KoboldCpp - Version " + KcppVersion) # just update version manually
+    # print("Python version: " + sys.version)
     parser = argparse.ArgumentParser(description='Kobold llama.cpp server')
     modelgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
     modelgroup.add_argument("--model", help="Model file to load", nargs="?")
@@ -674,6 +683,7 @@ if __name__ == '__main__':
     parser.add_argument("--noavx2", help="Do not use AVX2 instructions, a slower compatibility mode for older devices. Does not work with --clblast.", action='store_true')
     parser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", action='store_true')
     parser.add_argument("--skiplauncher", help="Doesn't display or use the new GUI launcher.", action='store_true')
+    parser.add_argument("--renamemodel", help="Sets the display model name to something else, for easy use on Horde.", type=str, default="")
     compatgroup = parser.add_mutually_exclusive_group()
     compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion.", action='store_true')
     compatgroup.add_argument("--useclblast", help="Use CLBlast instead of OpenBLAS for prompt ingestion. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
