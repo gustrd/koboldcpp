@@ -166,8 +166,15 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
+    
     inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
+    if ctxcap!=0 & ctxcap < inputs.max_context_length:
+        inputs.max_context_length = ctxcap
+    
     inputs.max_length = max_length
+    if lencap!=0 & lencap < inputs.max_length:
+        inputs.max_length = lencap
+
     inputs.temperature = temperature
     inputs.top_k = top_k
     inputs.top_a = top_a
@@ -208,6 +215,8 @@ def utfprint(str):
 friendlymodelname = "concedo/koboldcpp"  # local kobold api apparently needs a hardcoded known HF model name
 maxctx = 2048
 maxlen = 256
+ctxcap = 0 # generation upper caps, 0 means disabled
+lencap = 0
 modelbusy = False
 defaultport = 5001
 KcppVersion = "1.27"
@@ -567,6 +576,18 @@ def main(args):
         global maxctx       
         maxctx = args.contextsize
 
+    if args.ctxcap and args.ctxcap!=0:
+        global maxctx
+        global ctxcap
+        maxctx = args.ctxcap
+        ctxcap = args.ctxcap
+
+    if args.lencap and args.lencap!=0:
+        global maxlen
+        global lencap
+        maxlen = args.lencap
+        lencap = args.lencap
+
     init_library() # Note: if blas does not exist and is enabled, program will crash.
     print("==========")
     time.sleep(1)
@@ -660,6 +681,8 @@ if __name__ == '__main__':
     parser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", action='store_true')
     parser.add_argument("--skiplauncher", help="Doesn't display or use the new GUI launcher.", action='store_true')
     parser.add_argument("--renamemodel", help="Sets the display model name to something else, for easy use on Horde.", type=str, default="")
+    parser.add_argument("--ctxcap", help="Sets the upper cap for generation lenght, for easy use on Horde.", type=int, default=0)
+    parser.add_argument("--lencap", help="Sets the upper cap for context, for easy use on Horde.", type=int, default=0)
     compatgroup = parser.add_mutually_exclusive_group()
     compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion", action='store_true')
     compatgroup.add_argument("--useclblast", help="Use CLBlast instead of OpenBLAS for prompt ingestion. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
