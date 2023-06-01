@@ -42,6 +42,7 @@
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
+    MODEL_3B,
     MODEL_7B,
     MODEL_13B,
     MODEL_30B,
@@ -58,6 +59,7 @@ static const size_t MB = 1024*1024;
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 {
     static std::map<e_model, size_t> k_sizes = {
+        { MODEL_3B,    128ull * MB },
         { MODEL_7B,    512ull * MB },
         { MODEL_13B,   512ull * MB },
         { MODEL_30B,   512ull * MB },
@@ -69,6 +71,7 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
 {
     static std::map<e_model, size_t> k_sizes = {
+        { MODEL_3B,    128ull * MB },
         { MODEL_7B,    512ull * MB },
         { MODEL_13B,   512ull * MB },
         { MODEL_30B,   512ull * MB },
@@ -81,6 +84,7 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
 static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
 {
     static std::map<e_model, size_t> k_sizes = {
+        { MODEL_3B,    682ull * MB },
         { MODEL_7B,   1026ull * MB },
         { MODEL_13B,  1608ull * MB },
         { MODEL_30B,  3124ull * MB },
@@ -94,6 +98,7 @@ static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
 static const std::map<e_model, size_t> & MEM_REQ_EVAL()
 {
     static std::map<e_model, size_t> k_sizes = {
+        { MODEL_3B,   512ull * MB },
         { MODEL_7B,   800ull * MB },
         { MODEL_13B, 1024ull * MB },
         { MODEL_30B, 1280ull * MB },
@@ -899,6 +904,7 @@ static const char *llama_ftype_name(enum llama_ftype ftype) {
 
 static const char *llama_model_type_name(e_model type) {
     switch (type) {
+        case MODEL_3B: return "3B";
         case MODEL_7B: return "7B";
         case MODEL_13B: return "13B";
         case MODEL_30B: return "30B";
@@ -932,6 +938,7 @@ static void llama_model_load_internal(
 
     {
         switch (hparams.n_layer) {
+            case 26: model.type = e_model::MODEL_3B; break;
             case 32: model.type = e_model::MODEL_7B; break;
             case 40: model.type = e_model::MODEL_13B; break;
             case 60: model.type = e_model::MODEL_30B; break;
@@ -1003,8 +1010,10 @@ static void llama_model_load_internal(
         }
     }
 
-#ifdef GGML_USE_CUBLAS
+#if defined(GGML_USE_CUBLAS)
 #define LLAMA_BACKEND_OFFLOAD GGML_BACKEND_CUDA
+#elif defined(GGML_USE_CLBLAST)
+#define LLAMA_BACKEND_OFFLOAD GGML_BACKEND_CL
 #else
 #define LLAMA_BACKEND_OFFLOAD GGML_BACKEND_CPU
 #endif
@@ -1056,7 +1065,7 @@ static void llama_model_load_internal(
             layer.w2 = ml->get_tensor(layers_i + ".feed_forward.w2.weight", {  n_ff,   n_embd}, backend);
             layer.w3 = ml->get_tensor(layers_i + ".feed_forward.w3.weight", {n_embd,   n_ff},   backend);
 
-            if (backend == GGML_BACKEND_CUDA) {
+            if (backend == LLAMA_BACKEND_OFFLOAD) {
                 vram_total +=
                     ggml_nbytes(layer.attention_norm) + ggml_nbytes(layer.wq) + ggml_nbytes(layer.wk)             +
                     ggml_nbytes(layer.wv)             + ggml_nbytes(layer.wo) + ggml_nbytes(layer.attention_norm) +
@@ -1086,7 +1095,7 @@ static void llama_model_load_internal(
         fprintf(stderr, "%s: mem required  = %7.2f MB (+ %7.2f MB per state)\n", __func__,
                 mem_required / 1024.0 / 1024.0, mem_required_state / 1024.0 / 1024.0);
 
-#ifdef GGML_USE_CUBLAS
+#if defined(GGML_USE_CUBLAS)
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
         fprintf(stderr, "%s: [cublas] offloading %d layers to GPU\n", __func__, n_gpu);
@@ -1094,7 +1103,15 @@ static void llama_model_load_internal(
             fprintf(stderr, "%s: [cublas] offloading output layer to GPU\n", __func__);
         }
         fprintf(stderr, "%s: [cublas] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
-#elif !defined(GGML_USE_CLBLAST)
+#elif defined(GGML_USE_CLBLAST)
+        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+
+        fprintf(stderr, "%s: [opencl] offloading %d layers to GPU\n", __func__, n_gpu);
+        if (n_gpu_layers > (int) hparams.n_layer) {
+            fprintf(stderr, "%s: [opencl] offloading output layer to GPU\n", __func__);
+        }
+        fprintf(stderr, "%s: [opencl] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
+#else
         (void) n_gpu_layers;
 #endif
     }
@@ -1106,7 +1123,7 @@ static void llama_model_load_internal(
 
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
 
-#ifdef GGML_USE_CUBLAS
+#if defined(GGML_USE_CUBLAS)
     {
         size_t done_size = 0;
         size_t data_size = 0;
@@ -1129,29 +1146,24 @@ static void llama_model_load_internal(
     }
 #elif defined(GGML_USE_CLBLAST)
     {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
-
-        fprintf(stderr, "ggml_opencl: offloading %d layers to GPU\n", n_gpu);
-
-        size_t vram_total = 0;
-
-        for (int i = 0; i < n_gpu; ++i) {
-            const auto & layer = model.layers[i];
-
-            ggml_cl_transform_tensor(layer.wq); vram_total += ggml_nbytes(layer.wq);
-            ggml_cl_transform_tensor(layer.wk); vram_total += ggml_nbytes(layer.wk);
-            ggml_cl_transform_tensor(layer.wv); vram_total += ggml_nbytes(layer.wv);
-            ggml_cl_transform_tensor(layer.wo); vram_total += ggml_nbytes(layer.wo);
-            ggml_cl_transform_tensor(layer.w1); vram_total += ggml_nbytes(layer.w1);
-            ggml_cl_transform_tensor(layer.w2); vram_total += ggml_nbytes(layer.w2);
-            ggml_cl_transform_tensor(layer.w3); vram_total += ggml_nbytes(layer.w3);
+        size_t done_size = 0;
+        size_t data_size = 0;
+        for (llama_load_tensor & lt : ml->tensors_map.tensors) {
+            data_size += lt.size;
+            if (lt.ggml_tensor->backend == GGML_BACKEND_CPU) {
+                done_size += lt.size;
+            }
         }
-        if (n_gpu_layers > (int) hparams.n_layer) {
-            fprintf(stderr, "ggml_opencl: offloading output layer to GPU\n");
-            ggml_cl_transform_tensor(model.output); vram_total += ggml_nbytes(model.output);
+        for (llama_load_tensor & lt : ml->tensors_map.tensors) {
+            if (lt.ggml_tensor->backend != GGML_BACKEND_CL) {
+                continue;
+            }
+            if (progress_callback) {
+                progress_callback((float) done_size / data_size, progress_callback_user_data);
+            }
+            ggml_cl_load_data(fname.c_str(), lt.ggml_tensor, lt.shards.at(0).file_off);
+            done_size += lt.size;
         }
-
-        fprintf(stderr, "ggml_opencl: total VRAM used: %zu MB\n", vram_total / 1024 / 1024);
     }
 #endif
 

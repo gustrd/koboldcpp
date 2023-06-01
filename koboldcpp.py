@@ -75,6 +75,7 @@ lib_openblas = pick_existant_file("koboldcpp_openblas.dll","koboldcpp_openblas.s
 lib_openblas_noavx2 = pick_existant_file("koboldcpp_openblas_noavx2.dll","koboldcpp_openblas_noavx2.so")
 lib_clblast = pick_existant_file("koboldcpp_clblast.dll","koboldcpp_clblast.so")
 
+
 def init_library():
     global handle
     global lib_default,lib_failsafe,lib_openblas,lib_openblas_noavx2,lib_clblast
@@ -135,8 +136,6 @@ def init_library():
     handle.generate.restype = generation_outputs
 
 def load_model(model_filename):
-    global maxctx
-
     inputs = load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
     inputs.lora_filename = args.lora.encode("UTF-8")
@@ -164,20 +163,18 @@ def load_model(model_filename):
     return ret
 
 def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=300, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
-
-    # enforce the maximum lenght of generated tokens and context informed at program arguments, 
-    # useful to do avoid timeouts when using this program with KoboldHorde
-    global maxlen, maxctx
-    if max_length > maxlen:
-        max_length = maxlen
-    if max_context_length > maxctx:
-        max_context_length = maxctx
-    
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
+    
     inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
+    if ctxcap!=0 & ctxcap < inputs.max_context_length:
+        inputs.max_context_length = ctxcap
+    
     inputs.max_length = max_length
+    if lencap!=0 & lencap < inputs.max_length:
+        inputs.max_length = lencap
+
     inputs.temperature = temperature
     inputs.top_k = top_k
     inputs.top_a = top_a
@@ -215,9 +212,11 @@ def utfprint(str):
 ### A hacky simple HTTP server simulating a kobold api by Concedo
 ### we are intentionally NOT using flask, because we want MINIMAL dependencies
 #################################################################
-friendlymodelname = "concedo/koboldcpp"  # local KoboldAI-United API needs a model name registered at HuggingFace. This is the placeholder: https://huggingface.co/concedo/koboldcpp
-maxctx = 1024
-maxlen = 80
+friendlymodelname = "concedo/koboldcpp"  # local kobold api apparently needs a hardcoded known HF model name
+maxctx = 2048
+maxlen = 256
+ctxcap = 0 # generation upper caps, 0 means disabled
+lencap = 0
 modelbusy = False
 defaultport = 5001
 KcppVersion = "1.27"
@@ -440,6 +439,7 @@ def RunServerMultiThreaded(addr, port, embedded_kailite = None):
                 threadArr[i].stop()
             sys.exit(0)
 
+
 def show_gui():
     import tkinter as tk
     from tkinter.filedialog import askopenfilename
@@ -521,6 +521,7 @@ def show_gui():
             print("\nNo ggml model file was selected. Exiting.")
             time.sleep(2)
             sys.exit(2)
+
     else:
         root = tk.Tk() #we dont want the useless window to be visible, but we want it in taskbar
         root.attributes("-alpha", 0)
@@ -533,18 +534,6 @@ def show_gui():
 
 def main(args):
 
-    #gustrd fork
-    global friendlymodelname, maxctx, maxlen
-
-    if args.contextsize:  
-        maxctx = args.contextsize
-    
-    # parameters useful when joining the KoboldHorde
-    if args.maxctx:
-        maxctx = args.maxctx
-    if args.maxlen:
-        maxlen = args.maxlen
-        
     embedded_kailite = None
     if not args.model_param:
         args.model_param = args.model
@@ -582,6 +571,21 @@ def main(args):
                 print("High Priority for Other OS Set :" + str(oldprio) + " to " + str(process.nice()))
         except Exception as ex:
              print("Error, Could not change process priority: " + str(ex))
+
+    global maxctx 
+    if args.contextsize:          
+        maxctx = args.contextsize
+
+    if args.ctxcap and args.ctxcap!=0:
+        global ctxcap
+        maxctx = args.ctxcap
+        ctxcap = args.ctxcap
+
+    if args.lencap and args.lencap!=0:
+        global maxlen
+        global lencap
+        maxlen = args.lencap
+        lencap = args.lencap
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
     print("==========")
@@ -645,12 +649,12 @@ def main(args):
 if __name__ == '__main__':
     print("Welcome to KoboldCpp - Version " + KcppVersion) # just update version manually
     # print("Python version: " + sys.version)
-    parser = argparse.ArgumentParser(description='Kobold llama.cpp server')
+    parser = argparse.ArgumentParser(description='KoboldCpp Server')
     modelgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
     modelgroup.add_argument("--model", help="Model file to load", nargs="?")
     modelgroup.add_argument("model_param", help="Model file to load (positional)", nargs="?")
     portgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
-    portgroup.add_argument("--port", help="Port to listen on.", default=defaultport, type=int, action='store')
+    portgroup.add_argument("--port", help="Port to listen on", default=defaultport, type=int, action='store')
     portgroup.add_argument("port_param", help="Port to listen on (positional)", default=defaultport, nargs="?", type=int, action='store')
     parser.add_argument("--host", help="Host IP to listen on. If empty, all routable interfaces are accepted.", default="")
     parser.add_argument("--launch", help="Launches a web browser when load is completed.", action='store_true')
@@ -660,11 +664,6 @@ if __name__ == '__main__':
         physical_core_limit = int(os.cpu_count()/2)
     default_threads = (physical_core_limit if physical_core_limit<=3 else max(3,physical_core_limit-1))
     parser.add_argument("--threads", help="Use a custom number of threads if specified. Otherwise, uses an amount based on CPU cores", type=int, default=default_threads)
-    
-    #gustrd fork
-    parser.add_argument("--maxctx", help="Maximum context size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
-    parser.add_argument("--maxlen", help="Maximum lenght size to be used, an upper cap, useful when joining the Horde.", type=int, action='store')
-
     parser.add_argument("--blasthreads", help="Use a different number of threads during BLAS if specified. Otherwise, has the same value as --threads",metavar=('[threads]'), type=int, default=0)
     parser.add_argument("--psutil_set_threads", help="Experimental flag. If set, uses psutils to determine thread count based on physical cores.", action='store_true')
     parser.add_argument("--highpriority", help="Experimental flag. If set, increases the process CPU priority, potentially speeding up generation. Use caution.", action='store_true')
@@ -681,8 +680,10 @@ if __name__ == '__main__':
     parser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", action='store_true')
     parser.add_argument("--skiplauncher", help="Doesn't display or use the new GUI launcher.", action='store_true')
     parser.add_argument("--renamemodel", help="Sets the display model name to something else, for easy use on Horde.", type=str, default="")
+    parser.add_argument("--ctxcap", help="Sets the upper cap for generation lenght, for easy use on Horde.", type=int, default=0)
+    parser.add_argument("--lencap", help="Sets the upper cap for context, for easy use on Horde.", type=int, default=0)
     compatgroup = parser.add_mutually_exclusive_group()
-    compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion.", action='store_true')
+    compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion", action='store_true')
     compatgroup.add_argument("--useclblast", help="Use CLBlast instead of OpenBLAS for prompt ingestion. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
     parser.add_argument("--gpulayers", help="Set number of layers to offload to GPU when using CLBlast. Requires CLBlast.",metavar=('[GPU layers]'), type=int, default=0)
     args = parser.parse_args()
