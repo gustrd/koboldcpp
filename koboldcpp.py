@@ -572,12 +572,11 @@ def main(args):
         except Exception as ex:
              print("Error, Could not change process priority: " + str(ex))
 
-    if args.contextsize:
-        global maxctx       
+    global maxctx 
+    if args.contextsize:          
         maxctx = args.contextsize
 
     if args.ctxcap and args.ctxcap!=0:
-        global maxctx
         global ctxcap
         maxctx = args.ctxcap
         ctxcap = args.ctxcap
