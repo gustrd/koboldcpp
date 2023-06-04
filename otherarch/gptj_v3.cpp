@@ -331,46 +331,6 @@ ModelLoadResult gptj_model_load(const std::string & fname, gptj_model & model, g
 
     fin.close();
 
-//         //gpu offload for gptj
-// #if defined(GGML_USE_CLBLAST)
-//     if(gpulayers>0)
-//     {
-//         const auto & hparams = model.hparams;
-//         const int n_gpu = std::min(gpulayers, int(hparams.n_layer));
-//         if(GetQuantsUnshuffled())
-//         {
-//         SetGPULayers(n_gpu);
-
-//         fprintf(stderr, "%s: [opencl] offloading %d layers to GPU\n", __func__, n_gpu);
-
-//         size_t vram_total = 0;
-
-//         for (int i = 0; i < n_gpu; ++i) {
-//             const auto & layer = model.layers[i];
-
-//             ggml_cl_transform_tensor(layer.ln_1_g); vram_total += ggml_nbytes(layer.ln_1_g);
-//             ggml_cl_transform_tensor(layer.ln_1_b); vram_total += ggml_nbytes(layer.ln_1_b);
-//             ggml_cl_transform_tensor(layer.c_attn_q_proj_w); vram_total += ggml_nbytes(layer.c_attn_q_proj_w);
-//             ggml_cl_transform_tensor(layer.c_attn_k_proj_w); vram_total += ggml_nbytes(layer.c_attn_k_proj_w);
-//             ggml_cl_transform_tensor(layer.c_attn_v_proj_w); vram_total += ggml_nbytes(layer.c_attn_v_proj_w);
-//             ggml_cl_transform_tensor(layer.c_attn_proj_w); vram_total += ggml_nbytes(layer.c_attn_proj_w);
-//             ggml_cl_transform_tensor(layer.c_mlp_fc_w); vram_total += ggml_nbytes(layer.c_mlp_fc_w);
-//             ggml_cl_transform_tensor(layer.c_mlp_fc_b); vram_total += ggml_nbytes(layer.c_mlp_fc_b);
-//             ggml_cl_transform_tensor(layer.c_mlp_proj_w); vram_total += ggml_nbytes(layer.c_mlp_proj_w);
-//             ggml_cl_transform_tensor(layer.c_mlp_proj_b); vram_total += ggml_nbytes(layer.c_mlp_proj_b);
-//         }
-
-//         fprintf(stderr, "%s: [opencl] total VRAM used: %zu MB\n", __func__, vram_total / 1024 / 1024);
-//         }
-//         else
-//         {
-//             if(n_gpu>0)
-//             {
-//                 printf("\n[WARNING: Old format does not support GPU offloading! It will be deactivated!]\n");
-//             }
-//         }
-//     }
-// #endif
 
 
     return ModelLoadResult::SUCCESS;
@@ -408,7 +368,7 @@ bool gptj_eval(
     static void * buf = malloc(buf_size);
 
     if (mem_per_token > 0 && (mem_per_token*N*2 + 64u*1024*1024) > buf_size) {
-        const size_t buf_size_new = 320u*1024*1024 + 2*(mem_per_token*N); // add 10% to account for ggml object overhead
+        const size_t buf_size_new = 320u*1024*1024 + 1.7*(mem_per_token*N); // add 10% to account for ggml object overhead
         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
         // reallocate

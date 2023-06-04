@@ -26,6 +26,7 @@
 #include "rwkv_v3.cpp"
 #include "neox_v2.cpp"
 #include "neox_v3.cpp"
+#include "mpt_v3.cpp"
 
 
 //return val: 0=fail, 1=(original ggml, alpaca), 2=(ggmf), 3=(ggjt)
@@ -43,6 +44,8 @@ static gpt2_model gpt2_ctx_v3;
 
 static gpt_neox_v2_model neox_ctx_v2;
 static gpt_neox_model neox_ctx_v3;
+
+static mpt_model mpt_ctx_v3;
 
 static rwkv_v2_context * rwkv_ctx_v2;
 static rwkv_context * rwkv_ctx_v3;
@@ -298,7 +301,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     params.n_ctx = inputs.max_context_length;
 
     neox_ctx_v2.hparams.n_ctx = gptj_ctx_v1.hparams.n_ctx = gptj_ctx_v2.hparams.n_ctx = gpt2_ctx_v1.hparams.n_ctx = gpt2_ctx_v2.hparams.n_ctx 
-    = neox_ctx_v3.hparams.n_ctx = gptj_ctx_v3.hparams.n_ctx = gptj_ctx_v3.hparams.n_ctx = params.n_ctx;
+    = neox_ctx_v3.hparams.n_ctx = gptj_ctx_v3.hparams.n_ctx = gptj_ctx_v3.hparams.n_ctx = mpt_ctx_v3.hparams.n_ctx = params.n_ctx;
 
     printf("System Info: %s\n", llama_print_system_info());
     SetQuantsUnshuffled(false);   
@@ -682,6 +685,19 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
        
     }
+    else if(file_format==FileFormat::MPT_1)
+    {
+        bool res = mpt_model_load(params.model, mpt_ctx_v3, vocab);
+        if(res==false)
+        {
+            fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
+            return ModelLoadResult::FAIL;
+        } 
+     
+        // determine the required inference memory per token:
+        mpt_eval(mpt_ctx_v3, params.n_threads, 0, { 0, 1, 2, 3 }, logits, false, mem_per_token);    
+        return ModelLoadResult::SUCCESS;
+    }
     else
     {
         printf("\nUnknown Model, cannot load.\n");
@@ -725,7 +741,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     }
     if (params.top_k < 1)
     {
-        params.top_k = 300; //to disable top_k we actually need to increase this value to a very high number
+        params.top_k = 120; //to disable top_k we actually need to increase this value to a very high number
     }
     if (params.seed <= 0)
     {
@@ -791,7 +807,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                             file_format == FileFormat::GPTJ_2 || 
                             file_format == FileFormat::RWKV_1 || 
                             file_format==FileFormat::RWKV_2);
-    bool blasmode = (approved_format && embd_inp.size() >= 32 && ggml_cpu_has_blas());
+    bool blasmode = (approved_format && embd_inp.size() >= 32 && ggml_cpu_has_blas() && blasbatchsize!=-1);
     // bool blasmode = false;
     int original_batch = params.n_batch;
     int original_threads = params.n_threads;
@@ -868,6 +884,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     else if( file_format==FileFormat::NEOX_6|| file_format==FileFormat::NEOX_7)
     {
         n_vocab = neox_ctx_v3.hparams.n_vocab;
+    }
+    else if( file_format==FileFormat::MPT_1)
+    {
+        n_vocab = mpt_ctx_v3.hparams.n_vocab;
     }
     else if(file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
     {
@@ -1006,6 +1026,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             {
                 evalres = gptj_eval(gptj_ctx_v3, params.n_threads, n_past, embd, logits, mem_per_token);
             }
+            else if(file_format==FileFormat::MPT_1)
+            {
+                evalres = mpt_eval(mpt_ctx_v3, params.n_threads, n_past, embd, logits, false, mem_per_token);
+            }
             else
             {
                 printf("\nCannot find eval function\n");
@@ -1098,7 +1122,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                          file_format == FileFormat::NEOX_4 ||
                          file_format == FileFormat::NEOX_5 ||
                          file_format == FileFormat::NEOX_6 ||
-                         file_format == FileFormat::NEOX_7)
+                         file_format == FileFormat::NEOX_7 ||
+                         file_format == FileFormat::MPT_1)
                     {
                         eosID = 0;
                         int topid = std::min_element(logits.begin(),logits.end())-logits.begin();

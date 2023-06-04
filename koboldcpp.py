@@ -162,19 +162,12 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=300, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
+def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=120, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
-    
     inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
-    if ctxcap!=0 & ctxcap < inputs.max_context_length:
-        inputs.max_context_length = ctxcap
-    
     inputs.max_length = max_length
-    if lencap!=0 & lencap < inputs.max_length:
-        inputs.max_length = lencap
-
     inputs.temperature = temperature
     inputs.top_k = top_k
     inputs.top_a = top_a
@@ -215,11 +208,9 @@ def utfprint(str):
 friendlymodelname = "concedo/koboldcpp"  # local kobold api apparently needs a hardcoded known HF model name
 maxctx = 2048
 maxlen = 256
-ctxcap = 0 # generation upper caps, 0 means disabled
-lencap = 0
 modelbusy = False
 defaultport = 5001
-KcppVersion = "1.27"
+KcppVersion = "1.28"
 
 class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     sys_version = ""
@@ -337,7 +328,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     max_context_length=genparams.get('max_context_length', maxctx),
                     max_length=genparams.get('max_length', 50),
                     temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 300),
+                    top_k=genparams.get('top_k', 120),
                     top_a=genparams.get('top_a', 0.0),
                     top_p=genparams.get('top_p', 0.85),
                     typical_p=genparams.get('typical', 1.0),
@@ -354,7 +345,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     prompt=newprompt,
                     max_length=genparams.get('max', 50),
                     temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 300),
+                    top_k=genparams.get('top_k', 120),
                     top_a=genparams.get('top_a', 0.0),
                     top_p=genparams.get('top_p', 0.85),
                     typical_p=genparams.get('typical', 1.0),
@@ -456,32 +447,67 @@ def show_gui():
             pass
 
         # Adjust size
-        root.geometry("460x320")
+        root.geometry("480x360")
         root.title("KoboldCpp v"+KcppVersion)
+        root.grid_columnconfigure(0, weight=1)
         tk.Label(root, text = "KoboldCpp Easy Launcher",
-                font = ("Arial", 12)).pack(pady=4)
+                font = ("Arial", 12)).grid(row=0,column=0)
         tk.Label(root, text = "(Note: KoboldCpp only works with GGML model formats!)",
-                font = ("Arial", 9)).pack()
+                font = ("Arial", 9)).grid(row=1,column=0)
 
 
         opts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use No BLAS","Use OpenBLAS (Old CPU, noavx2)","Failsafe Mode (Old CPU, noavx)"]
         runchoice = tk.StringVar()
         runchoice.set("Use OpenBLAS")
-        tk.OptionMenu( root , runchoice , *opts ).pack()
+        def onDropdownChange(event):
+            sel = runchoice.get()
+            if sel==opts[1] or sel==opts[2] or sel==opts[3]:
+                frm1.grid(row=4,column=0,pady=4)
+            else:
+                frm1.grid_forget()
+            pass
+        tk.OptionMenu( root , runchoice , command = onDropdownChange ,*opts ).grid(row=2,column=0)
+     
+
+        frm2 = tk.Frame(root)
+        threads_var=tk.StringVar()
+        threads_var.set(str(default_threads))
+        threads_lbl = tk.Label(frm2, text = 'Threads: ', font=('calibre',10, 'bold'))  
+        threads_input = tk.Entry(frm2,textvariable = threads_var, font=('calibre',10,'normal'))
+        threads_lbl.grid(row=0,column=0)
+        threads_input.grid(row=0,column=1)
+        frm2.grid(row=3,column=0,pady=4)
+
+        frm1 = tk.Frame(root)
+        gpu_layers_var=tk.StringVar()
+        gpu_layers_var.set("0")
+        gpu_lbl = tk.Label(frm1, text = 'GPU Layers (CLBlast only): ', font=('calibre',10, 'bold'))  
+        gpu_layers_input = tk.Entry(frm1,textvariable = gpu_layers_var, font=('calibre',10,'normal'))
+        gpu_lbl.grid(row=0,column=0)
+        gpu_layers_input.grid(row=0,column=1)
+        frm1.grid(row=4,column=0,pady=4)
+        onDropdownChange(None)
 
         stream = tk.IntVar()
         smartcontext = tk.IntVar()
         launchbrowser = tk.IntVar(value=1)
         unbantokens = tk.IntVar()
-        tk.Checkbutton(root, text='Streaming Mode',variable=stream, onvalue=1, offvalue=0).pack()
-        tk.Checkbutton(root, text='Use SmartContext',variable=smartcontext, onvalue=1, offvalue=0).pack()
-        tk.Checkbutton(root, text='Unban Tokens',variable=unbantokens, onvalue=1, offvalue=0).pack()
-        tk.Checkbutton(root, text='Launch Browser',variable=launchbrowser, onvalue=1, offvalue=0).pack()
+        highpriority = tk.IntVar()
+        disablemmap = tk.IntVar()
+        frm3 = tk.Frame(root)
+        tk.Checkbutton(frm3, text='Streaming Mode',variable=stream, onvalue=1, offvalue=0).grid(row=0,column=0)
+        tk.Checkbutton(frm3, text='Use SmartContext',variable=smartcontext, onvalue=1, offvalue=0).grid(row=0,column=1)
+        tk.Checkbutton(frm3, text='High Priority',variable=highpriority, onvalue=1, offvalue=0).grid(row=1,column=0)
+        tk.Checkbutton(frm3, text='Disable MMAP',variable=disablemmap, onvalue=1, offvalue=0).grid(row=1,column=1)
+        tk.Checkbutton(frm3, text='Unban Tokens',variable=unbantokens, onvalue=1, offvalue=0).grid(row=2,column=0)
+        tk.Checkbutton(frm3, text='Launch Browser',variable=launchbrowser, onvalue=1, offvalue=0).grid(row=2,column=1)
+        
+        frm3.grid(row=5,column=0,pady=4)
 
         # Create button, it will change label text
-        tk.Button( root , text = "Launch", font = ("Impact", 18), bg='#54FA9B', command = guilaunch ).pack(pady=10)
+        tk.Button( root , text = "Launch", font = ("Impact", 18), bg='#54FA9B', command = guilaunch ).grid(row=6,column=0)
         tk.Label(root, text = "(Please use the Command Line for more advanced options)",
-                font = ("Arial", 9)).pack()
+                font = ("Arial", 9)).grid(row=7,column=0)
 
         root.mainloop()
 
@@ -491,10 +517,15 @@ def show_gui():
             sys.exit()
 
         #load all the vars
+        args.threads = int(threads_var.get())
+        args.gpulayers = int(gpu_layers_var.get())
+
         args.stream = (stream.get()==1)
         args.smartcontext = (smartcontext.get()==1)
         args.launch = (launchbrowser.get()==1)
         args.unbantokens = (unbantokens.get()==1)
+        args.highpriority = (highpriority.get()==1)
+        args.nommap = (disablemmap.get()==1)
         selchoice = runchoice.get()
 
         if selchoice==opts[1]:
@@ -549,9 +580,11 @@ def main(args):
             time.sleep(2)
             sys.exit(2)
 
-    if args.renamemodel and args.renamemodel!="":
-        global friendlymodelname
-        friendlymodelname = "koboldcpp/"+args.renamemodel
+    if args.hordeconfig and args.hordeconfig[0]!="":
+        global friendlymodelname, maxlen
+        friendlymodelname = "koboldcpp/"+args.hordeconfig[0]
+        if len(args.hordeconfig) > 1:
+            maxlen = int(args.hordeconfig[1])
 
     if args.highpriority:
         print("Setting process to Higher Priority - Use Caution")
@@ -572,20 +605,9 @@ def main(args):
         except Exception as ex:
              print("Error, Could not change process priority: " + str(ex))
 
-    global maxctx 
-    if args.contextsize:          
+    if args.contextsize:
+        global maxctx       
         maxctx = args.contextsize
-
-    if args.ctxcap and args.ctxcap!=0:
-        global ctxcap
-        maxctx = args.ctxcap
-        ctxcap = args.ctxcap
-
-    if args.lencap and args.lencap!=0:
-        global maxlen
-        global lencap
-        maxlen = args.lencap
-        lencap = args.lencap
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
     print("==========")
@@ -668,7 +690,7 @@ if __name__ == '__main__':
     parser.add_argument("--psutil_set_threads", help="Experimental flag. If set, uses psutils to determine thread count based on physical cores.", action='store_true')
     parser.add_argument("--highpriority", help="Experimental flag. If set, increases the process CPU priority, potentially speeding up generation. Use caution.", action='store_true')
     parser.add_argument("--contextsize", help="Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default 2048)", type=int,choices=[512,1024,2048,4096,8192], default=2048)
-    parser.add_argument("--blasbatchsize", help="Sets the batch size used in BLAS processing (default 512)", type=int,choices=[32,64,128,256,512,1024], default=512)
+    parser.add_argument("--blasbatchsize", help="Sets the batch size used in BLAS processing (default 512). Setting it to -1 disables BLAS mode, but keeps other benefits like GPU offload.", type=int,choices=[-1,32,64,128,256,512,1024], default=512)
     parser.add_argument("--stream", help="Uses pseudo streaming when generating tokens. Only for the Kobold Lite UI.", action='store_true')
     parser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently.", action='store_true')
     parser.add_argument("--unbantokens", help="Normally, KoboldAI prevents certain tokens such as EOS and Square Brackets. This flag unbans them.", action='store_true')
@@ -679,9 +701,7 @@ if __name__ == '__main__':
     parser.add_argument("--noavx2", help="Do not use AVX2 instructions, a slower compatibility mode for older devices. Does not work with --clblast.", action='store_true')
     parser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", action='store_true')
     parser.add_argument("--skiplauncher", help="Doesn't display or use the new GUI launcher.", action='store_true')
-    parser.add_argument("--renamemodel", help="Sets the display model name to something else, for easy use on Horde.", type=str, default="")
-    parser.add_argument("--ctxcap", help="Sets the upper cap for generation lenght, for easy use on Horde.", type=int, default=0)
-    parser.add_argument("--lencap", help="Sets the upper cap for context, for easy use on Horde.", type=int, default=0)
+    parser.add_argument("--hordeconfig", help="Sets the display model name to something else, for easy use on AI Horde. An optional second parameter sets the horde max gen length.",metavar=('[hordename]', '[hordelength]'), nargs='+')
     compatgroup = parser.add_mutually_exclusive_group()
     compatgroup.add_argument("--noblas", help="Do not use OpenBLAS for accelerated prompt ingestion", action='store_true')
     compatgroup.add_argument("--useclblast", help="Use CLBlast instead of OpenBLAS for prompt ingestion. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
