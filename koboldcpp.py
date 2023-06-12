@@ -5,7 +5,8 @@
 import ctypes
 import os
 import argparse
-import json, http.server, threading, socket, sys, time
+import json, sys, http.server, time, asyncio, socket, threading
+from concurrent.futures import ThreadPoolExecutor
 
 stop_token_max = 10
 
@@ -18,6 +19,7 @@ class load_model_inputs(ctypes.Structure):
                 ("executable_path", ctypes.c_char_p),
                 ("model_filename", ctypes.c_char_p),
                 ("lora_filename", ctypes.c_char_p),
+                ("lora_base", ctypes.c_char_p),
                 ("use_mmap", ctypes.c_bool),
                 ("use_mlock", ctypes.c_bool),
                 ("use_smartcontext", ctypes.c_bool),
@@ -44,7 +46,8 @@ class generation_inputs(ctypes.Structure):
                 ("mirostat", ctypes.c_int),
                 ("mirostat_tau", ctypes.c_float),
                 ("mirostat_eta", ctypes.c_float),
-                ("stop_sequence", ctypes.c_char_p * stop_token_max)]
+                ("stop_sequence", ctypes.c_char_p * stop_token_max),
+                ("stream_sse", ctypes.c_bool)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -115,7 +118,7 @@ def init_library():
         if use_blas:
             libname = lib_openblas_noavx2
         else:
-            libname = lib_failsafe            
+            libname = lib_failsafe
     else:
         if use_clblast:
             libname = lib_clblast
@@ -134,11 +137,16 @@ def init_library():
     handle.load_model.restype = ctypes.c_bool
     handle.generate.argtypes = [generation_inputs, ctypes.c_wchar_p] #apparently needed for osx to work. i duno why they need to interpret it that way but whatever
     handle.generate.restype = generation_outputs
+    handle.new_token.restype = ctypes.c_char_p
+    handle.new_token.argtypes = [ctypes.c_int]
+    handle.get_stream_count.restype = ctypes.c_int
+    handle.has_finished.restype = ctypes.c_bool
+    handle.abort_generate.restype = ctypes.c_bool
+    handle.get_pending_output.restype = ctypes.c_char_p
 
 def load_model(model_filename):
     inputs = load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
-    inputs.lora_filename = args.lora.encode("UTF-8")
     inputs.batch_size = 8
     inputs.max_context_length = maxctx #initial value to use for ctx, can be overwritten
     inputs.threads = args.threads
@@ -146,8 +154,13 @@ def load_model(model_filename):
     inputs.f16_kv = True
     inputs.use_mmap = (not args.nommap)
     inputs.use_mlock = args.usemlock
-    if args.lora and args.lora!="":
+    inputs.lora_filename = "".encode("UTF-8")
+    inputs.lora_base = "".encode("UTF-8")
+    if args.lora:
+        inputs.lora_filename = args.lora[0].encode("UTF-8")
         inputs.use_mmap = False
+        if len(args.lora) > 1:
+            inputs.lora_base = args.lora[1].encode("UTF-8")
     inputs.use_smartcontext = args.smartcontext
     inputs.unban_tokens = args.unbantokens
     inputs.blasbatchsize = args.blasbatchsize
@@ -162,7 +175,7 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=120, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[]):
+def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=120, top_a=0.0 ,top_p=0.85, typical_p=1.0, tfs=1.0 ,rep_pen=1.1,rep_pen_range=128,seed=-1,stop_sequence=[],stream_sse=False):
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
     inputs.prompt = prompt.encode("UTF-8")
@@ -176,14 +189,15 @@ def generate(prompt,max_length=20, max_context_length=512,temperature=0.8,top_k=
     inputs.tfs = tfs
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
+    inputs.stream_sse = stream_sse
     if args.usemirostat and args.usemirostat[0]>0:
         inputs.mirostat = int(args.usemirostat[0])
         inputs.mirostat_tau = float(args.usemirostat[1])
         inputs.mirostat_eta = float(args.usemirostat[2])
     else:
         inputs.mirostat = inputs.mirostat_tau = inputs.mirostat_eta = 0
-    inputs.seed = seed    
-    for n in range(0,stop_token_max):
+    inputs.seed = seed
+    for n in range(stop_token_max):
         if not stop_sequence or n >= len(stop_sequence):
             inputs.stop_sequence[n] = "".encode("UTF-8")
         else:
@@ -210,7 +224,7 @@ maxctx = 2048
 maxlen = 256
 modelbusy = False
 defaultport = 5001
-KcppVersion = "1.28"
+KcppVersion = "1.30"
 
 class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     sys_version = ""
@@ -224,8 +238,114 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     def __call__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    async def generate_text(self, newprompt, genparams, basic_api_flag, stream_flag):
+
+        def run_blocking():
+            if basic_api_flag:
+                return generate(
+                    prompt=newprompt,
+                    max_length=genparams.get('max', 50),
+                    temperature=genparams.get('temperature', 0.8),
+                    top_k=int(genparams.get('top_k', 120)),
+                    top_a=genparams.get('top_a', 0.0),
+                    top_p=genparams.get('top_p', 0.85),
+                    typical_p=genparams.get('typical', 1.0),
+                    tfs=genparams.get('tfs', 1.0),
+                    rep_pen=genparams.get('rep_pen', 1.1),
+                    rep_pen_range=genparams.get('rep_pen_range', 128),
+                    seed=genparams.get('sampler_seed', -1),
+                    stop_sequence=genparams.get('stop_sequence', []),
+                    stream_sse=stream_flag)
+
+            else:
+                return generate(prompt=newprompt,
+                    max_context_length=genparams.get('max_context_length', maxctx),
+                    max_length=genparams.get('max_length', 50),
+                    temperature=genparams.get('temperature', 0.8),
+                    top_k=genparams.get('top_k', 120),
+                    top_a=genparams.get('top_a', 0.0),
+                    top_p=genparams.get('top_p', 0.85),
+                    typical_p=genparams.get('typical', 1.0),
+                    tfs=genparams.get('tfs', 1.0),
+                    rep_pen=genparams.get('rep_pen', 1.1),
+                    rep_pen_range=genparams.get('rep_pen_range', 128),
+                    seed=genparams.get('sampler_seed', -1),
+                    stop_sequence=genparams.get('stop_sequence', []),
+                    stream_sse=stream_flag)
+
+        recvtxt = ""
+        if stream_flag:
+            loop = asyncio.get_event_loop()
+            executor = ThreadPoolExecutor()
+            recvtxt = await loop.run_in_executor(executor, run_blocking)
+        else:
+            recvtxt = run_blocking()
+
+        utfprint("\nOutput: " + recvtxt)
+
+        res = {"data": {"seqs":[recvtxt]}} if basic_api_flag else {"results": [{"text": recvtxt}]}
+
+        try:
+            return res
+        except Exception as e:
+            print(f"Generate: Error while generating: {e}")
+
+
+    async def send_sse_event(self, event, data):
+        self.wfile.write(f'event: {event}\n'.encode())
+        self.wfile.write(f'data: {data}\n\n'.encode())
+
+
+    async def handle_sse_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        current_token = 0
+
+        while not handle.has_finished():
+            if current_token < handle.get_stream_count():
+                token = handle.new_token(current_token)
+
+                if token is None: # Token isnt ready yet, received nullpointer
+                    continue
+
+                current_token += 1
+
+                tokenStr = ctypes.string_at(token).decode("UTF-8","ignore")
+                event_data = {"token": tokenStr}
+                event_str = json.dumps(event_data)
+                await self.send_sse_event("message", event_str)
+
+            await asyncio.sleep(0)
+
+        # flush buffers, sleep a bit to make sure all data sent, and then force close the connection
+        self.wfile.flush()
+        await asyncio.sleep(0.1)
+        self.close_connection = True
+
+
+    async def handle_request(self, genparams, newprompt, basic_api_flag, stream_flag):
+        tasks = []
+
+        if stream_flag:
+            tasks.append(self.handle_sse_stream())
+
+        generate_task = asyncio.create_task(self.generate_text(newprompt, genparams, basic_api_flag, stream_flag))
+        tasks.append(generate_task)
+
+        try:
+            await asyncio.gather(*tasks)
+            generate_result = generate_task.result()
+            return generate_result
+        except Exception as e:
+            print(e)
+
+
     def do_GET(self):
-        global maxctx, maxlen, friendlymodelname, KcppVersion
+        global maxctx, maxlen, friendlymodelname, KcppVersion, streamLock
         self.path = self.path.rstrip('/')
         response_body = None
 
@@ -286,7 +406,24 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         body = self.rfile.read(content_length)
         basic_api_flag = False
         kai_api_flag = False
+        kai_sse_stream_flag = False
         self.path = self.path.rstrip('/')
+
+        if self.path.endswith('/api/extra/abort'):
+            ag = handle.abort_generate()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": ("true" if ag else "false")}).encode())
+            print("Generation Aborted")
+            return
+
+        if self.path.endswith('/api/extra/generate/check'):
+            pendtxt = handle.get_pending_output()
+            pendtxtStr = ctypes.string_at(pendtxt).decode("UTF-8","ignore")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({"results": [{"text": pendtxtStr}]}).encode())
+            return
 
         if modelbusy:
             self.send_response(503)
@@ -303,71 +440,44 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         if self.path.endswith(('/api/v1/generate', '/api/latest/generate')):
             kai_api_flag = True
 
+        if self.path.endswith('/api/extra/generate/stream'):
+            kai_api_flag = True
+            kai_sse_stream_flag = True
+
         if basic_api_flag or kai_api_flag:
             genparams = None
             try:
                 genparams = json.loads(body)
             except ValueError as e:
-                self.send_response(503)
-                self.end_headers()
-                return
+                utfprint("Body Err: " + str(body))
+                return self.send_response(503)
+
             utfprint("\nInput: " + json.dumps(genparams))
 
             modelbusy = True
+
             if kai_api_flag:
                 fullprompt = genparams.get('prompt', "")
             else:
                 fullprompt = genparams.get('text', "")
             newprompt = fullprompt
 
-            recvtxt = ""
-            res = {}
-            if kai_api_flag:
-                recvtxt = generate(
-                    prompt=newprompt,
-                    max_context_length=genparams.get('max_context_length', maxctx),
-                    max_length=genparams.get('max_length', 50),
-                    temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 120),
-                    top_a=genparams.get('top_a', 0.0),
-                    top_p=genparams.get('top_p', 0.85),
-                    typical_p=genparams.get('typical', 1.0),
-                    tfs=genparams.get('tfs', 1.0),
-                    rep_pen=genparams.get('rep_pen', 1.1),
-                    rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=genparams.get('sampler_seed', -1),
-                    stop_sequence=genparams.get('stop_sequence', [])
-                    )
-                utfprint("\nOutput: " + recvtxt)
-                res = {"results": [{"text": recvtxt}]}
-            else:
-                recvtxt = generate(
-                    prompt=newprompt,
-                    max_length=genparams.get('max', 50),
-                    temperature=genparams.get('temperature', 0.8),
-                    top_k=genparams.get('top_k', 120),
-                    top_a=genparams.get('top_a', 0.0),
-                    top_p=genparams.get('top_p', 0.85),
-                    typical_p=genparams.get('typical', 1.0),
-                    tfs=genparams.get('tfs', 1.0),
-                    rep_pen=genparams.get('rep_pen', 1.1),
-                    rep_pen_range=genparams.get('rep_pen_range', 128),
-                    seed=genparams.get('sampler_seed', -1),
-                    stop_sequence=genparams.get('stop_sequence', [])
-                    )
-                utfprint("\nOutput: " + recvtxt)
-                res = {"data": {"seqs":[recvtxt]}}
+            gen = asyncio.run(self.handle_request(genparams, newprompt, basic_api_flag, kai_sse_stream_flag))
 
             try:
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(json.dumps(res).encode())
+                self.wfile.write(json.dumps(gen).encode())
             except:
                 print("Generate: The response could not be sent, maybe connection was terminated?")
+
             modelbusy = False
+
             return
+
         self.send_response(404)
         self.end_headers()
+
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -382,10 +492,11 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', '*')
         self.send_header('Access-Control-Allow-Headers', '*')
         if "/api" in self.path:
+            if self.path.endswith("/stream"):
+                self.send_header('Content-type', 'text/event-stream')
             self.send_header('Content-type', 'application/json')
         else:
             self.send_header('Content-type', 'text/html')
-
         return super(ServerRequestHandler, self).end_headers()
 
 
@@ -455,37 +566,43 @@ def show_gui():
         tk.Label(root, text = "(Note: KoboldCpp only works with GGML model formats!)",
                 font = ("Arial", 9)).grid(row=1,column=0)
 
+        blasbatchopts = ["Don't Batch BLAS","BLAS = 32","BLAS = 64","BLAS = 128","BLAS = 256","BLAS = 512","BLAS = 1024"]
+        blaschoice = tk.StringVar()
+        blaschoice.set("BLAS = 512")
 
-        opts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use No BLAS","Use OpenBLAS (Old CPU, noavx2)","Failsafe Mode (Old CPU, noavx)"]
+        runopts = ["Use OpenBLAS","Use CLBLast GPU #1","Use CLBLast GPU #2","Use CLBLast GPU #3","Use No BLAS","Use OpenBLAS (Old CPU, noavx2)","Failsafe Mode (Old CPU, noavx)"]
         runchoice = tk.StringVar()
         runchoice.set("Use OpenBLAS")
+
         def onDropdownChange(event):
             sel = runchoice.get()
-            if sel==opts[1] or sel==opts[2] or sel==opts[3]:
-                frm1.grid(row=4,column=0,pady=4)
+            if sel==runopts[1] or sel==runopts[2] or sel==runopts[3]:
+                frameC.grid(row=4,column=0,pady=4)
             else:
-                frm1.grid_forget()
-            pass
-        tk.OptionMenu( root , runchoice , command = onDropdownChange ,*opts ).grid(row=2,column=0)
-     
+                frameC.grid_forget()
 
-        frm2 = tk.Frame(root)
+        frameA = tk.Frame(root)
+        tk.OptionMenu( frameA , runchoice , command = onDropdownChange ,*runopts ).grid(row=0,column=0)
+        tk.OptionMenu( frameA , blaschoice ,*blasbatchopts ).grid(row=0,column=1)
+        frameA.grid(row=2,column=0)
+
+        frameB = tk.Frame(root)
         threads_var=tk.StringVar()
         threads_var.set(str(default_threads))
-        threads_lbl = tk.Label(frm2, text = 'Threads: ', font=('calibre',10, 'bold'))  
-        threads_input = tk.Entry(frm2,textvariable = threads_var, font=('calibre',10,'normal'))
+        threads_lbl = tk.Label(frameB, text = 'Threads: ', font=('calibre',10, 'bold'))
+        threads_input = tk.Entry(frameB,textvariable = threads_var, font=('calibre',10,'normal'))
         threads_lbl.grid(row=0,column=0)
         threads_input.grid(row=0,column=1)
-        frm2.grid(row=3,column=0,pady=4)
+        frameB.grid(row=3,column=0,pady=4)
 
-        frm1 = tk.Frame(root)
+        frameC = tk.Frame(root)
         gpu_layers_var=tk.StringVar()
         gpu_layers_var.set("0")
-        gpu_lbl = tk.Label(frm1, text = 'GPU Layers (CLBlast only): ', font=('calibre',10, 'bold'))  
-        gpu_layers_input = tk.Entry(frm1,textvariable = gpu_layers_var, font=('calibre',10,'normal'))
+        gpu_lbl = tk.Label(frameC, text = 'GPU Layers (CLBlast only): ', font=('calibre',10, 'bold'))
+        gpu_layers_input = tk.Entry(frameC,textvariable = gpu_layers_var, font=('calibre',10,'normal'))
         gpu_lbl.grid(row=0,column=0)
         gpu_layers_input.grid(row=0,column=1)
-        frm1.grid(row=4,column=0,pady=4)
+        frameC.grid(row=4,column=0,pady=4)
         onDropdownChange(None)
 
         stream = tk.IntVar()
@@ -494,15 +611,14 @@ def show_gui():
         unbantokens = tk.IntVar()
         highpriority = tk.IntVar()
         disablemmap = tk.IntVar()
-        frm3 = tk.Frame(root)
-        tk.Checkbutton(frm3, text='Streaming Mode',variable=stream, onvalue=1, offvalue=0).grid(row=0,column=0)
-        tk.Checkbutton(frm3, text='Use SmartContext',variable=smartcontext, onvalue=1, offvalue=0).grid(row=0,column=1)
-        tk.Checkbutton(frm3, text='High Priority',variable=highpriority, onvalue=1, offvalue=0).grid(row=1,column=0)
-        tk.Checkbutton(frm3, text='Disable MMAP',variable=disablemmap, onvalue=1, offvalue=0).grid(row=1,column=1)
-        tk.Checkbutton(frm3, text='Unban Tokens',variable=unbantokens, onvalue=1, offvalue=0).grid(row=2,column=0)
-        tk.Checkbutton(frm3, text='Launch Browser',variable=launchbrowser, onvalue=1, offvalue=0).grid(row=2,column=1)
-        
-        frm3.grid(row=5,column=0,pady=4)
+        frameD = tk.Frame(root)
+        tk.Checkbutton(frameD, text='Streaming Mode',variable=stream, onvalue=1, offvalue=0).grid(row=0,column=0)
+        tk.Checkbutton(frameD, text='Use SmartContext',variable=smartcontext, onvalue=1, offvalue=0).grid(row=0,column=1)
+        tk.Checkbutton(frameD, text='High Priority',variable=highpriority, onvalue=1, offvalue=0).grid(row=1,column=0)
+        tk.Checkbutton(frameD, text='Disable MMAP',variable=disablemmap, onvalue=1, offvalue=0).grid(row=1,column=1)
+        tk.Checkbutton(frameD, text='Unban Tokens',variable=unbantokens, onvalue=1, offvalue=0).grid(row=2,column=0)
+        tk.Checkbutton(frameD, text='Launch Browser',variable=launchbrowser, onvalue=1, offvalue=0).grid(row=2,column=1)
+        frameD.grid(row=5,column=0,pady=4)
 
         # Create button, it will change label text
         tk.Button( root , text = "Launch", font = ("Impact", 18), bg='#54FA9B', command = guilaunch ).grid(row=6,column=0)
@@ -526,23 +642,39 @@ def show_gui():
         args.unbantokens = (unbantokens.get()==1)
         args.highpriority = (highpriority.get()==1)
         args.nommap = (disablemmap.get()==1)
-        selchoice = runchoice.get()
+        selrunchoice = runchoice.get()
+        selblaschoice = blaschoice.get()
 
-        if selchoice==opts[1]:
+        if selrunchoice==runopts[1]:
             args.useclblast = [0,0]
-        if selchoice==opts[2]:
+        if selrunchoice==runopts[2]:
             args.useclblast = [1,0]
-        if selchoice==opts[3]:
+        if selrunchoice==runopts[3]:
             args.useclblast = [0,1]
-        if selchoice==opts[4]:
+        if selrunchoice==runopts[4]:
             args.noblas = True
-        if selchoice==opts[5]:
+        if selrunchoice==runopts[5]:
             args.noavx2 = True
-        if selchoice==opts[6]:
+        if selrunchoice==runopts[6]:
             args.noavx2 = True
             args.noblas = True
             args.nommap = True
             print("[Failsafe Mode : mmap is disabled.]")
+
+        if selblaschoice==blasbatchopts[0]:
+            args.blasbatchsize = -1
+        if selblaschoice==blasbatchopts[1]:
+            args.blasbatchsize = 32
+        if selblaschoice==blasbatchopts[2]:
+            args.blasbatchsize = 64
+        if selblaschoice==blasbatchopts[3]:
+            args.blasbatchsize = 128
+        if selblaschoice==blasbatchopts[4]:
+            args.blasbatchsize = 256
+        if selblaschoice==blasbatchopts[5]:
+            args.blasbatchsize = 512
+        if selblaschoice==blasbatchopts[6]:
+            args.blasbatchsize = 1024
 
         root = tk.Tk()
         root.attributes("-alpha", 0)
@@ -606,7 +738,7 @@ def main(args):
              print("Error, Could not change process priority: " + str(ex))
 
     if args.contextsize:
-        global maxctx       
+        global maxctx
         maxctx = args.contextsize
 
     init_library() # Note: if blas does not exist and is enabled, program will crash.
@@ -617,13 +749,20 @@ def main(args):
         time.sleep(2)
         sys.exit(2)
 
-    if args.lora and args.lora!="":
-        if not os.path.exists(args.lora):
-            print(f"Cannot find lora file: {args.lora}")
+    if args.lora and args.lora[0]!="":
+        if not os.path.exists(args.lora[0]):
+            print(f"Cannot find lora file: {args.lora[0]}")
             time.sleep(2)
             sys.exit(2)
         else:
-            args.lora = os.path.abspath(args.lora)
+            args.lora[0] = os.path.abspath(args.lora[0])
+            if len(args.lora) > 1:
+                if not os.path.exists(args.lora[1]):
+                    print(f"Cannot find lora base: {args.lora[1]}")
+                    time.sleep(2)
+                    sys.exit(2)
+                else:
+                    args.lora[1] = os.path.abspath(args.lora[1])
 
     if args.psutil_set_threads:
         import psutil
@@ -666,7 +805,7 @@ def main(args):
         except:
             print("--launch was set, but could not launch web browser automatically.")
     print(f"Please connect to custom endpoint at {epurl}")
-    RunServerMultiThreaded(args.host, args.port, embedded_kailite)
+    asyncio.run(RunServerMultiThreaded(args.host, args.port, embedded_kailite))
 
 if __name__ == '__main__':
     print("Welcome to KoboldCpp - Version " + KcppVersion) # just update version manually
@@ -680,7 +819,7 @@ if __name__ == '__main__':
     portgroup.add_argument("port_param", help="Port to listen on (positional)", default=defaultport, nargs="?", type=int, action='store')
     parser.add_argument("--host", help="Host IP to listen on. If empty, all routable interfaces are accepted.", default="")
     parser.add_argument("--launch", help="Launches a web browser when load is completed.", action='store_true')
-    parser.add_argument("--lora", help="LLAMA models only, applies a lora file on top of model. Experimental.", default="")
+    parser.add_argument("--lora", help="LLAMA models only, applies a lora file on top of model. Experimental.", metavar=('[lora_filename]', '[lora_base]'), nargs='+')
     physical_core_limit = 1
     if os.cpu_count()!=None and os.cpu_count()>1:
         physical_core_limit = int(os.cpu_count()/2)

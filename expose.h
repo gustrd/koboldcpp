@@ -11,6 +11,7 @@ struct load_model_inputs
     const char * executable_path;
     const char * model_filename;
     const char * lora_filename;
+    const char * lora_base;
     const bool use_mmap;
     const bool use_mlock;
     const bool use_smartcontext;
@@ -39,6 +40,7 @@ struct generation_inputs
     const float mirostat_eta;
     const float mirostat_tau;
     const char * stop_sequence[stop_token_max];
+    const bool stream_sse;
 };
 struct generation_outputs
 {
@@ -48,3 +50,6 @@ struct generation_outputs
 
 extern std::string executable_path;
 extern std::string lora_filename;
+extern std::string lora_base;
+extern std::vector<std::string> generated_tokens;
+extern bool generation_finished;
