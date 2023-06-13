@@ -409,9 +409,35 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     }
     else if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
     {
-        n_batch = 1;
+        //start loading the models first
+        bool useWorldTokenizer = false;
+        if (file_format == FileFormat::RWKV_1)
+        {
+            rwkv_ctx_v2 = rwkv_v2_init_from_file(modelname.c_str(), n_threads);
+        }
+        else //rwkv_2
+        {
+            rwkv_ctx_v3 = rwkv_init_from_file(modelname.c_str(), n_threads);
+            const struct rwkv_file_header & header = rwkv_ctx_v3->instance->model.header;
+            const size_t n_vocab = header.n_vocab;
+            printf("\nDetected Vocab: %d",n_vocab);
+            if(n_vocab>60000)
+            {
+                printf("\nUsing WORLD TOKENIZER");
+                useWorldTokenizer = true;
+            }
+        }
+
         std::string word;
-        read_rwkv_vocab();
+        if(useWorldTokenizer)
+        {
+            read_rwkv_world_vocab();
+        }
+        else
+        {
+            read_rwkv_vocab();
+        }
+
         int vocabsiz = rwkv_vocab.size();
         for (int i = 0; i < vocabsiz; i++)
         {
@@ -425,7 +451,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
         if (file_format == FileFormat::RWKV_1)
         {
-            rwkv_ctx_v2 = rwkv_v2_init_from_file(modelname.c_str(), n_threads);
+            n_batch = 1;
 
             //setup buffers for rwkv state
             auto padding = 512u;
@@ -453,7 +479,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         else
         {
-            rwkv_ctx_v3 = rwkv_init_from_file(modelname.c_str(), n_threads);
+            n_batch = 8; //use sequence mode to speedup
 
             //setup buffers for rwkv state
             auto padding = 512u;
@@ -946,6 +972,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             if(embd_inp.size()==0 && current_context_tokens.size()>0)
             {
                 embd_inp.push_back(current_context_tokens[current_context_tokens.size()-1]);
+                current_context_tokens.pop_back();
             }
         }
     }
@@ -1015,7 +1042,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                 }
                 else
                 {
-                    evalres = rwkv_eval(rwkv_ctx_v3, embd[0], rwkv_ctx_v3->state_in, rwkv_ctx_v3->state_out, rwkv_ctx_v3->logits_out);
+                    if(embd.size()>1)
+                    {
+                        evalres = rwkv_eval_sequence(rwkv_ctx_v3, (uint32_t*)embd.data(), embd.size(), rwkv_ctx_v3->state_in, rwkv_ctx_v3->state_out, rwkv_ctx_v3->logits_out);
+                    }
+                    else
+                    {
+                        evalres = rwkv_eval(rwkv_ctx_v3, embd[0], rwkv_ctx_v3->state_in, rwkv_ctx_v3->state_out, rwkv_ctx_v3->logits_out);
+                    }
+
                     memcpy(logits.data(), rwkv_ctx_v3->logits_out, sizeof(float) * rwkv_vocab.size());
                     rwkv_ctx_v3->state_in = rwkv_ctx_v3->state_out;
                 }
