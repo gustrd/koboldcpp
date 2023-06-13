@@ -11,6 +11,7 @@ struct load_model_inputs
     const char * executable_path;
     const char * model_filename;
     const char * lora_filename;
+    const char * lora_base;
     const bool use_mmap;
     const bool use_mlock;
     const bool use_smartcontext;
@@ -29,6 +30,7 @@ struct generation_inputs
     const int max_length;
     const float temperature;
     const int top_k;
+    const float top_a = 0.0f;
     const float top_p;
     const float typical_p;
     const float tfs;
@@ -38,6 +40,7 @@ struct generation_inputs
     const float mirostat_eta;
     const float mirostat_tau;
     const char * stop_sequence[stop_token_max];
+    const bool stream_sse;
 };
 struct generation_outputs
 {
@@ -47,3 +50,6 @@ struct generation_outputs
 
 extern std::string executable_path;
 extern std::string lora_filename;
+extern std::string lora_base;
+extern std::vector<std::string> generated_tokens;
+extern bool generation_finished;

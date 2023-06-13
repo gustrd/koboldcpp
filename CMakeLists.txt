@@ -43,41 +43,7 @@ endif()
 # 3rd party libs
 option(LLAMA_CUBLAS                 "llama: use cuBLAS"                                     ON)
 
-option(LLAMA_BUILD_TESTS            "llama: build tests"    OFF)
-option(LLAMA_BUILD_EXAMPLES         "llama: build examples" OFF)
 
-#
-# Build info header
-#
-
-# Generate initial build-info.h
-include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-info.cmake)
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-    set(GIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-
-    # Is git submodule
-    if(NOT IS_DIRECTORY "${GIT_DIR}")
-        file(READ ${GIT_DIR} REAL_GIT_DIR_LINK)
-        string(REGEX REPLACE "gitdir: (.*)\n$" "\\1" REAL_GIT_DIR ${REAL_GIT_DIR_LINK})
-        set(GIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${REAL_GIT_DIR}")
-    endif()
-
-    # Add a custom target for build-info.h
-    add_custom_target(BUILD_INFO ALL DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/build-info.h")
-
-    # Add a custom command to rebuild build-info.h when .git/index changes
-    add_custom_command(
-        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/build-info.h"
-        COMMENT "Generating build details from Git"
-        COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-info.cmake"
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        DEPENDS "${GIT_DIR}/index"
-        VERBATIM
-    )
-else()
-    message(WARNING "Git repository not found; to enable automatic generation of build info, make sure Git is installed and the project is a Git repository.")
-endif()
 
 #
 # Compile flags
@@ -90,6 +56,8 @@ set(CMAKE_C_STANDARD_REQUIRED true)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+add_compile_definitions(GGML_USE_K_QUANTS)
+
 if (LLAMA_CUBLAS)
     cmake_minimum_required(VERSION 3.17)
 
@@ -100,6 +68,7 @@ if (LLAMA_CUBLAS)
         enable_language(CUDA)
 
         set(GGML_CUDA_SOURCES ggml-cuda.cu ggml-cuda.h)
+        set(GGML_V2_CUDA_SOURCES otherarch/ggml_v2-cuda.cu otherarch/ggml_v2-cuda.h)
 
         add_compile_definitions(GGML_USE_CUBLAS)
 
@@ -271,6 +240,8 @@ endif()
 add_library(ggml OBJECT
             ggml.c
             ggml.h
+            k_quants.h
+            k_quants.c
             ${GGML_CUDA_SOURCES})
 target_include_directories(ggml PUBLIC . ./otherarch ./otherarch/tools)
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
@@ -284,6 +255,15 @@ target_include_directories(ggml_v1 PUBLIC . ./otherarch ./otherarch/tools)
 target_compile_features(ggml_v1 PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml_v1 PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
 set_target_properties(ggml_v1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(ggml_v2 OBJECT
+            otherarch/ggml_v2.c
+            otherarch/ggml_v2.h
+            ${GGML_V2_CUDA_SOURCES})
+target_include_directories(ggml_v2 PUBLIC . ./otherarch ./otherarch/tools)
+target_compile_features(ggml_v2 PUBLIC c_std_11) # don't bump
+target_link_libraries(ggml_v2 PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+set_target_properties(ggml_v2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(common2
             examples/common.cpp
@@ -314,6 +294,6 @@ target_compile_features(${TARGET} PUBLIC cxx_std_11) # don't bump
 set_target_properties(${TARGET} PROPERTIES PREFIX "")
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "koboldcpp")
 set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(${TARGET} PUBLIC ggml ggml_v1 common2 gpttype_adapter ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC ggml ggml_v1 ggml_v2 common2 gpttype_adapter ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_11)
 

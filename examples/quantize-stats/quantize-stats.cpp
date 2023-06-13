@@ -282,8 +282,9 @@ int main(int argc, char ** argv) {
                 break;
             }
             int j;
-            for (j = 0; j < GGML_TYPE_COUNT && strcmp(argv[i], ggml_type_name((ggml_type) j)) != 0; j++) {
-                // find match
+            for (j = 0; j < GGML_TYPE_COUNT; ++j) {
+               const auto * name = ggml_type_name((ggml_type) j);
+               if (name && strcmp(argv[i], name) == 0) break;
             }
             if (j < GGML_TYPE_COUNT) {
                 params.include_types.push_back((ggml_type) j);
@@ -321,7 +322,6 @@ int main(int argc, char ** argv) {
         auto lparams = llama_context_default_params();
 
         lparams.n_ctx      = 256;
-        lparams.n_parts    = 1;
         lparams.seed       = 1;
         lparams.f16_kv     = false;
         lparams.use_mlock  = false;

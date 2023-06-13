@@ -7,6 +7,7 @@
 .envrc
 .swiftpm
 .venv
+.clang-tidy
 .vs/
 .vscode/
 
@@ -17,12 +18,10 @@ build-release/
 build-static/
 build-cublas/
 build-opencl/
+build-metal/
 build-no-accel/
 build-sanitize-addr/
 build-sanitize-thread/
-
-models/*
-*.bin
 
 /main
 /quantize
@@ -33,8 +32,8 @@ models/*
 /benchmark-matmult
 /vdot
 /Pipfile
+/libllama.so
 
-build-info.h
 arm_neon.h
 compile_commands.json
 
@@ -52,12 +51,12 @@ perf-*.txt
 
 examples/jeopardy/results.txt
 koboldcpp.so
-koboldcpp_noavx2.so
+koboldcpp_failsafe.so
 koboldcpp_openblas.so
 koboldcpp_openblas_noavx2.so
 koboldcpp_clblast.so
 koboldcpp.dll
-koboldcpp_noavx2.dll
+koboldcpp_failsafe.dll
 koboldcpp_openblas.dll
 koboldcpp_openblas_noavx2.dll
 koboldcpp_clblast.dll
