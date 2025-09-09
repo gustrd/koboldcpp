@@ -10,8 +10,12 @@
 #include <vector>
 
 #include "model_adapter.h"
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "gguf.h"
 
 #include <chrono>
+#include <filesystem>
 
 static auto bench_timer = std::chrono::high_resolution_clock().now();
 
@@ -78,12 +82,64 @@ void print_tok_vec(std::vector<float> &embd)
     std::cout << "]\n";
 }
 
+bool gguf_tensor_exists(const std::string & gguf_filename, std::string tensor_name, bool exactmatch)
+{
+    struct gguf_init_params ggufparams;
+    ggufparams.no_alloc = true;
+    ggufparams.ctx = NULL;
+    struct gguf_context * ctx = gguf_init_from_file(gguf_filename.c_str(), ggufparams);
+    if (!ctx) return false;
+
+    bool found = false;
+
+    int n_tensors = gguf_get_n_tensors(ctx);
+    for (int i = 0; i < n_tensors; i++) {
+        std::string curr_name = gguf_get_tensor_name(ctx, i);
+        if(exactmatch)
+        {
+            if (curr_name == tensor_name) {
+                found = true;
+                break;
+            }
+        }
+        else
+        {
+            if (curr_name.find(tensor_name) != std::string::npos) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    gguf_free(ctx);
+    return found;
+}
+
+std::string gguf_get_model_arch(const std::string & gguf_filename)
+{
+    struct gguf_init_params ggufparams;
+    ggufparams.no_alloc = true;
+    ggufparams.ctx = NULL;
+    struct gguf_context * ctx = gguf_init_from_file(gguf_filename.c_str(), ggufparams);
+    if (!ctx) return "";
+    auto keyidx = gguf_find_key(ctx, "general.architecture");
+    std::string modelarch = "";
+    if (keyidx != -1) { modelarch = gguf_get_val_str(ctx, keyidx); }
+    gguf_free(ctx);
+    return modelarch;
+}
+
 //return val: 0=fail, 1=(original ggml, alpaca), 2=(ggmf), 3=(ggjt)
- FileFormat check_file_format(const std::string & fname)
+ FileFormat check_file_format(const std::string & fname, FileFormatExtraMeta * fileformatmeta)
  {
     std::vector<char> f_buf(1024*1024);
 
-    auto fin = std::ifstream(fname, std::ios::binary);
+    #ifdef _WIN32
+        std::filesystem::path fpath = std::filesystem::u8path(fname);
+    #else
+        std::filesystem::path fpath = std::filesystem::path(fname);
+    #endif
+    auto fin = std::ifstream(fpath, std::ios::binary);
     fin.rdbuf()->pubsetbuf(f_buf.data(), f_buf.size());
     if (!fin) {
         fprintf(stderr, "%s: failed to open '%s'\n", __func__, fname.c_str());
@@ -98,7 +154,7 @@ void print_tok_vec(std::vector<float> &embd)
        //we need to read more to determine
        int32_t vocabsiz = 0;
        fin.read((char *) &vocabsiz, sizeof(int32_t));
-       if(vocabsiz==4096) //actually the d_model for mpt
+       if(vocabsiz==4096 || vocabsiz==7168) //actually the d_model for mpt
        {
            fileformat = FileFormat::MPT_1;
        }
@@ -133,28 +189,36 @@ void print_tok_vec(std::vector<float> &embd)
        else if(vocabsiz==50257 || (vocabsiz>=49152&&vocabsiz<=49157)) //49152-6 is starcoder
        {
            fileformat = FileFormat::GPT2_1;
-           uint32_t temp;
-           fin.read((char *)&temp, sizeof(temp)); //ctx
-           fin.read((char *)&temp, sizeof(temp)); //n_embd
-           fin.read((char *)&temp, sizeof(temp)); //n_head
+           uint32_t temp, v1,v2,v3;
+           fin.read((char *)&v1, sizeof(temp)); //ctx
+           fin.read((char *)&v2, sizeof(temp)); //n_embd
+           fin.read((char *)&v3, sizeof(temp)); //n_head
            fin.read((char *)&temp, sizeof(temp)); //n_layer
-           fin.read((char *)&temp, sizeof(temp)); //f16
-           const int32_t qntvr = temp / 1000;
-           temp %= 1000;
-           if (qntvr != 0)
+           if(vocabsiz==49152 && v1==4096 && v2==2560 && v3==32 && temp==32)
            {
-               if (qntvr == 1)
-               {
-                   fileformat = FileFormat::GPT2_3;
-               }
-               else
-               {
-                   fileformat = FileFormat::GPT2_4;
-               }
+                //special case, Stablecode Completion Alpha 3B
+               fileformat = FileFormat::NEOX_6;
            }
-           else if (temp != 0 && temp != 1)
+           else
            {
-               fileformat = FileFormat::GPT2_2; //quantized format cannot be legacy type
+                fin.read((char *)&temp, sizeof(temp)); //f16
+                const int32_t qntvr = temp / 1000;
+                temp %= 1000;
+                if (qntvr != 0)
+                {
+                    if (qntvr == 1)
+                    {
+                        fileformat = FileFormat::GPT2_3;
+                    }
+                    else
+                    {
+                        fileformat = FileFormat::GPT2_4;
+                    }
+                }
+                else if (temp != 0 && temp != 1)
+                {
+                    fileformat = FileFormat::GPT2_2; //quantized format cannot be legacy type
+                }
            }
        }
        else if(vocabsiz < 31998 || vocabsiz > 33000)
@@ -243,7 +307,118 @@ void print_tok_vec(std::vector<float> &embd)
             fileformat = FileFormat::GGJT_2;
         }
     }
-    fin.close();
+    else if(magic == 0x46554747)
+    {
+        fin.close();
+        fileformat = FileFormat::GGUF_GENERIC;
+
+        struct gguf_init_params ggufparams;
+        ggufparams.no_alloc = true;
+        ggufparams.ctx = NULL;
+
+        auto ctx  = gguf_init_from_file(fname.c_str(), ggufparams);
+
+        auto keyidx = gguf_find_key(ctx, "general.architecture");
+        std::string modelarch = "";
+        if (keyidx != -1) { modelarch = gguf_get_val_str(ctx, keyidx); }
+
+        printf("\nThe reported GGUF Arch is: %s\n",(modelarch==""?"unknown":modelarch.c_str()));
+
+        if(modelarch!="" && fileformatmeta!=nullptr)
+        {
+            int n_tensors = gguf_get_n_tensors(ctx);
+            float freq_base_train = 0;
+
+            std::string fkey = modelarch+".context_length";
+            int keyidx = gguf_find_key(ctx, fkey.c_str());
+            if (keyidx != -1) {
+                fileformatmeta->n_ctx_train = gguf_get_val_u32(ctx, keyidx);
+            }
+            fkey = modelarch+".expert_count";
+            keyidx = gguf_find_key(ctx, fkey.c_str());
+            if (keyidx != -1) {
+                fileformatmeta->n_expert_count = gguf_get_val_u32(ctx, keyidx);
+            }
+            fkey = modelarch+".rope.freq_base";
+            keyidx = gguf_find_key(ctx, fkey.c_str());
+            if (keyidx != -1) {
+                freq_base_train = gguf_get_val_f32(ctx, keyidx);
+            }
+            fkey = "tokenizer.ggml.add_bos_token";
+            keyidx = gguf_find_key(ctx, fkey.c_str());
+            if (keyidx != -1) {
+                bool result = gguf_get_val_bool(ctx, keyidx);
+                if(result==false)
+                {
+                    fileformatmeta->explicitly_no_bos = true;
+                }
+            }
+
+            int filever = gguf_get_version(ctx);
+
+            fileformatmeta->fileversion = filever;
+            fileformatmeta->model_architecture = GGUFArch::ARCH_DEFAULT;
+            fileformatmeta->model_architecture_str = modelarch;
+            if(modelarch=="phi2")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_PHI;
+            }
+            else if(modelarch=="falcon")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_FALCON;
+            }
+            else if(modelarch=="mamba")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_MAMBA;
+            }
+            else if(modelarch=="jamba")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_JAMBA;
+            }
+            else if(modelarch=="llama" && freq_base_train==10000.0f && (n_tensors==435 || n_tensors==611))
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_SOLAR;
+            }
+            else if(modelarch=="qwen2")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_QWEN2;
+            }
+            else if(modelarch=="qwen2vl")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_QWEN2VL;
+            }
+            else if(modelarch=="gemma3")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_GEMMA3;
+            }
+            else if(modelarch=="gemma3n")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_GEMMA3N;
+            }
+            else if(modelarch=="rwkv6" || modelarch=="rwkv7")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_RWKV;
+            }
+            else if(modelarch=="glm4" || modelarch=="glm4moe")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_GLM4;
+            }
+            else if(modelarch=="gpt-oss")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_GPTOSS;
+            }
+            printf("Arch Category: %d\n",fileformatmeta->model_architecture);
+
+        }
+
+        gguf_free(ctx);
+    }
+
+    if(fin.is_open())
+    {
+        fin.close();
+    }
+
 
     return fileformat;
  }
@@ -348,9 +523,10 @@ void print_tok_vec(std::vector<float> &embd)
 
     //fast forward the past based on identical tokens, stop once a divergence is noted
     int embd_inp_len = embd_inp.size();
+    int cur_ctx_len = current_context_tokens.size();
     bool fastforwardok = true;
 
-    for (int i = 0; i < current_context_tokens.size(); ++i)
+    for (int i = 0; i < cur_ctx_len; ++i)
     {
         if (current_context_tokens[i] == embd_inp[i])
         {
@@ -381,6 +557,10 @@ void print_tok_vec(std::vector<float> &embd)
         else
         {
             if ((i + 2) >= embd_inp_len)
+            {
+                break;
+            }
+            if ((i + 2) >= cur_ctx_len)
             {
                 break;
             }

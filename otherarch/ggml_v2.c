@@ -1,6 +1,3 @@
-// Defines CLOCK_MONOTONIC on Linux
-#define _GNU_SOURCE
-
 #include "ggml_v2.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -139,8 +136,9 @@ inline static void* ggml_v2_aligned_malloc(size_t size) {
 #include <Accelerate/Accelerate.h>
 #elif defined(GGML_USE_OPENBLAS)
 #include <cblas.h>
-#elif defined(GGML_USE_CUBLAS)
+#elif defined(GGML_USE_CUDA)
 #include "ggml_v2-cuda.h"
+#include "ggml_v2-cuda-legacy.h"
 #endif
 #if defined(GGML_USE_CLBLAST)
 #include "ggml_v2-opencl.h"
@@ -471,6 +469,9 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 //
 // quantization
 //
+#ifndef MM256_SET_M128I
+#define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+#endif
 
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
 // multiply int8_t, add results pairwise twice
@@ -531,7 +532,7 @@ static inline __m256i bytes_from_bits_32(const uint8_t * x) {
 static inline __m256i bytes_from_nibbles_32(const uint8_t * rsi)
 {
     const __m128i tmp = _mm_loadu_si128((const __m128i *)rsi);
-    const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
+    const __m256i bytes = MM256_SET_M128I(_mm_srli_epi16(tmp, 4), tmp);
     const __m256i lowMask = _mm256_set1_epi8( 0xF );
     return _mm256_and_si256(lowMask, bytes);
 }
@@ -604,7 +605,7 @@ static inline __m256i bytes_from_bits_32(const uint8_t * x) {
     bytesh = _mm_or_si128(bytesh, bit_mask);
     bytesl = _mm_cmpeq_epi8(bytesl, _mm_set1_epi64x(-1));
     bytesh = _mm_cmpeq_epi8(bytesh, _mm_set1_epi64x(-1));
-    return _mm256_set_m128i(bytesh, bytesl);
+    return MM256_SET_M128I(bytesh, bytesl);
 }
 
 // Unpack 32 4-bit fields into 32 bytes
@@ -617,7 +618,7 @@ static inline __m256i bytes_from_nibbles_32(const uint8_t * rsi)
     const __m128i lowMask = _mm_set1_epi8(0xF);
     tmpl = _mm_and_si128(lowMask, tmpl);
     tmph = _mm_and_si128(lowMask, tmph);
-    return _mm256_set_m128i(tmph, tmpl);
+    return MM256_SET_M128I(tmph, tmpl);
 }
 
 // add int16_t pairwise and return as float vector
@@ -625,7 +626,7 @@ static inline __m256 sum_i16_pairs_float(const __m128i xh, const __m128i xl) {
     const __m128i ones = _mm_set1_epi16(1);
     const __m128i summed_pairsl = _mm_madd_epi16(ones, xl);
     const __m128i summed_pairsh = _mm_madd_epi16(ones, xh);
-    const __m256i summed_pairs = _mm256_set_m128i(summed_pairsh, summed_pairsl);
+    const __m256i summed_pairs = MM256_SET_M128I(summed_pairsh, summed_pairsl);
     return _mm256_cvtepi32_ps(summed_pairs);
 }
 
@@ -1524,9 +1525,9 @@ quantize_fns_t2 ggml_v2_internal_get_quantize_fn(size_t i) {
 
 bool quants_unshuffled = false; //new GGJT_2 is unshuffled, all old ones are shuffled
 static const quantize_fns_t2 quantize_fns_v2[GGML_V2_TYPE_COUNT]; //forward decl
-static inline quantize_fns_t2 get_quantize_fn(size_t i) 
+static inline quantize_fns_t2 get_quantize_fn(size_t i)
 {
-    return(quants_unshuffled?quantize_fns[i]:quantize_fns_v2[i]);  
+    return(quants_unshuffled?quantize_fns[i]:quantize_fns_v2[i]);
 }
 
 
@@ -2245,7 +2246,7 @@ static void ggml_v2_vec_dot_q4_0_q8_0(const int n, float * restrict s, const voi
         const __m128i i32_1 = mul_sum_i8_pairs(bx, by);
 
         // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps(_mm256_set_m128i(i32_0, i32_1));
+        __m256 p = _mm256_cvtepi32_ps(MM256_SET_M128I(i32_0, i32_1));
 
         // Apply the scale, and accumulate
         acc = _mm256_add_ps(_mm256_mul_ps( d, p ), acc);
@@ -2726,7 +2727,7 @@ static void ggml_v2_vec_dot_q5_0_q8_0(const int n, float * restrict s, const voi
         __m128i bxh = _mm256_extractf128_si256(bx, 1);
         bxl = _mm_or_si128(bxl, bxhil);
         bxh = _mm_or_si128(bxh, bxhih);
-        bx = _mm256_set_m128i(bxh, bxl);
+        bx = MM256_SET_M128I(bxh, bxl);
 
         const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
 
@@ -2988,7 +2989,7 @@ static void ggml_v2_vec_dot_q5_1_q8_1(const int n, float * restrict s, const voi
         __m128i bxh = _mm256_extractf128_si256(bx, 1);
         bxl = _mm_or_si128(bxl, bxhil);
         bxh = _mm_or_si128(bxh, bxhih);
-        bx = _mm256_set_m128i(bxh, bxl);
+        bx = MM256_SET_M128I(bxh, bxl);
 
         const __m256 dy = _mm256_broadcast_ss(&y[i].d);
         const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
@@ -3894,8 +3895,15 @@ struct ggml_v2_context * ggml_v2_init(struct ggml_v2_init_params params) {
             GGML_V2_PRINT_DEBUG("%s: g_state initialized in %f ms\n", __func__, (t_end - t_start)/1000.0f);
         }
 
-#if defined(GGML_USE_CUBLAS)
-        ggml_v2_init_cublas();
+#if defined(GGML_USE_CUDA)
+        if(quants_unshuffled)
+        {
+            ggml_v2_init_cublas();
+        }
+        else
+        {
+            ggml_v2_init_cublas_legacy();
+        }
 #elif defined(GGML_USE_CLBLAST)
         if(quants_unshuffled)
         {
@@ -9448,10 +9456,16 @@ static void ggml_v2_compute_forward_mul_mat_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
     if (ggml_v2_cuda_can_mul_mat(src0, src1, dst)) {
         if (params->ith == 0 && params->type == GGML_V2_TASK_COMPUTE) {
+            if(quants_unshuffled)
+            {
             ggml_v2_cuda_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+            }else
+            {
+            ggml_v2_cuda_mul_mat_legacy(src0, src1, dst, params->wdata, params->wsize);
+            }
         }
         return;
     }
@@ -9642,10 +9656,16 @@ static void ggml_v2_compute_forward_mul_mat_f16_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
     if (ggml_v2_cuda_can_mul_mat(src0, src1, dst)) {
         if (params->ith == 0 && params->type == GGML_V2_TASK_COMPUTE) {
+            if(quants_unshuffled)
+            {
             ggml_v2_cuda_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+            }else
+            {
+            ggml_v2_cuda_mul_mat_legacy(src0, src1, dst, params->wdata, params->wsize);
+            }
         }
         return;
     }
@@ -9881,10 +9901,16 @@ static void ggml_v2_compute_forward_mul_mat_q_f32(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
     if (ggml_v2_cuda_can_mul_mat(src0, src1, dst)) {
         if (params->ith == 0 && params->type == GGML_V2_TASK_COMPUTE) {
+            if(quants_unshuffled)
+            {
             ggml_v2_cuda_mul_mat(src0, src1, dst, params->wdata, params->wsize);
+            }else
+            {
+            ggml_v2_cuda_mul_mat_legacy(src0, src1, dst, params->wdata, params->wsize);
+            }
         }
         return;
     }
@@ -14061,7 +14087,7 @@ void ggml_v2_graph_compute(struct ggml_v2_context * ctx, struct ggml_v2_cgraph *
 
                         size_t cur = 0;
 
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
                         if (ggml_v2_cuda_can_mul_mat(node->src0, node->src1, node)) {
                             node->n_tasks = 1; // TODO: this actually is doing nothing
                                                 //       the threads are still spinning
@@ -15559,7 +15585,7 @@ int ggml_v2_cpu_has_wasm_simd(void) {
 }
 
 int ggml_v2_cpu_has_blas(void) {
-#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST)
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUDA) || defined(GGML_USE_CLBLAST)
     return 1;
 #else
     return 0;
@@ -15567,7 +15593,7 @@ int ggml_v2_cpu_has_blas(void) {
 }
 
 int ggml_v2_cpu_has_cublas(void) {
-#if defined(GGML_USE_CUBLAS)
+#if defined(GGML_USE_CUDA)
     return 1;
 #else
     return 0;
@@ -17391,7 +17417,7 @@ static void ggml_v2_vec_dot_q4_0_q8_0_v2(const int n, float * restrict s, const 
         }
 
         // Convert int32_t to float
-        __m256 p = _mm256_cvtepi32_ps( _mm256_set_m128i( i32[0], i32[1] ));
+        __m256 p = _mm256_cvtepi32_ps( MM256_SET_M128I( i32[0], i32[1] ));
         // Apply the scale, and accumulate
         acc = _mm256_add_ps(_mm256_mul_ps( d, p ), acc);
     }
@@ -17660,7 +17686,7 @@ static void ggml_v2_vec_dot_q4_2_q8_0_v2(const int n, float * restrict s, const 
 
         __m128i bx0 = bytes_from_nibbles_16(x[2*i + 0].qs);
         __m128i bx1 = bytes_from_nibbles_16(x[2*i + 1].qs);
-        __m256i bx = _mm256_set_m128i(bx1, bx0);
+        __m256i bx = MM256_SET_M128I(bx1, bx0);
 
         // Now we have a vector with bytes in [ 0 .. 15 ] interval. Offset them into [ -8 .. +7 ] interval.
         const __m256i off = _mm256_set1_epi8(8);
@@ -17793,7 +17819,7 @@ static void ggml_v2_vec_dot_q4_3_q8_1_v2(const int n, float * restrict s, const 
 
         const __m128i bx0 = bytes_from_nibbles_16(x[2*i + 0].qs);
         const __m128i bx1 = bytes_from_nibbles_16(x[2*i + 1].qs);
-        const __m256i bx = _mm256_set_m128i(bx1, bx0);
+        const __m256i bx = MM256_SET_M128I(bx1, bx0);
 
         const __m256 dy = _mm256_broadcast_ss(&y[i].d);
         const __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);

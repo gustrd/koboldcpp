@@ -48,14 +48,6 @@
         } \
     } while (0)
 
-#ifdef __GNUC__
-#ifdef __MINGW32__
-__attribute__((format(gnu_printf, 1, 2)))
-#else
-__attribute__((format(printf, 1, 2)))
-#endif
-#endif
-
 
 struct llama_v2_file {
     // use FILE * so we don't have to re-open the file to mmap
@@ -65,7 +57,7 @@ struct llama_v2_file {
     llama_v2_file(const char * fname, const char * mode) {
         fp = std::fopen(fname, mode);
         if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+            throw std::runtime_error(format_old("failed to open %s: %s", fname, strerror(errno)));
         }
         seek(0, SEEK_END);
         size = tell();
@@ -98,7 +90,7 @@ struct llama_v2_file {
         errno = 0;
         std::size_t ret = std::fread(ptr, size, 1, fp);
         if (ferror(fp)) {
-            throw std::runtime_error(format("read error: %s", strerror(errno)));
+            throw std::runtime_error(format_old("read error: %s", strerror(errno)));
         }
         if (ret != 1) {
             throw std::runtime_error(std::string("unexpectedly reached end of file"));
@@ -124,7 +116,7 @@ struct llama_v2_file {
         errno = 0;
         size_t ret = std::fwrite(ptr, size, 1, fp);
         if (ret != 1) {
-            throw std::runtime_error(format("write error: %s", strerror(errno)));
+            throw std::runtime_error(format_old("write error: %s", strerror(errno)));
         }
     }
 
@@ -171,7 +163,7 @@ struct llama_v2_mmap {
 #endif
         addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
-            throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+            throw std::runtime_error(format_old("mmap failed: %s", strerror(errno)));
         }
 
         if (prefetch) {
@@ -198,7 +190,7 @@ struct llama_v2_mmap {
         DWORD error = GetLastError();
 
         if (hMapping == NULL) {
-            throw std::runtime_error(format("CreateFileMappingA failed: %s", llama_v2_format_win_err(error).c_str()));
+            throw std::runtime_error(format_old("CreateFileMappingA failed: %s", llama_v2_format_win_err(error).c_str()));
         }
 
         addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
@@ -206,7 +198,7 @@ struct llama_v2_mmap {
         CloseHandle(hMapping);
 
         if (addr == NULL) {
-            throw std::runtime_error(format("MapViewOfFile failed: %s", llama_v2_format_win_err(error).c_str()));
+            throw std::runtime_error(format_old("MapViewOfFile failed: %s", llama_v2_format_win_err(error).c_str()));
         }
 
         #ifndef USE_FAILSAFE
@@ -225,7 +217,7 @@ struct llama_v2_mmap {
         #pragma message("warning: You are building for pre-Windows 8; prefetch not supported")
         #endif // _WIN32_WINNT >= _WIN32_WINNT_WIN8
         #else
-        printf("\nPrefetchVirtualMemory skipped in failsafe mode.");
+        printf("\nPrefetchVirtualMemory skipped in compatibility mode.\n");
         #endif
     }
 
@@ -415,7 +407,7 @@ struct llama_v2_buffer {
     llama_v2_buffer& operator=(llama_v2_buffer&&) = delete;
 };
 
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
 #include "ggml_v2-cuda.h"
 struct llama_v2_ctx_buffer {
     uint8_t * addr = NULL;
