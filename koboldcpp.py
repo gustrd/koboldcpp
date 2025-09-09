@@ -425,7 +425,7 @@ def debug_dark_yellow_utf(msg: str, *, file=sys.stderr, encoding: str = "utf-8",
     ESC = "\033["       # CSI
     YELLOW = "0;33m"    # normal/dark yellow
     RESET = "\033[0m"
-    full = f"{ESC}{YELLOW}{"\n" + msg}{RESET}\n"
+    full = f"{ESC}{YELLOW}\n{msg}{RESET}\n"
 
     # Prefer writing bytes to the underlying buffer if possible
     try:
@@ -6281,7 +6281,8 @@ def run_horde_worker(args, api_key, worker_name):
             # GRD_DEBUG: Try to identify the bug where a single token is always sampled and restart
             try:
                 generated_string = current_generation["results"][0]["text"]
-                
+                debug_dark_yellow_utf(generated_string)
+
                 repeated_substring, count = detect_repeated_prefix(generated_string)
                 if count >= 5:
                     debug_dark_yellow_utf("ERROR: Single token sample bug detected. Restarting...")
