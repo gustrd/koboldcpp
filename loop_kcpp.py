@@ -131,7 +131,8 @@ def _search_json_for_string(obj, substring: str) -> bool:
 def http_contains(url: str, header_name: str, header_value: str, substring: str, timeout: int = 10) -> bool:
     """
     Performs GET request to URL, attempts to parse JSON and searches for substring.
-    Returns False on any error.
+    Returns False only if the substring is not found in a valid response.
+    Returns True for timeout errors (assumes worker is still online).
     """
     req = urllib.request.Request(url, headers={header_name: header_value})
     try:
@@ -150,6 +151,13 @@ def http_contains(url: str, header_name: str, header_value: str, substring: str,
                 except Exception:
                     pass
             return substring.lower() in text.lower()
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, socket.timeout):
+            print(f"{time.asctime()} - HTTP timeout when querying {url}: {e}", file=sys.stderr)
+            return True  # Timeout: assume worker is still online
+        else:
+            print(f"{time.asctime()} - HTTP error when querying {url}: {e}", file=sys.stderr)
+            return False
     except Exception as e:
         print(f"{time.asctime()} - HTTP error when querying {url}: {e}", file=sys.stderr)
         return False
