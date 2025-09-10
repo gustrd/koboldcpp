@@ -151,16 +151,10 @@ def http_contains(url: str, header_name: str, header_value: str, substring: str,
                 except Exception:
                     pass
             return substring.lower() in text.lower()
-    except urllib.error.URLError as e:
-        if isinstance(e.reason, socket.timeout):
-            print(f"{time.asctime()} - HTTP timeout when querying {url}: {e}", file=sys.stderr)
-            return True  # Timeout: assume worker is still online
-        else:
-            print(f"{time.asctime()} - HTTP error when querying {url}: {e}", file=sys.stderr)
-            return False
+
     except Exception as e:
-        print(f"{time.asctime()} - HTTP error when querying {url}: {e}", file=sys.stderr)
-        return False
+        print(f"{time.asctime()} - HTTP error when querying {url}: {e}. Will try again.", file=sys.stderr)
+        return True
 
 
 def stream_process_output(cmd: str, use_shell: bool = True, start_reason: str = "Unknown") -> subprocess.Popen:
