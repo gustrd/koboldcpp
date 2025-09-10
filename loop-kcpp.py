@@ -162,7 +162,14 @@ def stream_process_output(cmd: str, use_shell: bool = True, start_reason: str = 
     """
     log(f"Starting command: {cmd}")
     log_to_file(f"BEGIN inner script run - Reason: {start_reason} - Command: {cmd}")
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "encoding": "utf-8",
+        "errors": "replace", 
+        "text": True,
+        "bufsize": 1
+        }
 
     if platform.system() == "Windows":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -180,7 +187,6 @@ def stream_process_output(cmd: str, use_shell: bool = True, start_reason: str = 
             for line in iter(pipe.readline, ""):
                 if not line:
                     break
-                # Prefix to identify the worker output
                 sys.stdout.write(f"KOBOLD: {line}")
                 sys.stdout.flush()
         except Exception as e:
