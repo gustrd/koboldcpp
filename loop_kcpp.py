@@ -128,13 +128,20 @@ def _search_json_for_string(obj, substring: str) -> bool:
     return False
 
 
-def http_contains(url: str, header_name: str, header_value: str, substring: str, timeout: int = 10) -> bool:
+def http_contains(url: str, substring: str, timeout: int = 10) -> bool:
     """
     Performs GET request to URL, attempts to parse JSON and searches for substring.
     Returns False only if the substring is not found in a valid response.
     Returns True for timeout errors (assumes worker is still online).
     """
-    req = urllib.request.Request(url, headers={header_name: header_value})
+
+    headers = {
+        "X-Fields": "name",
+        "User-Agent": "Mozilla/5.0",    # prevents bot blocking
+        "Accept": "application/json",   # tells server what you expect  
+    }
+
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
@@ -426,9 +433,9 @@ def main() -> None:
                     break
                 continue
 
-            online = http_contains(args.url, "X-Fields", "name", args.string)
+            online = http_contains(args.url, args.string)
             if online:
-                log("Worker appears online (substring found).")
+                log("Worker appears online, or request failed.")
                 if interruptible_sleep(args.interval, args.sleep_interval):
                     break
                 continue
