@@ -37,7 +37,9 @@ except Exception:
 
 
 def log(msg: str) -> None:
-    print(f"{time.asctime()} - {msg}")
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+    print(f"{time.asctime()} - {BLUE}{msg}{RESET}")
 
 def log_to_file(msg: str, log_file: str = "_loop-kcpp.log") -> None:
     """Log message to file with timestamp."""
