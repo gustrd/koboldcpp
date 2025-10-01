@@ -484,8 +484,8 @@ void ContextRewind(std::vector<int> &embd, std::vector<int> &current_context_tok
         printf("\nWARNING: Don't use context rewind when in batch processing phase!\n");
         return;
     }
-    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBA
-    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV || file_format_meta.model_architecture==GGUFArch::ARCH_JAMBA));
+    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBALIKE
+    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV));
     if(file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2 || is_recurrent)
     {
         printf("\nWARNING: RNN models do not support context rewind!\n");
@@ -607,7 +607,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, const ll
     draft_ctx_params.n_ubatch = base_ctx_params.n_ubatch;
     draft_ctx_params.n_threads = base_ctx_params.n_threads;
     draft_ctx_params.n_threads_batch =  base_ctx_params.n_threads_batch;
-    draft_ctx_params.flash_attn = base_ctx_params.flash_attn;
+    draft_ctx_params.flash_attn_type = base_ctx_params.flash_attn_type;
     draft_ctx_params.type_k = base_ctx_params.type_k;
     draft_ctx_params.type_v = base_ctx_params.type_v;
     draft_ctx_params.swa_full = base_ctx_params.swa_full;
@@ -2401,7 +2401,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             llamamodel->vocab.set_eos_bos(0,0);
         }
 
-        llama_ctx_params.flash_attn = kcpp_data->flash_attn;
+        llama_ctx_params.flash_attn_type = (kcpp_data->flash_attn?LLAMA_FLASH_ATTN_TYPE_ENABLED:LLAMA_FLASH_ATTN_TYPE_DISABLED);
         llama_ctx_params.swa_full = kcpp_data->swa_full;
         llama_ctx_params.type_k = (inputs.quant_k>1?GGML_TYPE_Q4_0:(inputs.quant_k==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
         llama_ctx_params.type_v = (inputs.quant_v>1?GGML_TYPE_Q4_0:(inputs.quant_v==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
@@ -3747,8 +3747,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         printf("%s\n", RemoveBell(outstr).c_str());
     }
 
-    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBA
-    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV || file_format_meta.model_architecture==GGUFArch::ARCH_JAMBA));
+    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBALIKE
+    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV));
     bool blank_prompt = (addedmemory=="" && kcpp_data->prompt=="");
 
     if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2 || is_recurrent)

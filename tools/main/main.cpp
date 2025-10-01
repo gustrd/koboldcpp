@@ -179,7 +179,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // Start the non-batch threadpool in the paused state
+        // start the non-batch threadpool in the paused state
         tpp.paused = true;
     }
 
@@ -588,12 +588,12 @@ int main(int argc, char ** argv) {
 
                 if (n_past + (int) embd.size() >= n_ctx) {
                     if (!params.ctx_shift){
-                        LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+                        LOG_WRN("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
                         break;
                     }
 
                     if (params.n_predict == -2) {
-                        LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
+                        LOG_WRN("\n\n%s: context full and n_predict == %d => stopping\n", __func__, params.n_predict);
                         break;
                     }
 
