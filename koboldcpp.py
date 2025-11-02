@@ -397,7 +397,121 @@ class embeddings_generation_outputs(ctypes.Structure):
                 ("count", ctypes.c_int),
                 ("data", ctypes.c_char_p)]
 
+# GRD: Custom functions
+from typing import Optional
 
+def _enable_windows_ansi() -> None:
+    """
+    Try to enable ANSI escape sequence handling on Windows 10+ consoles.
+    Fails silently on older Windows or when not available.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint()
+        if kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode)):
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(hStdOut, new_mode)
+    except Exception:
+        # If anything goes wrong (permissions, platform), just ignore — not fatal.
+        pass
+
+_enable_windows_ansi()
+
+def debug_dark_yellow_utf(msg: str, *, file=sys.stderr, encoding: str = "utf-8", errors: str = "backslashreplace") -> None:
+    """
+    Print a debug message in dark yellow and safely handle UTF characters.
+
+    - `msg` should be a Python str (Unicode).
+    - `file` can be any text stream (defaults to sys.stderr).
+      If the stream exposes a `.buffer` attribute (binary underlying stream),
+      the function will encode to `encoding` and write bytes directly to it,
+      avoiding issues if the text wrapper's encoding is something else.
+    - `errors` controls how encoding errors are handled (default 'backslashreplace').
+    """
+    ESC = "\033["       # CSI
+    YELLOW = "0;33m"    # normal/dark yellow
+    RESET = "\033[0m"
+    full = f"{ESC}{YELLOW}\n{msg}{RESET}\n"
+
+    # Prefer writing bytes to the underlying buffer if possible
+    try:
+        buf = getattr(file, "buffer", None)
+        if buf is not None and hasattr(buf, "write"):
+            # encode explicitly to the chosen encoding
+            b = full.encode(encoding, errors=errors)
+            buf.write(b)
+            buf.flush()
+            return
+    except Exception:
+        # fall through to text-mode print if binary write fails
+        pass
+
+    # Fallback: use normal print (may raise if stream can't accept some codepoints)
+    try:
+        print(full, end="", file=file)
+    except Exception:
+        # As a last resort, replace problematic characters and print
+        safe = full.encode(encoding, errors=errors).decode(encoding, errors="replace")
+        print(safe, end="", file=file)
+
+def restart_program() -> None:
+    """
+    Restart the current Python program, replacing the current process with a fresh Python process
+    invoked with the same executable and the same command-line arguments.
+
+    Important: this function does not return if successful — the current process is replaced.
+    Use with care (don't call inside an interactive notebook unless you expect the kernel to be replaced).
+    """
+    python = sys.executable
+    args = [python] + sys.argv
+    # Make sure std streams are flushed before exec
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os.execv(python, args)
+
+def detect_repeated_prefix(s: str, min_repeats: int = 5) -> Tuple[Optional[str], int]:
+    """
+    Detect if the string `s` begins with some substring repeated at least `min_repeats` times.
+    If found, prints the substring and how many times it appears consecutively from the start,
+    and returns (substring, count). If not found, returns (None, 0).
+
+    Strategy:
+    - Try candidate substring lengths from 1 up to floor(len(s) / min_repeats).
+      (If len(s) < min_repeats then no candidate possible.)
+    - For each candidate length L, take prefix = s[:L] and count how many consecutive copies
+      of prefix occur starting at index 0.
+    - Return the first (smallest L) match that yields count >= min_repeats.
+    """
+    n = len(s)
+    if n == 0 or n < min_repeats:
+        debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
+        return None, 0
+
+    max_sub_len = n // min_repeats  # a substring longer than this cannot repeat min_repeats times
+    for sub_len in range(1, max_sub_len + 1):
+        prefix = s[:sub_len]
+        count = 0
+        i = 0
+        # Count consecutive repeats of `prefix` from the beginning
+        while i + sub_len <= n and s[i:i+sub_len] == prefix:
+            count += 1
+            i += sub_len
+        if count >= min_repeats:
+            debug_dark_yellow_utf(f"Substring '{prefix}' repeated {count} times from the beginning.")
+            return prefix, count
+
+    debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
+    return None, 0
+
+# Original functions
 
 def getdirpath():
     return os.path.dirname(os.path.realpath(__file__))
@@ -6421,6 +6535,20 @@ def run_horde_worker(args, api_key, worker_name):
         #submit reply
         print("") #empty newline
         if current_generation:
+
+            # GRD_DEBUG: Try to identify the bug where a single token is always sampled and restart
+            try:
+                generated_string = current_generation["results"][0]["text"]
+                debug_dark_yellow_utf(generated_string)
+
+                repeated_substring, count = detect_repeated_prefix(generated_string)
+                if count >= 5:
+                    debug_dark_yellow_utf("ERROR: Single token sample bug detected. Restarting...")
+                    restart_program()
+            except Exception as e:
+                debug_dark_yellow_utf("DEBUG ERROR: " + str(e))
+                pass
+
             submit_dict = {
                 "id": current_id,
                 "generation": current_generation["results"][0]["text"],
