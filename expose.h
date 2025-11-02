@@ -5,6 +5,7 @@ const int tensor_split_max = 16;
 const int images_max = 8;
 const int audio_max = 4;
 const int logprobs_max = 5;
+const int overridekv_max = 4;
 
 // match kobold's sampler list and order
 enum samplers
@@ -55,7 +56,7 @@ struct load_model_inputs
     const int clblast_info = 0;
     const int kcpp_main_gpu = 0;
     const char * vulkan_info = nullptr;
-    const int blasbatchsize = 512;
+    const int batchsize = 512;
     const int forceversion = 0;
     const int gpulayers = 0;
     const float rope_freq_scale = 1.0f;
@@ -65,7 +66,7 @@ struct load_model_inputs
     const int moecpu = 0;
     const bool no_bos_token = false;
     const bool load_guidance = false;
-    const char * override_kv = nullptr;
+    const char * override_kv[overridekv_max] = {};
     const char * override_tensors = nullptr;
     const bool flash_attention = false;
     const float tensor_split[tensor_split_max] = {};
@@ -167,13 +168,16 @@ struct sd_load_model_inputs
     const int threads = 0;
     const int quant = 0;
     const bool flash_attention = false;
+    const bool offload_cpu = false;
+    const bool vae_cpu = false;
+    const bool clip_cpu = false;
     const bool diffusion_conv_direct = false;
     const bool vae_conv_direct = false;
     const bool taesd = false;
     const int tiled_vae_threshold = 0;
     const char * t5xxl_filename = nullptr;
-    const char * clipl_filename = nullptr;
-    const char * clipg_filename = nullptr;
+    const char * clip1_filename = nullptr;
+    const char * clip2_filename = nullptr;
     const char * vae_filename = nullptr;
     const char * lora_filename = nullptr;
     const float lora_multiplier = 1.0f;
@@ -194,16 +198,22 @@ struct sd_generation_inputs
     const bool flip_mask = false;
     const float denoising_strength = 0.0f;
     const float cfg_scale = 0.0f;
+    const float distilled_guidance = -1.0f;
+    const int shifted_timestep = 0;
     const int sample_steps = 0;
     const int width = 0;
     const int height = 0;
     const int seed = 0;
     const char * sample_method = nullptr;
+    const char * scheduler = nullptr;
     const int clip_skip = -1;
+    const int vid_req_frames = 1;
+    const int vid_req_avi = 0;
 };
 struct sd_generation_outputs
 {
     int status = -1;
+    int animated = 0;
     const char * data = "";
 };
 

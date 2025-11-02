@@ -484,8 +484,15 @@ void ContextRewind(std::vector<int> &embd, std::vector<int> &current_context_tok
         printf("\nWARNING: Don't use context rewind when in batch processing phase!\n");
         return;
     }
-    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBALIKE
-    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV));
+    bool is_recurrent = false;
+    if(file_format==FileFormat::GGUF_GENERIC)
+    {
+        const llama_model * mdl = llama_get_model(llama_ctx_v4);
+        if(llama_model_is_recurrent(mdl) || llama_model_is_hybrid(mdl))
+        {
+            is_recurrent = true;
+        }
+    }
     if(file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2 || is_recurrent)
     {
         printf("\nWARNING: RNN models do not support context rewind!\n");
@@ -623,7 +630,7 @@ static void speculative_decoding_setup(std::string spec_model_filename, const ll
     {
         const llama_vocab * tmpvocab = llama_model_get_vocab(draftmodel);
         int draftvocab = llama_vocab_n_tokens(tmpvocab);
-        if(llama_model_is_recurrent(draftmodel))
+        if(llama_model_is_recurrent(draftmodel) || llama_model_is_hybrid(draftmodel))
         {
             printf("Error: Speculative decoding cannot be used with Recurrent draft models!\n");
             llama_free(draft_ctx);
@@ -1965,7 +1972,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     kcpp_data->n_threads = inputs.threads;
     kcpp_data->n_blasthreads = inputs.blasthreads;
     bool isGguf = (file_format == FileFormat::GGUF_GENERIC);
-    kcpp_data->n_batch = GetBatchSize(inputs.blasbatchsize, in_file_format);
+    kcpp_data->n_batch = GetBatchSize(inputs.batchsize, in_file_format);
     kcpp_data->n_ubatch = kcpp_data->n_batch;
     kcpp_data->flash_attn = inputs.flash_attention;
     kcpp_data->model_filename = inputs.model_filename;
@@ -2274,14 +2281,18 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             kvo.val_i64 = inputs.moe_experts;
             kvos.push_back(kvo);
         }
-        std::string override_kv = inputs.override_kv;
-        if(override_kv != "" && file_format==FileFormat::GGUF_GENERIC)
+        for(int x=0;x<overridekv_max;++x)
         {
-            printf("\nAttempting to apply KV override: %s...\n",override_kv.c_str());
-            bool kvo_ok = string_parse_kv_override(override_kv.c_str(),kvos);
-            LLAMA_LOG_INFO("\nKV override parse: %s\n",(kvo_ok?"success":"failed"));
-            fflush(stdout);
+            std::string override_kv = inputs.override_kv[x];
+            if(override_kv != "" && file_format==FileFormat::GGUF_GENERIC)
+            {
+                printf("\nAttempting to apply KV override: %s...\n",override_kv.c_str());
+                bool kvo_ok = string_parse_kv_override(override_kv.c_str(),kvos);
+                LLAMA_LOG_INFO("\nKV override parse: %s\n",(kvo_ok?"success":"failed"));
+                fflush(stdout);
+            }
         }
+
         if(kvos.size()>0)
         {
             kvos.emplace_back();
@@ -2355,7 +2366,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
 
         llama_model * llamamodel = llama_model_load_from_file(kcpp_data->model_filename.c_str(), model_params);
-        if(file_format_meta.model_architecture == GGUFArch::ARCH_QWEN2VL || llama_model_rope_type(llamamodel)==LLAMA_ROPE_TYPE_MROPE)
+        if(file_format_meta.model_architecture == GGUFArch::ARCH_QWEN2VL || llama_model_rope_type(llamamodel)==LLAMA_ROPE_TYPE_MROPE || llama_model_rope_type(llamamodel)==LLAMA_ROPE_TYPE_IMROPE)
         {
             printf("\nMRope is used, context shift will be disabled!\n");
             kcpp_data->use_contextshift = false;
@@ -2516,7 +2527,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
         if(draftmodel_filename !="" && file_format==FileFormat::GGUF_GENERIC)
         {
-            if(llama_model_is_recurrent(llamamodel))
+            if(llama_model_is_recurrent(llamamodel) || llama_model_is_hybrid(llamamodel))
             {
                 printf("Error: Speculative decoding cannot be used with Recurrent models!\n");
             }
@@ -3747,8 +3758,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         printf("%s\n", RemoveBell(outstr).c_str());
     }
 
-    bool is_recurrent = (file_format == FileFormat::GGUF_GENERIC && (file_format_meta.model_architecture==GGUFArch::ARCH_MAMBALIKE
-    || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV));
+    bool is_recurrent = false;
+    if(file_format==FileFormat::GGUF_GENERIC)
+    {
+        const llama_model * mdl = llama_get_model(llama_ctx_v4);
+        if(llama_model_is_recurrent(mdl) || llama_model_is_hybrid(mdl) || file_format_meta.model_architecture==GGUFArch::ARCH_MAMBALIKE || file_format_meta.model_architecture==GGUFArch::ARCH_RWKV)
+        {
+            is_recurrent = true;
+        }
+    }
     bool blank_prompt = (addedmemory=="" && kcpp_data->prompt=="");
 
     if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2 || is_recurrent)
@@ -3774,6 +3792,22 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             {
                 embd_inp.push_back(current_context_tokens[current_context_tokens.size()-1]);
                 n_past -= 1;
+            }
+            else if(embd_inp.size()>0 && current_context_tokens.size()>0 && last_n_tokens.size()>0)
+            {
+                int maxedpos = llama_memory_seq_pos_max(llama_get_memory(llama_ctx_v4),0);
+                if(maxedpos+2==n_past)
+                {
+                    //kcpp: a very dirty hack for rnn models. this happens because the very last token of the last turn
+                    //does not actually get processed but is still added to current_context_tokens. if the instruct start tag starts with that same token
+                    //it might get wrongly fast forwarded and we will get an off by 1 error.
+                    //todo: figure out a better way to solve this rubbish
+                    int tail = last_n_tokens[last_n_tokens.size()-1];
+                    last_n_tokens.pop_back();
+                    current_context_tokens.pop_back();
+                    n_past -=1;
+                    embd_inp.insert(embd_inp.begin(), 1, tail);
+                }
             }
         }
     }

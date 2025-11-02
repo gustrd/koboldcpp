@@ -75,6 +75,8 @@ endif()
 
 file(GLOB GGML_SOURCES_CUDA "ggml/src/ggml-cuda/*.cu")
 list(APPEND GGML_SOURCES_CUDA "ggml/src/ggml-cuda/ggml-cuda.cu")
+file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/fattn-tile*.cu")
+list(APPEND GGML_SOURCES_CUDA ${SRCS})
 file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_CUDA ${SRCS})
 file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/mmq*.cu")
@@ -130,7 +132,10 @@ if (LLAMA_CUBLAS)
         # 75 == int8 tensor cores
         # 80 == Ampere, asynchronous data loading, faster tensor core instructions
         message("CUDA Toolkit Version: ${CUDAToolkit_VERSION}")
-        if(CUDAToolkit_VERSION VERSION_GREATER 12)
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13)
+                add_compile_definitions(GGML_CUDA_USE_GRAPHS) #try enable cuda graphs on cu12 build
+                set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-virtual") # lowest CUDA 13 standard
+        elseif(CUDAToolkit_VERSION VERSION_GREATER 12)
                 add_compile_definitions(GGML_CUDA_USE_GRAPHS) #try enable cuda graphs on cu12 build
                 set(CMAKE_CUDA_ARCHITECTURES "50-virtual;61-virtual;70-virtual;75-virtual;80-virtual") # lowest CUDA 12 standard + lowest for integer intrinsics
         else()
@@ -174,6 +179,8 @@ if (LLAMA_HIPBLAS)
         message(STATUS "HIP and hipBLAS found")
         file(GLOB GGML_SOURCES_ROCM "ggml/src/ggml-cuda/*.cu")
         list(APPEND GGML_SOURCES_ROCM "ggml/src/ggml-cuda/ggml-cuda.cu")
+        file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/fattn-tile*.cu")
+        list(APPEND GGML_SOURCES_ROCM ${SRCS})
         file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/fattn-mma*.cu")
         list(APPEND GGML_SOURCES_ROCM ${SRCS})
         file(GLOB SRCS "ggml/src/ggml-cuda/template-instances/mmq*.cu")

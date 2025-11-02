@@ -1493,7 +1493,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                GGML_ASSERT_CONTINUE(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
                         }
@@ -1797,6 +1797,14 @@ ggml_backend_t ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i)
     GGML_ASSERT(sched);
     GGML_ASSERT(i >= 0 && i < sched->n_backends);
     return sched->backends[i];
+}
+
+ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return sched->bufts[backend_index];
 }
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {

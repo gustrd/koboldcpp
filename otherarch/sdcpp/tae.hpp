@@ -29,7 +29,7 @@ public:
         }
     }
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) {
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) override {
         // x: [n, n_in, h, w]
         // return: [n, n_out, h, w]
 
@@ -86,7 +86,7 @@ public:
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, z_channels, {3, 3}, {1, 1}, {1, 1}));
     }
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) {
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* x) override {
         // x: [n, in_channels, h, w]
         // return: [n, z_channels, h/8, w/8]
 
@@ -136,7 +136,7 @@ public:
         blocks[std::to_string(index++)] = std::shared_ptr<GGMLBlock>(new Conv2d(channels, out_channels, {3, 3}, {1, 1}, {1, 1}));
     }
 
-    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* z) {
+    struct ggml_tensor* forward(struct ggml_context* ctx, struct ggml_tensor* z) override {
         // z: [n, z_channels, h, w]
         // return: [n, out_channels, h*8, w*8]
 
@@ -196,13 +196,14 @@ struct TinyAutoEncoder : public GGMLRunner {
     bool decode_only = false;
 
     TinyAutoEncoder(ggml_backend_t backend,
+                    bool offload_params_to_cpu,
                     const String2GGMLType& tensor_types,
                     const std::string prefix,
                     bool decoder_only = true,
                     SDVersion version = VERSION_SD1)
         : decode_only(decoder_only),
           taesd(decoder_only, version),
-          GGMLRunner(backend) {
+          GGMLRunner(backend, offload_params_to_cpu) {
         taesd.init(params_ctx, tensor_types, prefix);
     }
 
@@ -217,11 +218,11 @@ struct TinyAutoEncoder : public GGMLRunner {
         }
     }
 
-    std::string get_desc() {
+    std::string get_desc() override {
         return "taesd";
     }
 
-    bool load_from_file(const std::string& file_path) {
+    bool load_from_file(const std::string& file_path, int n_threads) {
         LOG_INFO("loading taesd from '%s', decode_only = %s", file_path.c_str(), decode_only ? "true" : "false");
         alloc_params_buffer();
         std::map<std::string, ggml_tensor*> taesd_tensors;
@@ -237,7 +238,7 @@ struct TinyAutoEncoder : public GGMLRunner {
             return false;
         }
 
-        bool success = model_loader.load_tensors(taesd_tensors, backend, ignore_tensors);
+        bool success = model_loader.load_tensors(taesd_tensors, ignore_tensors, n_threads);
 
         if (!success) {
             LOG_ERROR("load tae tensors from model loader failed");
@@ -260,7 +261,7 @@ struct TinyAutoEncoder : public GGMLRunner {
                  struct ggml_tensor* z,
                  bool decode_graph,
                  struct ggml_tensor** output,
-                 struct ggml_context* output_ctx = NULL) {
+                 struct ggml_context* output_ctx = nullptr) {
         auto get_graph = [&]() -> struct ggml_cgraph* {
             return build_graph(z, decode_graph);
         };

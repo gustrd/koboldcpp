@@ -19,7 +19,7 @@ struct SigmaSchedule {
 };
 
 struct DiscreteSchedule : SigmaSchedule {
-    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
         std::vector<float> result;
 
         int t_max = TIMESTEPS - 1;
@@ -43,7 +43,7 @@ struct DiscreteSchedule : SigmaSchedule {
 };
 
 struct ExponentialSchedule : SigmaSchedule {
-    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
         std::vector<float> sigmas;
 
         // Calculate step size
@@ -150,7 +150,7 @@ std::vector<float> log_linear_interpolation(std::vector<float> sigma_in,
 https://research.nvidia.com/labs/toronto-ai/AlignYourSteps/howto.html
 */
 struct AYSSchedule : SigmaSchedule {
-    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
         const std::vector<float> noise_levels[] = {
             /* SD1.5 */
             {14.6146412293f, 6.4745760956f, 3.8636745985f, 2.6946151520f,
@@ -204,7 +204,7 @@ struct AYSSchedule : SigmaSchedule {
  * GITS Scheduler: https://github.com/zju-pi/diff-sampler/tree/main/gits-main
  */
 struct GITSSchedule : SigmaSchedule {
-    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
         if (sigma_max <= 0.0f) {
             return std::vector<float>{};
         }
@@ -232,8 +232,27 @@ struct GITSSchedule : SigmaSchedule {
     }
 };
 
+struct SGMUniformSchedule : SigmaSchedule {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min_in, float sigma_max_in, t_to_sigma_t t_to_sigma_func) override {
+        std::vector<float> result;
+        if (n == 0) {
+            result.push_back(0.0f);
+            return result;
+        }
+        result.reserve(n + 1);
+        int t_max                    = TIMESTEPS - 1;
+        int t_min                    = 0;
+        std::vector<float> timesteps = linear_space(static_cast<float>(t_max), static_cast<float>(t_min), n + 1);
+        for (int i = 0; i < n; i++) {
+            result.push_back(t_to_sigma_func(timesteps[i]));
+        }
+        result.push_back(0.0f);
+        return result;
+    }
+};
+
 struct KarrasSchedule : SigmaSchedule {
-    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
         // These *COULD* be function arguments here,
         // but does anybody ever bother to touch them?
         float rho = 7.f;
@@ -251,8 +270,66 @@ struct KarrasSchedule : SigmaSchedule {
     }
 };
 
+struct SimpleSchedule : SigmaSchedule {
+    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) override {
+        std::vector<float> result_sigmas;
+
+        if (n == 0) {
+            return result_sigmas;
+        }
+
+        result_sigmas.reserve(n + 1);
+
+        int model_sigmas_len = TIMESTEPS;
+
+        float step_factor = static_cast<float>(model_sigmas_len) / static_cast<float>(n);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            int offset_from_start_of_py_array = static_cast<int>(static_cast<float>(i) * step_factor);
+            int timestep_index                = model_sigmas_len - 1 - offset_from_start_of_py_array;
+
+            if (timestep_index < 0) {
+                timestep_index = 0;
+            }
+
+            result_sigmas.push_back(t_to_sigma(static_cast<float>(timestep_index)));
+        }
+        result_sigmas.push_back(0.0f);
+        return result_sigmas;
+    }
+};
+
+// Close to Beta Schedule, but increadably simple in code.
+struct SmoothStepSchedule : SigmaSchedule {
+    static constexpr float smoothstep(float x) {
+        return x * x * (3.0f - 2.0f * x);
+    }
+
+    std::vector<float> get_sigmas(uint32_t n, float /*sigma_min*/, float /*sigma_max*/, t_to_sigma_t t_to_sigma) override {
+        std::vector<float> result;
+        result.reserve(n + 1);
+
+        const int t_max = TIMESTEPS - 1;
+        if (n == 0) {
+            return result;
+        } else if (n == 1) {
+            result.push_back(t_to_sigma((float)t_max));
+            result.push_back(0.f);
+            return result;
+        }
+
+        for (uint32_t i = 0; i < n; i++) {
+            float u = 1.f - float(i) / float(n);
+            result.push_back(t_to_sigma(std::round(smoothstep(u) * t_max)));
+        }
+
+        result.push_back(0.f);
+        return result;
+    }
+};
+
 struct Denoiser {
-    std::shared_ptr<SigmaSchedule> schedule                                                  = std::make_shared<DiscreteSchedule>();
+    std::shared_ptr<SigmaSchedule> scheduler                                                 = std::make_shared<DiscreteSchedule>();
     virtual float sigma_min()                                                                = 0;
     virtual float sigma_max()                                                                = 0;
     virtual float sigma_to_t(float sigma)                                                    = 0;
@@ -263,7 +340,7 @@ struct Denoiser {
 
     virtual std::vector<float> get_sigmas(uint32_t n) {
         auto bound_t_to_sigma = std::bind(&Denoiser::t_to_sigma, this, std::placeholders::_1);
-        return schedule->get_sigmas(n, sigma_min(), sigma_max(), bound_t_to_sigma);
+        return scheduler->get_sigmas(n, sigma_min(), sigma_max(), bound_t_to_sigma);
     }
 };
 
@@ -273,15 +350,15 @@ struct CompVisDenoiser : public Denoiser {
 
     float sigma_data = 1.0f;
 
-    float sigma_min() {
+    float sigma_min() override {
         return sigmas[0];
     }
 
-    float sigma_max() {
+    float sigma_max() override {
         return sigmas[TIMESTEPS - 1];
     }
 
-    float sigma_to_t(float sigma) {
+    float sigma_to_t(float sigma) override {
         float log_sigma = std::log(sigma);
         std::vector<float> dists;
         dists.reserve(TIMESTEPS);
@@ -307,7 +384,7 @@ struct CompVisDenoiser : public Denoiser {
         return t;
     }
 
-    float t_to_sigma(float t) {
+    float t_to_sigma(float t) override {
         int low_idx     = static_cast<int>(std::floor(t));
         int high_idx    = static_cast<int>(std::ceil(t));
         float w         = t - static_cast<float>(low_idx);
@@ -315,7 +392,7 @@ struct CompVisDenoiser : public Denoiser {
         return std::exp(log_sigma);
     }
 
-    std::vector<float> get_scalings(float sigma) {
+    std::vector<float> get_scalings(float sigma) override {
         float c_skip = 1.0f;
         float c_out  = -sigma;
         float c_in   = 1.0f / std::sqrt(sigma * sigma + sigma_data * sigma_data);
@@ -323,19 +400,19 @@ struct CompVisDenoiser : public Denoiser {
     }
 
     // this function will modify noise/latent
-    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) {
-        ggml_tensor_scale(noise, sigma);
-        ggml_tensor_add(latent, noise);
+    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) override {
+        ggml_ext_tensor_scale_inplace(noise, sigma);
+        ggml_ext_tensor_add_inplace(latent, noise);
         return latent;
     }
 
-    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) {
+    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) override {
         return latent;
     }
 };
 
 struct CompVisVDenoiser : public CompVisDenoiser {
-    std::vector<float> get_scalings(float sigma) {
+    std::vector<float> get_scalings(float sigma) override {
         float c_skip = sigma_data * sigma_data / (sigma * sigma + sigma_data * sigma_data);
         float c_out  = -sigma * sigma_data / std::sqrt(sigma * sigma + sigma_data * sigma_data);
         float c_in   = 1.0f / std::sqrt(sigma * sigma + sigma_data * sigma_data);
@@ -349,22 +426,22 @@ struct EDMVDenoiser : public CompVisVDenoiser {
 
     EDMVDenoiser(float min_sigma = 0.002, float max_sigma = 120.0)
         : min_sigma(min_sigma), max_sigma(max_sigma) {
-        schedule = std::make_shared<ExponentialSchedule>();
+        scheduler = std::make_shared<ExponentialSchedule>();
     }
 
-    float t_to_sigma(float t) {
+    float t_to_sigma(float t) override {
         return std::exp(t * 4 / (float)TIMESTEPS);
     }
 
-    float sigma_to_t(float s) {
+    float sigma_to_t(float s) override {
         return 0.25 * std::log(s);
     }
 
-    float sigma_min() {
+    float sigma_min() override {
         return min_sigma;
     }
 
-    float sigma_max() {
+    float sigma_max() override {
         return max_sigma;
     }
 };
@@ -382,7 +459,8 @@ struct DiscreteFlowDenoiser : public Denoiser {
 
     float sigma_data = 1.0f;
 
-    DiscreteFlowDenoiser() {
+    DiscreteFlowDenoiser(float shift = 3.0f)
+        : shift(shift) {
         set_parameters();
     }
 
@@ -392,24 +470,24 @@ struct DiscreteFlowDenoiser : public Denoiser {
         }
     }
 
-    float sigma_min() {
+    float sigma_min() override {
         return sigmas[0];
     }
 
-    float sigma_max() {
+    float sigma_max() override {
         return sigmas[TIMESTEPS - 1];
     }
 
-    float sigma_to_t(float sigma) {
+    float sigma_to_t(float sigma) override {
         return sigma * 1000.f;
     }
 
-    float t_to_sigma(float t) {
+    float t_to_sigma(float t) override {
         t = t + 1;
         return time_snr_shift(shift, t / 1000.f);
     }
 
-    std::vector<float> get_scalings(float sigma) {
+    std::vector<float> get_scalings(float sigma) override {
         float c_skip = 1.0f;
         float c_out  = -sigma;
         float c_in   = 1.0f;
@@ -417,15 +495,15 @@ struct DiscreteFlowDenoiser : public Denoiser {
     }
 
     // this function will modify noise/latent
-    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) {
-        ggml_tensor_scale(noise, sigma);
-        ggml_tensor_scale(latent, 1.0f - sigma);
-        ggml_tensor_add(latent, noise);
+    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) override {
+        ggml_ext_tensor_scale_inplace(noise, sigma);
+        ggml_ext_tensor_scale_inplace(latent, 1.0f - sigma);
+        ggml_ext_tensor_add_inplace(latent, noise);
         return latent;
     }
 
-    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) {
-        ggml_tensor_scale(latent, 1.0f / (1.0f - sigma));
+    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) override {
+        ggml_ext_tensor_scale_inplace(latent, 1.0f / (1.0f - sigma));
         return latent;
     }
 };
@@ -451,24 +529,24 @@ struct FluxFlowDenoiser : public Denoiser {
         }
     }
 
-    float sigma_min() {
+    float sigma_min() override {
         return sigmas[0];
     }
 
-    float sigma_max() {
+    float sigma_max() override {
         return sigmas[TIMESTEPS - 1];
     }
 
-    float sigma_to_t(float sigma) {
+    float sigma_to_t(float sigma) override {
         return sigma;
     }
 
-    float t_to_sigma(float t) {
+    float t_to_sigma(float t) override {
         t = t + 1;
         return flux_time_shift(shift, 1.0f, t / TIMESTEPS);
     }
 
-    std::vector<float> get_scalings(float sigma) {
+    std::vector<float> get_scalings(float sigma) override {
         float c_skip = 1.0f;
         float c_out  = -sigma;
         float c_in   = 1.0f;
@@ -476,15 +554,15 @@ struct FluxFlowDenoiser : public Denoiser {
     }
 
     // this function will modify noise/latent
-    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) {
-        ggml_tensor_scale(noise, sigma);
-        ggml_tensor_scale(latent, 1.0f - sigma);
-        ggml_tensor_add(latent, noise);
+    ggml_tensor* noise_scaling(float sigma, ggml_tensor* noise, ggml_tensor* latent) override {
+        ggml_ext_tensor_scale_inplace(noise, sigma);
+        ggml_ext_tensor_scale_inplace(latent, 1.0f - sigma);
+        ggml_ext_tensor_add_inplace(latent, noise);
         return latent;
     }
 
-    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) {
-        ggml_tensor_scale(latent, 1.0f / (1.0f - sigma));
+    ggml_tensor* inverse_noise_scaling(float sigma, ggml_tensor* latent) override {
+        ggml_ext_tensor_scale_inplace(latent, 1.0f / (1.0f - sigma));
         return latent;
     }
 };
@@ -542,7 +620,7 @@ static void sample_k_diffusion(sample_method_t method,
 
                 if (sigmas[i + 1] > 0) {
                     // x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
-                    ggml_tensor_set_f32_randn(noise, rng);
+                    ggml_ext_im_set_randn_f32(noise, rng);
                     // noise = load_tensor_from_file(work_ctx, "./rand" + std::to_string(i+1) + ".bin");
                     {
                         float* vec_x     = (float*)x->data;
@@ -692,7 +770,6 @@ static void sample_k_diffusion(sample_method_t method,
         } break;
         case DPMPP2S_A: {
             struct ggml_tensor* noise = ggml_dup_tensor(work_ctx, x);
-            struct ggml_tensor* d     = ggml_dup_tensor(work_ctx, x);
             struct ggml_tensor* x2    = ggml_dup_tensor(work_ctx, x);
 
             for (int i = 0; i < steps; i++) {
@@ -707,22 +784,15 @@ static void sample_k_diffusion(sample_method_t method,
                 auto sigma_fn    = [](float t) -> float { return exp(-t); };
 
                 if (sigma_down == 0) {
-                    // Euler step
-                    float* vec_d        = (float*)d->data;
+                    // d = (x - denoised) / sigmas[i];
+                    // dt = sigma_down - sigmas[i];
+                    // x += d * dt;
+                    // => x = denoised
                     float* vec_x        = (float*)x->data;
                     float* vec_denoised = (float*)denoised->data;
 
-                    for (int j = 0; j < ggml_nelements(d); j++) {
-                        vec_d[j] = (vec_x[j] - vec_denoised[j]) / sigmas[i];
-                    }
-
-                    // TODO: If sigma_down == 0, isn't this wrong?
-                    // But
-                    // https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/sampling.py#L525
-                    // has this exactly the same way.
-                    float dt = sigma_down - sigmas[i];
-                    for (int j = 0; j < ggml_nelements(d); j++) {
-                        vec_x[j] = vec_x[j] + vec_d[j] * dt;
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_denoised[j];
                     }
                 } else {
                     // DPM-Solver++(2S)
@@ -731,7 +801,6 @@ static void sample_k_diffusion(sample_method_t method,
                     float h      = t_next - t;
                     float s      = t + 0.5f * h;
 
-                    float* vec_d        = (float*)d->data;
                     float* vec_x        = (float*)x->data;
                     float* vec_x2       = (float*)x2->data;
                     float* vec_denoised = (float*)denoised->data;
@@ -751,7 +820,7 @@ static void sample_k_diffusion(sample_method_t method,
 
                 // Noise addition
                 if (sigmas[i + 1] > 0) {
-                    ggml_tensor_set_f32_randn(noise, rng);
+                    ggml_ext_im_set_randn_f32(noise, rng);
                     {
                         float* vec_x     = (float*)x->data;
                         float* vec_noise = (float*)noise->data;
@@ -1016,7 +1085,7 @@ static void sample_k_diffusion(sample_method_t method,
 
                 if (sigmas[i + 1] > 0) {
                     // x += sigmas[i + 1] * noise_sampler(sigmas[i], sigmas[i + 1])
-                    ggml_tensor_set_f32_randn(noise, rng);
+                    ggml_ext_im_set_randn_f32(noise, rng);
                     // noise = load_tensor_from_file(res_ctx, "./rand" + std::to_string(i+1) + ".bin");
                     {
                         float* vec_x     = (float*)x->data;
@@ -1207,7 +1276,7 @@ static void sample_k_diffusion(sample_method_t method,
                     }
                 }
                 if (eta > 0) {
-                    ggml_tensor_set_f32_randn(variance_noise, rng);
+                    ggml_ext_im_set_randn_f32(variance_noise, rng);
                     float* vec_variance_noise =
                         (float*)variance_noise->data;
                     float* vec_x = (float*)x->data;
@@ -1375,7 +1444,7 @@ static void sample_k_diffusion(sample_method_t method,
                 if (eta > 0 && i != steps - 1) {
                     // In this case, x is still pred_noised_sample,
                     // continue in-place
-                    ggml_tensor_set_f32_randn(noise, rng);
+                    ggml_ext_im_set_randn_f32(noise, rng);
                     float* vec_x     = (float*)x->data;
                     float* vec_noise = (float*)noise->data;
                     for (int j = 0; j < ggml_nelements(x); j++) {
