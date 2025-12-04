@@ -405,7 +405,7 @@ def main() -> None:
     parser.add_argument("--no-shell", action="store_true", help="Execute start-command without shell (recommended when passing list)")
     parser.add_argument("--interval", type=int, default=120, help="Interval in seconds between status checks")
     parser.add_argument("--sleep-interval", type=int, default=10, help="Sleep interval in seconds for sub-loops (default: 10)")
-    parser.add_argument("--start-wait", type=int, default=5, help="Seconds to wait after starting the worker")
+    parser.add_argument("--start-wait", type=int, default=180, help="Seconds to wait after starting the worker before first API check")
     parser.add_argument("--battery-threshold", type=int, default=58, help="Battery level threshold below which the worker will be halted (default: 58)")
     parser.add_argument("--process-name", default=None, help="Process name (exact/executable) for fallback kill by name (not used by default)")
     parser.add_argument("--allow-name-kill", action="store_true", help="Allow using kill by name as fallback (CAUTION: does not kill python by default)")
