@@ -1,17 +1,39 @@
 #!/usr/bin/env python3
 """
-loop-kcpp.py - Cross-platform monitor and auto-restart for worker processes.
+loop_kcpp.py - Cross-platform monitor and auto-restart for worker processes.
 
-Main features:
- - Checks if a worker appears in an API response (searches for substring in JSON/text response).
- - Starts the worker via provided command and maintains process handle (Popen).
- - When worker is detected offline (substring not found), restarts ONLY the monitored process.
- - Avoids killing global python.exe processes: kill by handle is the default approach.
- - Options for fallback by process name (only if explicitly permitted).
- - Sends CTRL_BREAK_EVENT on Windows as graceful attempt before forced kill.
- - Handles SIGINT/SIGTERM for graceful shutdown.
- - Simple logging to stdout with timestamps.
- - Battery monitoring to prevent operation on low battery.
+USAGE:
+    python loop_kcpp.py --start-command "python worker.py" --string "MyWorkerName" [options]
+
+USE CASE:
+    Monitors an AI Horde worker (or similar API-registered service) by periodically
+    querying an API endpoint. If the worker's name disappears from the response
+    (indicating it crashed or became unresponsive), automatically restarts it.
+    Also halts operation when battery is low (useful for laptops/portable setups).
+
+EXAMPLES:
+    # Basic: restart worker if "MyWorker" not found in API response
+    python loop_kcpp.py --start-command "./run_worker.sh" --string "MyWorker"
+
+    # Custom API endpoint and check interval
+    python loop_kcpp.py --start-command "python kobold_worker.py" \\
+        --string "MyWorker" --url "https://api.example.com/workers" --interval 60
+
+    # With battery threshold (halt if battery <= 30%)
+    python loop_kcpp.py --start-command "./worker.sh" --string "MyWorker" --battery-threshold 30
+
+OPTIONS:
+    --start-command   Command to start the worker (required)
+    --string          Substring to search for in API response (worker name)
+    --url             API endpoint to check (default: https://aihorde.net/api/v2/workers)
+    --interval        Seconds between checks (default: 120)
+    --battery-threshold  Halt worker if battery <= this % (default: 58)
+    --no-shell        Run command without shell (safer, use with simple commands)
+    --stop-kills-worker  Also terminate worker when monitor stops (Ctrl+C)
+
+REQUIREMENTS:
+    - Python 3.8+
+    - psutil (pip install psutil)
 """
 from __future__ import annotations
 
@@ -30,10 +52,7 @@ import time
 import urllib.request
 from typing import Optional
 
-try:
-    import psutil  # optional, used for safer process-by-name handling
-except Exception:
-    psutil = None
+import psutil  # required for reliable process tree termination
 
 
 def log(msg: str) -> None:
@@ -50,7 +69,7 @@ def log_to_file(msg: str, log_file: str = "_loop-kcpp.log") -> None:
         print(f"{time.asctime()} - Error writing to log file {log_file}: {e}", file=sys.stderr)
 
 def get_battery_percent():
-    # tenta psutil se disponível
+    # try psutil if available
     try:
         import psutil
         b = psutil.sensors_battery()
@@ -110,7 +129,7 @@ def get_battery_percent():
 
 
 def _search_json_for_string(obj, substring: str) -> bool:
-    """Busca recursiva de substring em JSON (keys/values)."""
+    """Recursive search for substring in JSON (keys/values)."""
     try:
         if isinstance(obj, dict):
             for k, v in obj.items():
@@ -157,8 +176,8 @@ def http_contains(url: str, substring: str, timeout: int = 10) -> bool:
                     json_data = json.loads(text)
                     if _search_json_for_string(json_data, substring):
                         return True
-                except Exception:
-                    pass
+                except json.JSONDecodeError as e:
+                    print(f"{time.asctime()} - JSON parse error: {e}. Falling back to text search.", file=sys.stderr)
             return substring.lower() in text.lower()
 
     except Exception as e:
@@ -232,47 +251,69 @@ def _send_ctrl_break_windows(p: subprocess.Popen) -> bool:
 
 def ensure_terminate_process(p: Optional[subprocess.Popen], timeout: int = 8, try_graceful_windows: bool = True, end_reason: str = "Unknown") -> None:
     """
-    Ensures that process `p` terminates; tries graceful methods before forced kill.
-    - First attempts to terminate (p.terminate()).
-    - On Windows, if specified, tries CTRL_BREAK_EVENT.
-    - Waits `timeout` seconds; if not terminated, calls p.kill().
+    Ensures that process `p` and all its children terminate using psutil.
+    - Kills entire process tree to prevent orphaned children (critical when shell=True).
+    - First attempts graceful termination, then forces kill if needed.
+    - On Windows, tries CTRL_BREAK_EVENT for graceful shutdown.
     """
     if not p:
         return
-    
+
     log_to_file(f"END inner script run - Reason: {end_reason} - PID: {p.pid}")
+
+    if p.poll() is not None:
+        log(f"Process PID {p.pid} already terminated")
+        return
+
     try:
-        if p.poll() is not None:
-            return  # Already terminated
-        # Graceful attempt
+        parent = psutil.Process(p.pid)
+        children = parent.children(recursive=True)
+
+        # Send graceful shutdown signal based on platform
+        if platform.system() == "Windows":
+            if try_graceful_windows:
+                _send_ctrl_break_windows(p)
+            time.sleep(0.5)  # Brief pause to allow signal handling
+        else:
+            # On Linux/Unix, give parent time to propagate signals to children
+            time.sleep(0.5)
+
+        # Terminate children first (leaf to root order)
+        for child in reversed(children):
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+
+        # Terminate parent
         try:
-            p.terminate()
-        except Exception:
+            parent.terminate()
+        except psutil.NoSuchProcess:
             pass
 
-        # On Windows, sending CTRL_BREAK_EVENT may allow cleanup (if p was created in new process group)
-        if try_graceful_windows and platform.system() == "Windows":
-            try:
-                _send_ctrl_break_windows(p)
-            except Exception:
-                pass
+        # Wait for all processes to terminate
+        all_procs = children + [parent]
+        gone, alive = psutil.wait_procs(all_procs, timeout=timeout)
 
-        try:
-            p.wait(timeout=timeout)
-            log(f"Process PID {p.pid} terminated cleanly")
-            log_to_file(f"Process PID {p.pid} terminated cleanly")
-            return
-        except subprocess.TimeoutExpired:
-            print(f"{time.asctime()} - Process PID {p.pid} did not exit after {timeout}s; killing...", file=sys.stderr)
-            log_to_file(f"Process PID {p.pid} did not exit after {timeout}s; force killing")
-            try:
-                p.kill()
-            except Exception:
-                pass
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                pass
+        if alive:
+            log(f"Force killing {len(alive)} processes that did not terminate gracefully")
+            log_to_file(f"Force killing {len(alive)} processes that did not terminate gracefully")
+            for proc in alive:
+                try:
+                    proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            # Wait again after kill
+            gone2, alive2 = psutil.wait_procs(alive, timeout=3)
+            if alive2:
+                print(f"{time.asctime()} - WARNING: {len(alive2)} processes still running after kill", file=sys.stderr)
+                log_to_file(f"WARNING: {len(alive2)} processes still running after kill")
+
+        log(f"Process tree rooted at PID {p.pid} terminated ({len(gone)} graceful, {len(alive)} forced)")
+        log_to_file(f"Process tree rooted at PID {p.pid} terminated ({len(gone)} graceful, {len(alive)} forced)")
+
+    except psutil.NoSuchProcess:
+        log(f"Process PID {p.pid} no longer exists")
     except Exception as e:
         print(f"{time.asctime()} - Error ensuring process termination: {e}", file=sys.stderr)
         log_to_file(f"Error ensuring process termination: {e}")
@@ -280,77 +321,57 @@ def ensure_terminate_process(p: Optional[subprocess.Popen], timeout: int = 8, tr
 
 def kill_process_by_name_safe(name: str, exclude_pids: Optional[set[int]] = None, allow_kill_python: bool = False) -> None:
     """
-    Mata processos que casem `name`, mas com precauções:
-      - Se psutil disponível, usa-o para identificar processos e terminar apenas correspondentes.
-      - Exclui PIDs em `exclude_pids`.
-      - Não mata `python`/`python.exe` a menos que allow_kill_python True.
-    Use com CUIDADO: por padrão este NÃO é chamado automaticamente, apenas como fallback se você pedir.
+    Kills processes matching `name` with safety precautions:
+      - Uses psutil to identify and terminate only matching processes.
+      - Excludes PIDs in `exclude_pids`.
+      - Does not kill `python`/`python.exe` unless allow_kill_python is True.
+    Use with CAUTION: by default this is NOT called automatically, only as fallback if explicitly requested.
     """
     exclude_pids = exclude_pids or set()
     lowered = name.lower()
 
-    if psutil:
-        try:
-            for p in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
-                try:
-                    pid = p.info.get("pid")
-                    if pid in exclude_pids:
-                        continue
-                    pname = (p.info.get("name") or "").lower()
-                    exe = (p.info.get("exe") or "").lower()
-                    cmd = " ".join(p.info.get("cmdline") or []).lower()
-
-                    match = False
-                    # match exact exe name or substring in cmdline
-                    if pname == lowered or exe.endswith(lowered) or lowered in cmd:
-                        match = True
-
-                    # avoid killing global python unless explicitly allowed
-                    if match and (pname.startswith("python") or exe.endswith("python.exe") or "python" in cmd):
-                        if not allow_kill_python:
-                            log(f"Skipping python process PID {pid} (name match) because allow_kill_python=False")
-                            continue
-
-                    if match:
-                        log(f"Terminating matched process PID {pid} ({pname})")
-                        try:
-                            p.terminate()
-                            p.wait(timeout=5)
-                        except Exception:
-                            try:
-                                p.kill()
-                            except Exception:
-                                pass
-                except Exception:
-                    continue
-            return
-        except Exception as e:
-            log(f"psutil fallback failed: {e}")
-
-    # Fallback: use system commands, but avoid catching generic 'python' unless explicitly allowed
-    sysname = platform.system()
-    if sysname == "Windows":
-        if not allow_kill_python and name.lower().startswith("python"):
-            log("Skipping taskkill for python names (allow_kill_python=False)")
-            return
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        if not name.lower().endswith(".exe"):
+    try:
+        for p in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
             try:
-                subprocess.run(["taskkill", "/F", "/IM", name + ".exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-    else:
-        # on unix, avoid `pkill -f python` unless allowed
-        if not allow_kill_python and "python" in name.lower():
-            log("Skipping pkill for python names (allow_kill_python=False)")
-            return
-        try:
-            subprocess.run(["pkill", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+                pid = p.info.get("pid")
+                if pid in exclude_pids:
+                    continue
+                pname = (p.info.get("name") or "").lower()
+                exe = (p.info.get("exe") or "").lower()
+                cmd = " ".join(p.info.get("cmdline") or []).lower()
+
+                match = False
+                # match exact exe name or substring in cmdline
+                if pname == lowered or exe.endswith(lowered) or lowered in cmd:
+                    match = True
+
+                # avoid killing global python unless explicitly allowed (check both Windows and Linux patterns)
+                if match and (pname.startswith("python") or exe.endswith("python.exe") or "/python" in exe or "python" in cmd):
+                    if not allow_kill_python:
+                        log(f"Skipping python process PID {pid} (name match) because allow_kill_python=False")
+                        continue
+
+                if match:
+                    log(f"Terminating matched process PID {pid} ({pname})")
+                    try:
+                        p.terminate()
+                        p.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        log(f"Process PID {pid} did not terminate, force killing")
+                        try:
+                            p.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                    except psutil.NoSuchProcess:
+                        pass
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.AccessDenied as e:
+                log(f"Access denied for process PID {p.info.get('pid')}: {e}")
+                continue
+    except Exception as e:
+        print(f"{time.asctime()} - Error in kill_process_by_name_safe: {e}", file=sys.stderr)
+        log_to_file(f"Error in kill_process_by_name_safe: {e}")
 
 
 # ---------------- Main monitor loop ----------------
