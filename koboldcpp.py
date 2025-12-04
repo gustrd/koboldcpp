@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 import shutil
 import subprocess
 import gzip
@@ -405,8 +405,24 @@ class embeddings_generation_outputs(ctypes.Structure):
                 ("count", ctypes.c_int),
                 ("data", ctypes.c_char_p)]
 
-# GRD: Custom functions
-from typing import Optional
+# ==============================================================================
+# GRD: CUSTOM EXTENSIONS
+# ==============================================================================
+# This section contains custom modifications by GRD (gustrd-develop branch).
+# These functions are additions to the upstream KoboldCpp codebase.
+#
+# When merging with upstream (concedo), this entire section should be preserved.
+# The section is intentionally placed after ctypes structures and before
+# utility functions to minimize merge conflicts.
+#
+# Contents:
+#   - _enable_windows_ansi(): Enable ANSI escape sequences on Windows consoles
+#   - debug_dark_yellow_utf(): Debug printing with color and UTF-8 safety
+#   - restart_program(): Restart the current Python process
+#   - detect_repeated_prefix(): Detect repeated substrings (for bug detection)
+#
+# See also: GRD_DEBUG section in horde worker (~line 6888) for usage example.
+# ==============================================================================
 
 def _enable_windows_ansi() -> None:
     """
@@ -519,7 +535,9 @@ def detect_repeated_prefix(s: str, min_repeats: int = 5) -> Tuple[Optional[str],
     debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
     return None, 0
 
-# Original functions
+# ==============================================================================
+# END OF GRD CUSTOM EXTENSIONS
+# ==============================================================================
 
 def getdirpath():
     return os.path.dirname(os.path.realpath(__file__))
@@ -6867,7 +6885,13 @@ def run_horde_worker(args, api_key, worker_name):
         print("") #empty newline
         if current_generation:
 
-            # GRD_DEBUG: Try to identify the bug where a single token is always sampled and restart
+            # ------------------------------------------------------------------
+            # GRD_DEBUG: Single-token sampling bug detection and auto-restart
+            # ------------------------------------------------------------------
+            # This detects a bug where the model gets stuck generating the same
+            # token repeatedly. If detected, the program automatically restarts.
+            # Uses functions from GRD CUSTOM EXTENSIONS section (~line 408).
+            # ------------------------------------------------------------------
             try:
                 generated_string = current_generation["results"][0]["text"]
                 debug_dark_yellow_utf(generated_string)
@@ -6879,6 +6903,7 @@ def run_horde_worker(args, api_key, worker_name):
             except Exception as e:
                 debug_dark_yellow_utf("DEBUG ERROR: " + str(e))
                 pass
+            # ------------------------------------------------------------------
 
             submit_dict = {
                 "id": current_id,
