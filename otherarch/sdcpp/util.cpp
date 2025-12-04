@@ -60,6 +60,19 @@ void replace_all_chars(std::string& str, char target, char replacement) {
     }
 }
 
+std::string sd_format(const char* fmt, ...) {
+    va_list ap;
+    va_list ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int size = vsnprintf(nullptr, 0, fmt, ap);
+    std::vector<char> buf(size + 1);
+    int size2 = vsnprintf(buf.data(), size + 1, fmt, ap2);
+    va_end(ap2);
+    va_end(ap);
+    return std::string(buf.data(), size);
+}
+
 int round_up_to(int value, int base) {
     if (base <= 0) {
         return value;
@@ -177,6 +190,7 @@ static sd_progress_cb_t sd_progress_cb = nullptr;
 void* sd_progress_cb_data              = nullptr;
 
 static sd_preview_cb_t sd_preview_cb = nullptr;
+static void* sd_preview_cb_data      = nullptr;
 preview_t sd_preview_mode            = PREVIEW_NONE;
 int sd_preview_interval              = 1;
 bool sd_preview_denoised             = true;
@@ -270,13 +284,16 @@ void pretty_progress(int step, int steps, float time) {
         }
     }
     progress += "|";
-    printf(time > 1.0f ? "\r%s %i/%i - %.2fs/it" : "\r%s %i/%i - %.2fit/s\033[K",
-           progress.c_str(), step, steps,
-           time > 1.0f || time == 0 ? time : (1.0f / time));
-    fflush(stdout);  // for linux
-    if (step == steps) {
-        printf("\n");
+
+    const char* lf   = (step == steps ? "\n" : "");
+    const char* unit = "s/it";
+    float speed      = time;
+    if (speed < 1.0f && speed > 0.f) {
+        speed = 1.0f / speed;
+        unit  = "it/s";
     }
+    printf("\r%s %i/%i - %.2f%s\033[K%s", progress.c_str(), step, steps, speed, unit, lf);
+    fflush(stdout);  // for linux
 }
 
 std::string ltrim(const std::string& s) {
@@ -355,8 +372,9 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
 }
-void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode = PREVIEW_PROJ, int interval = 1, bool denoised = true, bool noisy = false) {
+void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
     sd_preview_cb       = cb;
+    sd_preview_cb_data  = data;
     sd_preview_mode     = mode;
     sd_preview_interval = interval;
     sd_preview_denoised = denoised;
@@ -365,6 +383,9 @@ void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode = PREVIEW_PROJ, 
 
 sd_preview_cb_t sd_get_preview_callback() {
     return sd_preview_cb;
+}
+void* sd_get_preview_callback_data() {
+    return sd_preview_cb_data;
 }
 
 preview_t sd_get_preview_mode() {
@@ -390,19 +411,19 @@ const char* sd_get_system_info() {
     static char buffer[1024];
     std::stringstream ss;
     ss << "System Info: \n";
-    ss << "    SSE3 = " << ggml_cpu_has_sse3() << std::endl;
-    ss << "    AVX = " << ggml_cpu_has_avx() << std::endl;
-    ss << "    AVX2 = " << ggml_cpu_has_avx2() << std::endl;
-    ss << "    AVX512 = " << ggml_cpu_has_avx512() << std::endl;
-    ss << "    AVX512_VBMI = " << ggml_cpu_has_avx512_vbmi() << std::endl;
-    ss << "    AVX512_VNNI = " << ggml_cpu_has_avx512_vnni() << std::endl;
-    ss << "    FMA = " << ggml_cpu_has_fma() << std::endl;
-    ss << "    NEON = " << ggml_cpu_has_neon() << std::endl;
-    ss << "    ARM_FMA = " << ggml_cpu_has_arm_fma() << std::endl;
-    ss << "    F16C = " << ggml_cpu_has_f16c() << std::endl;
-    ss << "    FP16_VA = " << ggml_cpu_has_fp16_va() << std::endl;
-    ss << "    WASM_SIMD = " << ggml_cpu_has_wasm_simd() << std::endl;
-    ss << "    VSX = " << ggml_cpu_has_vsx() << std::endl;
+    ss << "    SSE3 = " << ggml_cpu_has_sse3() << " | ";
+    ss << "    AVX = " << ggml_cpu_has_avx() << " | ";
+    ss << "    AVX2 = " << ggml_cpu_has_avx2() << " | ";
+    ss << "    AVX512 = " << ggml_cpu_has_avx512() << " | ";
+    ss << "    AVX512_VBMI = " << ggml_cpu_has_avx512_vbmi() << " | ";
+    ss << "    AVX512_VNNI = " << ggml_cpu_has_avx512_vnni() << " | ";
+    ss << "    FMA = " << ggml_cpu_has_fma() << " | ";
+    ss << "    NEON = " << ggml_cpu_has_neon() << " | ";
+    ss << "    ARM_FMA = " << ggml_cpu_has_arm_fma() << " | ";
+    ss << "    F16C = " << ggml_cpu_has_f16c() << " | ";
+    ss << "    FP16_VA = " << ggml_cpu_has_fp16_va() << " | ";
+    ss << "    WASM_SIMD = " << ggml_cpu_has_wasm_simd() << " | ";
+    ss << "    VSX = " << ggml_cpu_has_vsx() << " | ";
     snprintf(buffer, sizeof(buffer), "%s", ss.str().c_str());
     return buffer;
 }

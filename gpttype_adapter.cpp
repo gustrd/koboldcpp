@@ -144,6 +144,7 @@ static std::vector<logit_bias> logit_biases;
 static bool add_bos_token = true; // if set to false, mmproj handling breaks. dont disable unless you know what you're doing
 static bool load_guidance = false; //whether to enable cfg for negative prompts
 static bool check_slowness = false; //will display a suggestion to use highpriority if slow
+static bool showed_rnn_warning = false;
 static bool highpriority = false;
 
 static int delayed_generated_tokens_limit = 0;
@@ -495,7 +496,11 @@ void ContextRewind(std::vector<int> &embd, std::vector<int> &current_context_tok
     }
     if(file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2 || is_recurrent)
     {
-        printf("\nWARNING: RNN models do not support context rewind!\n");
+        if(!showed_rnn_warning)
+        {
+            showed_rnn_warning = true;
+            printf("\nWARNING: RNN models do not support context rewind!\n");
+        }
         return;
     }
 
@@ -2258,6 +2263,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         std::vector<llama_model_kv_override> kvos; //ensure it keeps in scope until model is created
         std::vector<llama_model_tensor_buft_override> tenos; //ensure it keeps in scope until model is created
         std::vector<std::string> temp_tensor_names; //store temp tensor names to have mem references.
+        temp_tensor_names.reserve(32); //very important, prevents vector from reallocating
+        tenos.reserve(32);
         if(inputs.moe_experts>0)
         {
             printf("\nOverriding number of experts to %d\n",inputs.moe_experts);
@@ -2333,14 +2340,14 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 }
             }
             printf("\n\n");
-            for (const auto & override : string_split<std::string>(tensoroverrides, ',')) {
-                std::string::size_type pos = override.find('=');
+            for (const auto & overrider : string_split<std::string>(tensoroverrides, ',')) {
+                std::string::size_type pos = overrider.find('=');
                 if (pos == std::string::npos) {
-                    printf("\nInvalid Override Tensor: %s\n",override.c_str());
+                    printf("\nInvalid Override Tensor: %s\n",overrider.c_str());
                     continue;
                 }
-                std::string tensor_name = override.substr(0, pos);
-                std::string buffer_type = override.substr(pos + 1);
+                std::string tensor_name = overrider.substr(0, pos);
+                std::string buffer_type = overrider.substr(pos + 1);
 
                 if (buft_list.find(buffer_type) == buft_list.end()) {
                     printf("\nUnknown Buffer Type: %s\n",buffer_type.c_str());
@@ -2470,7 +2477,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
             clip_context_params ctx_clip_params {
                 /* use_gpu           */ true,
-                /* flash_attn_type   */ (kcpp_data->flash_attn?CLIP_FLASH_ATTN_TYPE_ENABLED:CLIP_FLASH_ATTN_TYPE_DISABLED),
+                /* flash_attn_type   */ CLIP_FLASH_ATTN_TYPE_DISABLED, //kcpp: disabled in 1.102.2 as some headsizes break on turing
                 /* image_min_tokens  */ -1,
                 /* image_max_tokens  */ -1,
             };
@@ -3198,6 +3205,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         llama_perf_context_reset(llama_ctx_v4);
     }
 
+    showed_rnn_warning = false;
     generation_finished = false; // Set current generation status
     generated_tokens.clear(); // New Generation, new tokens
     delayed_generated_tokens.clear();
@@ -3752,7 +3760,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     if (debugmode==1 && !is_quiet)
     {
         std::string outstr = "";
-        printf("\n\n[Debug: Dump %d Raw Input Tokens]\n",embd_inp.size());
+        printf("\n\n[Debug: Dump %zu Raw Input Tokens]\n",embd_inp.size());
         outstr += get_tok_vec_str(embd_inp);
         printf("%s\n", RemoveBell(outstr).c_str());
     }
@@ -3986,7 +3994,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             int32_t decode_status2 = llama_decode(llama_ctx_v4, smallbatch.batch);
                             if(debugmode==1 && !is_quiet)
                             {
-                                printf("Retry chunk: %d at %d... status: %s\n",chunk.size(),temp_past,(decode_status2==0?"ok":"fail"));
+                                printf("Retry chunk: %zu at %d... status: %s\n",chunk.size(),temp_past,(decode_status2==0?"ok":"fail"));
                             }
                             evalres = (evalres && (decode_status2==0));
                             temp_past += chunk.size();
