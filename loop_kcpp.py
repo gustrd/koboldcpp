@@ -278,6 +278,16 @@ def ensure_terminate_process(p: Optional[subprocess.Popen], timeout: int = 8, tr
             # On Linux/Unix, give parent time to propagate signals to children
             time.sleep(0.5)
 
+        # Refresh children list in case new ones appeared during the graceful window
+        try:
+            if parent.is_running():
+                new_children = parent.children(recursive=True)
+                for nc in new_children:
+                    if nc not in children:
+                        children.append(nc)
+        except Exception:
+            pass
+
         # Terminate children first (leaf to root order)
         for child in reversed(children):
             try:
@@ -298,11 +308,27 @@ def ensure_terminate_process(p: Optional[subprocess.Popen], timeout: int = 8, tr
         if alive:
             log(f"Force killing {len(alive)} processes that did not terminate gracefully")
             log_to_file(f"Force killing {len(alive)} processes that did not terminate gracefully")
+
+            # Windows: Aggressive tree kill if parent is still around
+            taskkill_success = False
+            if platform.system() == "Windows" and parent in alive:
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], 
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                    taskkill_success = True
+                except Exception:
+                    pass
+            
+            # Individual kill for remaining (or if taskkill skipped/failed)
             for proc in alive:
                 try:
+                    # If we ran taskkill, verify it's actually running before killing again
+                    if taskkill_success and not proc.is_running():
+                        continue
                     proc.kill()
-                except psutil.NoSuchProcess:
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
+
             # Wait again after kill
             gone2, alive2 = psutil.wait_procs(alive, timeout=3)
             if alive2:
