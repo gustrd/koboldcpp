@@ -12,6 +12,10 @@
 #include <vector>
 #include <map>
 
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0A00
+#endif
+
 #ifdef _WIN32
 #define DIRECTORY_SEPARATOR '\\'
 #else
@@ -74,7 +78,8 @@ int32_t cpu_get_num_math();
 enum llama_example {
     LLAMA_EXAMPLE_COMMON,
     LLAMA_EXAMPLE_SPECULATIVE,
-    LLAMA_EXAMPLE_MAIN,
+    LLAMA_EXAMPLE_COMPLETION,
+    LLAMA_EXAMPLE_CLI,
     LLAMA_EXAMPLE_EMBEDDING,
     LLAMA_EXAMPLE_PERPLEXITY,
     LLAMA_EXAMPLE_RETRIEVAL,
@@ -398,6 +403,7 @@ struct common_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool no_perf           = false; // disable performance metrics
+    bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
@@ -646,6 +652,13 @@ struct common_file_info {
     bool        is_dir = false;
 };
 std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
+
+//
+// TTY utils
+//
+
+// Auto-detect if colors can be enabled based on terminal and environment
+bool tty_can_use_colors();
 
 //
 // Model utils

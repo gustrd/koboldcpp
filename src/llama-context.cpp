@@ -17,6 +17,9 @@
 // llama_context
 //
 
+//kcpp: use a global flag to toggle pipeline parallelism to avoid messing with ctx params
+static bool kcpp_pipeline_parallelism = false;
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -248,7 +251,10 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
-        const size_t max_nodes = this->graph_max_nodes();
+        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+        const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
         LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -263,6 +269,11 @@ llama_context::llama_context(
             model.params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
+
+        if(!kcpp_pipeline_parallelism)
+        {
+            pipeline_parallel = false;
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -300,9 +311,6 @@ llama_context::llama_context(
         }
 
         cross.v_embd.clear();
-
-        const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         // avoid reserving graphs with zero outputs - assume one output per sequence
         n_outputs = n_seqs;
@@ -1388,9 +1396,9 @@ void llama_context::output_reorder() {
 // graph
 //
 
-uint32_t llama_context::graph_max_nodes() const {
+uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT) {
-        return std::max<uint32_t>(8192u, 32u*model.n_tensors());
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     return std::max<uint32_t>(1024u, 8u*model.n_tensors());
 }
