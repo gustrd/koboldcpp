@@ -414,6 +414,14 @@ class StdoutRedirector:
         self.terminal = sys.__stdout__
     def write(self, message):
         try:
+            # ------------------------------------------------------------------
+            # GRD_DEBUG: Auto-restart due to ARC driver bugs
+            # ------------------------------------------------------------------
+            # Intel ARC driver bugs can sometimes cause the program to get stuck 
+            # or fail in ways that require a process restart to recover.
+            # ------------------------------------------------------------------
+            if "0xc00000ff" in message.lower():
+                restart_program()
             # Always write to terminal, then duplicate to pipe writer
             self.terminal.write(message)
             self.terminal.flush()
@@ -6850,6 +6858,17 @@ def show_gui_yesnobox(title,message,icon='error'):
 
 def print_with_time(txt):
     print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt, flush=True)
+    try:
+        # ------------------------------------------------------------------
+        # GRD_DEBUG: Auto-restart due to ARC driver bugs
+        # ------------------------------------------------------------------
+        # Intel ARC driver bugs can sometimes cause the program to get stuck 
+        # or fail in ways that require a process restart to recover.
+        # ------------------------------------------------------------------
+        if "0xc00000ff" in txt.lower():
+            restart_program()
+    except:
+        pass
 
 def make_url_request(url, data, method='POST', headers={}, timeout=300):
     global nocertify
@@ -7051,6 +7070,13 @@ def run_horde_worker(args, api_key, worker_name):
             submit_thread.start() #submit job in new thread so nothing is waiting
         else:
             print_with_time("Error, Abandoned current job due to errors. Getting new job.")
+            # ------------------------------------------------------------------
+            # GRD_DEBUG: Auto-restart due to ARC driver bugs
+            # ------------------------------------------------------------------
+            # Intel ARC driver bugs can sometimes cause the program to get stuck
+            # or fail in ways that require a process restart to recover.
+            # ------------------------------------------------------------------
+            restart_program()
         current_id = None
         current_payload = None
         time.sleep(0.1)
