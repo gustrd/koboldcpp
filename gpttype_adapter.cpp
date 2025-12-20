@@ -107,7 +107,7 @@ static llama_context * guidance_ctx = nullptr; //for classifier free guidance, w
 static clip_ctx * clp_ctx_v = nullptr; //for llava
 static clip_image_u8 * clp_img_data = nullptr; //most recent image
 static clip_ctx * clp_ctx_a = nullptr; //for audio multimodal
-static whisper_preprocessor::whisper_filters w_filters; //for audio processing
+static std::unique_ptr<mtmd_audio_preprocessor> audio_preproc; //for audio processing
 static std::vector<media_object> media_objects;
 static std::vector<int> last_media_mem; //for storing dummy tokens that will be consumed by llava
 static std::string media_composite_image_signature = ""; //for identifying when the llava images change, we need to invalidate the cache
@@ -187,6 +187,17 @@ inline bool LogitsDuplicated(std::vector<float> & arr1, std::vector<float> & arr
     return true;
 }
 
+static inline void string_trim_whitespace(std::string & s) {
+    auto nul = std::find(s.begin(), s.end(), '\0'); //remove everything after the first NUL
+    if (nul != s.end()) {
+        s.erase(nul, s.end());
+    }
+    if (s.empty()) return;
+    // trim leading whitespace
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+    // trim trailing whitespace
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+}
 
 static std::string FileFormatTokenizeID(int id, FileFormat file_format, bool return_special = false)
 {
@@ -389,6 +400,38 @@ bool allExtendedUnicode(const std::string& str) {
         }
     }
     return true;
+}
+
+void print_fitted_params(const llama_model_params & mparams, const llama_context_params & cparams)
+{
+    std::cout << "-c "    << cparams.n_ctx;
+    std::cout << " -ngl " << mparams.n_gpu_layers;
+    size_t nd = llama_max_devices();
+    while (nd > 1 && mparams.tensor_split[nd - 1] == 0.0f) {
+        nd--;
+    }
+    if (nd > 1) {
+        for (size_t id = 0; id < nd; id++) {
+            if (id == 0) {
+                std::cout << " -ts ";
+            }
+            if (id > 0) {
+                std::cout << ",";
+            }
+            std::cout << mparams.tensor_split[id];
+        }
+    }
+    const size_t ntbo = llama_max_tensor_buft_overrides();
+    for (size_t itbo = 0; itbo < ntbo && mparams.tensor_buft_overrides[itbo].pattern != nullptr; itbo++) {
+        if (itbo == 0) {
+            std::cout << " -ot ";
+        }
+        if (itbo > 0) {
+            std::cout << ",";
+        }
+        std::cout << mparams.tensor_buft_overrides[itbo].pattern << "=" << ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft);
+    }
+    std::cout << "\n";
 }
 
 // Find tokens that completely contain `str`, either as a single token, or as a sequence of tokens.
@@ -1808,22 +1851,25 @@ static void load_grammar(const std::string & gammarstr)
     }
 }
 
-static bool kcpp_eval_image(llama_context * ctx_llama, float * img_embd, int num_img_tokens, int n_batch, int * n_past) {
-    int n_embd  = llama_model_n_embd_inp(llama_get_model(ctx_llama));
+static bool kcpp_eval_media(llama_context * ctx_llama, const media_chunk & mediachunk, int n_batch, int * n_past, bool is2d) {
+    float * img_embd = mediachunk.clp_img_embd;
+    int num_img_tokens = mediachunk.clp_image_tokens;
+    int img_nx = mediachunk.nx;
+    int img_ny = mediachunk.ny;
+    int n_embd_mmproj  = llama_model_n_embd_inp(llama_get_model(ctx_llama));
+    const int image_n_past = *n_past;
+
+    kcpp_embd_batch media_batch = kcpp_embd_batch(img_embd, num_img_tokens, image_n_past, use_mrope, is2d, img_nx, img_ny);
 
     for (int i = 0; i < num_img_tokens; i += n_batch) {
-        int n_eval = num_img_tokens - i;
-        if (n_eval > n_batch) {
-            n_eval = n_batch;
-        }
-        float * embd = img_embd+i*n_embd;
-        kcpp_embd_batch media_batch = kcpp_embd_batch(embd, n_eval, *n_past, use_mrope);
-        if (llama_decode(ctx_llama, media_batch.batch)) {
+        const int n_eval = std::min(n_batch, num_img_tokens - i);
+        llama_batch batch_embd_view = media_batch.get_view(i, n_eval, n_embd_mmproj);
+        if (llama_decode(ctx_llama, batch_embd_view)) {
             fprintf(stderr, "\n%s : failed to eval image\n", __func__);
             return false;
         }
-        *n_past += n_eval;
     }
+    *n_past += num_img_tokens;
     return true;
 }
 
@@ -1841,9 +1887,23 @@ float ComputePrefixMatchPercent(std::vector<int> &current_context_tokens, std::v
     }
     // Handle case where both sequences are empty to avoid division by zero
     if (min_length == 0) {
-        return 0.0f; // Both empty sequences are considered 100% matched
+        return 0.0f; // Both empty sequences are considered not matched
     }
     return static_cast<float>(match_count) / static_cast<float>(min_length);
+}
+
+//returns true if and only if sequence 1 is fully contained within the starting of sequence 2
+bool FullyContainedPrefix(std::vector<int> &sequence1, std::vector<int> &sequence2)
+{
+    if (sequence1.size() > sequence2.size() || sequence1.size()==0 || sequence2.size()==0) {
+        return false;
+    }
+    for (size_t i = 0; i < sequence1.size(); ++i) {
+        if (sequence1[i] != sequence2[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 //given an old GGUF context and a new context that has some middle portion removed,
@@ -1985,6 +2045,30 @@ static float CalcGradientAIRopeFreqBase(float original_rope_base, int n_ctx_trai
 	        return gradient_ai_rope_freq_base_value;
         }
     }
+}
+
+void kcpp_init_audio_proj(clip_ctx * ctx_a)
+{
+    projector_type proj = clip_get_projector_type(ctx_a);
+
+    // set preprocessor
+    switch (proj) {
+        case PROJECTOR_TYPE_QWEN2A:
+        case PROJECTOR_TYPE_QWEN25O:
+        case PROJECTOR_TYPE_ULTRAVOX:
+        case PROJECTOR_TYPE_VOXTRAL:
+        case PROJECTOR_TYPE_GLMA:
+            audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+            break;
+        case PROJECTOR_TYPE_LFM2A:
+            audio_preproc = std::make_unique<mtmd_audio_preprocessor_conformer>(ctx_a);
+            break;
+        default:
+            GGML_ABORT("unsupported audio projector type");
+    }
+
+    // initialize audio preprocessor
+    audio_preproc->initialize();
 }
 
 ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in_file_format, FileFormatExtraMeta in_file_format_meta)
@@ -2297,8 +2381,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         std::vector<llama_model_kv_override> kvos; //ensure it keeps in scope until model is created
         std::vector<llama_model_tensor_buft_override> tenos; //ensure it keeps in scope until model is created
         std::vector<std::string> temp_tensor_names; //store temp tensor names to have mem references.
-        temp_tensor_names.reserve(32); //very important, prevents vector from reallocating
-        tenos.reserve(32);
+        temp_tensor_names.reserve(llama_max_tensor_buft_overrides()); //very important, prevents vector from reallocating
+        tenos.reserve(llama_max_tensor_buft_overrides());
         if(inputs.moe_experts>0)
         {
             printf("\nOverriding number of experts to %d\n",inputs.moe_experts);
@@ -2382,6 +2466,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 }
                 std::string tensor_name = overrider.substr(0, pos);
                 std::string buffer_type = overrider.substr(pos + 1);
+                string_trim_whitespace(tensor_name);
+                string_trim_whitespace(buffer_type);
 
                 if (buft_list.find(buffer_type) == buft_list.end()) {
                     printf("\nUnknown Buffer Type: %s\n",buffer_type.c_str());
@@ -2399,6 +2485,25 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         {
             tenos.push_back({nullptr, nullptr});
             model_params.tensor_buft_overrides = tenos.data();
+        }
+
+        //apply overrides from autofit
+        float tensor_split_temp[128] = {0}; //temp buffer for autofit
+        if(inputs.autofit)
+        {
+            common_params temp_params;
+            printf("\nAttempting to use llama.cpp's automating fitting code. This will override all your layer configs, may or may not work!\n");
+            //zero out any customizations made
+            tenos.clear();
+            tenos.push_back({nullptr, nullptr});
+            model_params.tensor_buft_overrides = tenos.data();
+            model_params.tensor_split = tensor_split_temp;
+            model_params.n_gpu_layers = 999; //must be this value to be considered default
+            llama_params_fit(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
+            tensor_split_temp, tenos.data(), 1024*1024*1024, kcpp_data->n_ctx,
+            GGML_LOG_LEVEL_DEBUG);
+            printf("Autofit Result: ");
+            print_fitted_params(model_params,llama_ctx_params);
         }
 
         llama_model * llamamodel = llama_model_load_from_file(kcpp_data->model_filename.c_str(), model_params);
@@ -2452,6 +2557,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.swa_full = kcpp_data->swa_full;
         llama_ctx_params.type_k = (inputs.quant_k>1?GGML_TYPE_Q4_0:(inputs.quant_k==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
         llama_ctx_params.type_v = (inputs.quant_v>1?GGML_TYPE_Q4_0:(inputs.quant_v==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
+
         llama_ctx_v4 = llama_init_from_model(llamamodel, llama_ctx_params);
         if(load_guidance)
         {
@@ -2553,10 +2659,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             clp_img_data = clip_image_u8_init();
             if(clp_ctx_a) //init audio
             {
-                if (clip_has_whisper_encoder(clp_ctx_a)) {
-                    // TODO @ngxson : check if model n_mel is 128 or 80
-                    w_filters = whisper_precalc_filters::get_128_bins();
-                }
+                kcpp_init_audio_proj(clp_ctx_a);
                 audio_multimodal_supported = true;
             }
         }
@@ -3132,7 +3235,7 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
                         printf("\nCreating clip image embed...");
                     }
                     media_chunk chunk;
-                    if (!llava_image_embed_make_with_clip_img(clp_ctx_v, kcpp_data->n_threads, clp_img_data, &chunk.clp_img_embd, &chunk.clp_image_tokens)) {
+                    if (!llava_image_embed_make_with_clip_img(clp_ctx_v, kcpp_data->n_threads, clp_img_data, &chunk.clp_img_embd, &chunk.clp_image_tokens, &chunk.nx, &chunk.ny)) {
                         printf("\nError: Clip image %d failed to create embd!",i);
                     }
                     if(debugmode==1 && !is_quiet)
@@ -3161,17 +3264,15 @@ static void PrepareMediaEmbds(const int nctx, const std::vector<int> & media_int
                 }
             } else if(media_objects[i].is_audio && audio_on) {
                 //  audio
-                GGML_ASSERT(w_filters.n_mel); // make sure we have filter preloaded
-
                 std::vector<float> pcmf32;
-                bool ok = kcpp_decode_audio_from_buf(media_data_buffer.data(), media_data_buffer.size(), 16000, pcmf32);
+                int samplerate = clip_get_hparams(clp_ctx_a)->audio_sample_rate;
+                bool ok = kcpp_decode_audio_from_buf(media_data_buffer.data(), media_data_buffer.size(), samplerate, pcmf32);
                 if (!ok) {
                    printf("\nError: Clip audio %d failed to convert!",i);
                    continue;
                 }
-
-                std::vector<whisper_preprocessor::whisper_mel> mel_spec_chunks;
-                ok = whisper_preprocessor::preprocess_audio(pcmf32.data(), pcmf32.size(), w_filters, mel_spec_chunks);
+                std::vector<mtmd_audio_mel> mel_spec_chunks;
+                ok = audio_preproc->preprocess(pcmf32.data(), pcmf32.size(), mel_spec_chunks);
                 if (!ok) {
                    printf("\nError: Clip audio %d failed to load!",i);
                    continue;
@@ -3401,8 +3502,24 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             media_object lv;
             lv.b64data = item;
             lv.is_audio = false;
-            TokenizeString("<image>", lv.chunk_start_seq, file_format, false);
-            TokenizeString("</image>\n\n", lv.chunk_end_seq, file_format, false);
+            std::string img_start = "<image>";
+            std::string img_end = "</image>\n\n";
+            if(clp_ctx_v)
+            {
+                int ptype = clip_get_projector_type_ext(clp_ctx_v);
+                if(ptype == PROJECTOR_TYPE_QWEN2VL || ptype == PROJECTOR_TYPE_QWEN25VL || ptype == PROJECTOR_TYPE_QWEN3VL) //qwen
+                {
+                    img_start = "<|vision_start|>";
+                    img_end = "<|vision_end|>\n\n";
+                }
+                else if(ptype==PROJECTOR_TYPE_GLM4V)
+                {
+                    img_start = "<|begin_of_image|>";
+                    img_end = "<|end_of_image|>\n\n";
+                }
+            }
+            TokenizeString(img_start, lv.chunk_start_seq, file_format, false);
+            TokenizeString(img_end, lv.chunk_end_seq, file_format, false);
             media_objects.push_back(lv);
             new_media_composite += item;
         }
@@ -3420,12 +3537,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             if(clp_ctx_a)
             {
                 int ptype = clip_get_projector_type_ext(clp_ctx_a);
-                if(ptype==14) //qwen omni
+                if(ptype==PROJECTOR_TYPE_QWEN2A) //qwen omni
                 {
                     aud_start = "<|audio_bos|>";
                     aud_end = "<|audio_eos|>\n";
                 }
-                else if(ptype==16) //voxtral
+                else if(ptype==PROJECTOR_TYPE_VOXTRAL) //voxtral
                 {
                     aud_start = "[INST][BEGIN_AUDIO]";
                     aud_end = "[/INST]\n";
@@ -3818,13 +3935,75 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         {
             shiftable = false;
         }
-        const float similarity_threshold = 0.7f;
-        //If CanBeShifted is true, do nothing. Allow shift as normal.
-        if(!(shiftable && CanContextShift(current_context_tokens, embd_inp, inputs.max_length, nctx)))
+
+        //we handle recurrent models differently since they require a full subset match
+        if(is_recurrent)
+        {
+            bool curr_usable = FullyContainedPrefix(current_context_tokens,embd_inp);
+            if(!curr_usable)
+            {
+                //see if we have any other usable contexts out there
+                int bestslot = -1;
+                int bestlen = 0;
+                int identical_slot = get_identical_existing_slot(); //see if the slot already exists
+                for(int i=0;i<savestate_limit;++i)
+                {
+                    bool target_usable = FullyContainedPrefix(savestates[i].savestate_context_tokens,embd_inp);
+                    int target_len = savestates[i].savestate_context_tokens.size();
+                    if(target_usable && target_len>bestlen)
+                    {
+                        bestlen = target_len;
+                        bestslot = i;
+                    }
+                }
+                if(bestslot!=-1) //found a good slot to load
+                {
+                    int oldest_slot = get_oldest_slot(bestslot);
+                    if(oldest_slot!=bestslot)
+                    {
+                        if(current_context_tokens.size() > 32) //do not save tiny contexts
+                        {
+                            if(identical_slot==-1)
+                            {
+                                printf("\n[SmartCache RNN Match of %d tokens in slot %d. Saving into slot %d and switching...]\n",bestlen,bestslot,oldest_slot);
+                                gpttype_save_state_kv(oldest_slot);
+                            } else {
+                                printf("\n[SmartCache RNN Match of %d tokens in slot %d. Already saved in slot %d, switching...]\n",bestlen,bestslot,identical_slot);
+                                touch_slot(identical_slot);
+                            }
+                        }
+                        else
+                        {
+                            printf("\n[SmartCache RNN Match of %d tokens in slot %d. Switching...]\n",bestlen,bestslot);
+                        }
+                        gpttype_load_state_kv(bestslot);
+                    }
+                }
+                else
+                {
+                    if(current_context_tokens.size() > 32) //do not save tiny contexts
+                    {
+                        if(identical_slot==-1)
+                        {
+                            int oldest_slot = get_oldest_slot(-1);
+                            printf("\n[SmartCache RNN No Match, Saving into slot %d...]\n",oldest_slot);
+                            gpttype_save_state_kv(oldest_slot);
+                        }
+                        else
+                        {
+                            printf("\n[SmartCache RNN No Match, Already saved in slot %d]\n",identical_slot);
+                            touch_slot(identical_slot);
+                        }
+                    }
+                }
+            }
+        }
+        else if(!(shiftable && CanContextShift(current_context_tokens, embd_inp, inputs.max_length, nctx)))   //If CanBeShifted is true, do nothing. Allow shift as normal.
         {
             // If CanBeShifted is false, calculate prefix similarity with current_context_tokens of current context
             // If similarity > similarity_threshold, do nothing. Allow fast forward as normal.
             float similarity = ComputePrefixMatchPercent(current_context_tokens,embd_inp);
+            const float similarity_threshold = 0.7f;
             if(similarity < similarity_threshold)
             {
                 // Otherwise, for each of the currently used kv state slots, calculate ComputePrefixMatch and CanBeShifted
@@ -3832,6 +4011,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 // Whenever loading or saving current slot, simply tag the slot with a timestamp. When running out of slots after all 3 are used, delete the oldest timestamped slot.
                 // Slot loading and saving completely reuses gpttype_load_state_kv and gpttype_save_state_kv, nothing else is needed.
                 bool foundswap = false;
+                int identical_slot = get_identical_existing_slot(); //see if a slot already exists with identical data to current
                 for(int i=0;i<savestate_limit;++i)
                 {
                     float similaritybeat = ComputePrefixMatchPercent(savestates[i].savestate_context_tokens,embd_inp);
@@ -3841,15 +4021,20 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         int oldest_slot = get_oldest_slot(i);
                         if(oldest_slot!=i)
                         {
-                            if(current_context_tokens.size()>32) //do not save tiny contexts
+                            if(current_context_tokens.size() > 32) //do not save tiny contexts
                             {
-                                printf("\n[SmartCache Match of %.2f in slot %d. Saving into slot %d and switching...]",similaritybeat,i,oldest_slot);
-                                gpttype_save_state_kv(oldest_slot);
+                                if(identical_slot==-1)
+                                {
+                                    printf("\n[SmartCache Match of %.2f in slot %d. Saving into slot %d and switching...]\n",similaritybeat,i,oldest_slot);
+                                    gpttype_save_state_kv(oldest_slot);
+                                } else {
+                                    printf("\n[SmartCache Match of %.2f in slot %d. Already saved in slot %d, switching...]\n",similaritybeat,i,identical_slot);
+                                    touch_slot(identical_slot);
+                                }
                             }
                             else
                             {
-                                printf("\n[SmartCache Match of %.2f in slot %d. Switching...]",similaritybeat,i);
-
+                                printf("\n[SmartCache Match of %.2f in slot %d. Switching...]\n",similaritybeat,i);
                             }
                             gpttype_load_state_kv(i);
                             foundswap = true;
@@ -3859,11 +4044,19 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 }
                 if(!foundswap) //could not match anything, just save kv and continue
                 {
-                    if(current_context_tokens.size()>32) //do not save tiny contexts
+                    if(current_context_tokens.size() > 32) //do not save tiny contexts
                     {
-                        int oldest_slot = get_oldest_slot(-1);
-                        printf("\n[SmartCache No Match, Saving into slot %d...]",oldest_slot);
-                        gpttype_save_state_kv(oldest_slot);
+                        if(identical_slot==-1)
+                        {
+                            int oldest_slot = get_oldest_slot(-1);
+                            printf("\n[SmartCache No Match, Saving into slot %d...]\n",oldest_slot);
+                            gpttype_save_state_kv(oldest_slot);
+                        }
+                        else
+                        {
+                            printf("\n[SmartCache No Match, Already saved in slot %d]\n",identical_slot);
+                            touch_slot(identical_slot);
+                        }
                     }
                 }
             }
@@ -4611,7 +4804,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     printf("\rProcessing Media Embedding %d (%d tokens)",(i+1), chunk.clp_image_tokens);
                                 }
-                                bool err = kcpp_eval_image(llama_ctx_v4,chunk.clp_img_embd,chunk.clp_image_tokens,kcpp_data->n_batch,&n_past);
+                                bool is2d = (media_objects[i].is_audio?false:true);
+                                bool err = kcpp_eval_media(llama_ctx_v4,chunk,kcpp_data->n_batch,&n_past,is2d);
                                 llavatokensevaled += chunk.clp_image_tokens;
                                 if(!err)
                                 {
@@ -4684,6 +4878,21 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         concat_output += delayed_generated_tokens[0];
         concat_output_mtx.unlock();
         delayed_generated_tokens.pop_front();
+    }
+
+    //if running rnn model in smartcache mode, save progress after each gen
+    if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
+    {
+        int identical_slot = get_identical_existing_slot();
+        if(identical_slot==-1)
+        {
+            int oldest_slot = get_oldest_slot(-1);
+            gpttype_save_state_kv(oldest_slot);
+        }
+        else
+        {
+            touch_slot(identical_slot);
+        }
     }
 
     if(debugmode==1 && !is_quiet && file_format == FileFormat::GGUF_GENERIC)
@@ -4803,9 +5012,7 @@ size_t gpttype_save_state_kv(int slot)
             totalbytes += res;
             savestates[slot].current_savestate_size   = newsize;
             savestates[slot].savestate_context_tokens = current_context_tokens;
-            auto timenow = std::chrono::system_clock::now();
-            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(timenow.time_since_epoch()).count();
-            savestates[slot].last_used = timestamp;
+            touch_slot(slot);
             printf("\nKV Save State %d: Created SaveState of %zu tokens, costing %zu MB.\n",slot,current_context_tokens.size(),savestates[slot].current_savestate_size/(1024*1024));
         }
 
@@ -4855,9 +5062,7 @@ bool gpttype_load_state_kv(int slot)
                 auto res2 = llama_state_set_data(draft_ctx, savestates[slot].current_draft_savestate_buffer.data(), savestates[slot].current_draft_savestate_size);
                 printf("\nKV Load DraftSaveState %d: Restored KV with %zu tokens.\n", slot,current_context_tokens.size());
             }
-            auto timenow = std::chrono::system_clock::now();
-            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(timenow.time_since_epoch()).count();
-            savestates[slot].last_used = timestamp;
+            touch_slot(slot);
         }
         return (res > 0);
     }
@@ -4897,6 +5102,41 @@ bool gpttype_clear_state_kv(bool shrink)
         return true;
     }
     return false;
+}
+void touch_slot(int slot) //update the slot's last used time and nothing else
+{
+    auto timenow = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(timenow.time_since_epoch()).count();
+    savestates[slot].last_used = timestamp;
+}
+int get_identical_existing_slot() //returns slot number of slot containing exactly the same data, or -1 if nothing
+{
+    int64_t slotage = INT64_MAX; // Initialize with maximum possible value
+    int slotid = -1;
+    int currctxsize = current_context_tokens.size();
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(savestates[i].savestate_context_tokens.size() == currctxsize)
+        {
+            bool is_identical = true;
+            const auto& slot_tokens = savestates[i].savestate_context_tokens;
+            for (size_t j = 0; j < currctxsize; ++j)
+            {
+                if (slot_tokens[j] != current_context_tokens[j])
+                {
+                    is_identical = false;
+                    break;
+                }
+            }
+
+            if (is_identical)
+            {
+                slotid = i;
+                break;
+            }
+        }
+    }
+    return slotid;
 }
 
 int get_oldest_slot(int excludeSlotId)
