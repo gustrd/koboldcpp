@@ -447,6 +447,8 @@ class StdoutRedirector:
 # See also: GRD_DEBUG section in horde worker (~line 6888) for usage example.
 # ==============================================================================
 
+GRD_REPEATED_CHARS_LIMIT = 15
+
 def _enable_windows_ansi() -> None:
     """
     Try to enable ANSI escape sequence handling on Windows 10+ consoles.
@@ -524,7 +526,7 @@ def restart_program() -> None:
         pass
     os.execv(python, args)
 
-def detect_repeated_prefix(s: str, min_repeats: int = 5) -> Tuple[Optional[str], int]:
+def detect_repeated_prefix(s: str, min_repeats: int = GRD_REPEATED_CHARS_LIMIT) -> Tuple[Optional[str], int]:
     """
     Detect if the string `s` begins with some substring repeated at least `min_repeats` times.
     If found, prints the substring and how many times it appears consecutively from the start,
@@ -7040,7 +7042,7 @@ def run_horde_worker(args, api_key, worker_name):
                 debug_dark_yellow_utf(generated_string)
 
                 repeated_substring, count = detect_repeated_prefix(generated_string)
-                if count >= 15:
+                if count >= GRD_REPEATED_CHARS_LIMIT:
                     debug_dark_yellow_utf("ERROR: Single token sample bug detected. Restarting...")
                     restart_program()
             except Exception as e:
