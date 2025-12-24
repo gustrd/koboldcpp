@@ -6857,9 +6857,6 @@ def show_gui_yesnobox(title,message,icon='error'):
 
 def print_with_time(txt):
     print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt, flush=True)
-    try:
-    except:
-        pass
 
 def make_url_request(url, data, method='POST', headers={}, timeout=300):
     global nocertify
