@@ -7040,7 +7040,7 @@ def run_horde_worker(args, api_key, worker_name):
                 debug_dark_yellow_utf(generated_string)
 
                 repeated_substring, count = detect_repeated_prefix(generated_string)
-                if count >= 5:
+                if count >= 15:
                     debug_dark_yellow_utf("ERROR: Single token sample bug detected. Restarting...")
                     restart_program()
             except Exception as e:
