@@ -95,7 +95,8 @@ bool whispertype_load_model(const whisper_load_model_inputs inputs)
             vulkan_info_str += ",";
         }
     }
-    if(vulkan_info_str!="")
+    const char* existingenv = getenv("GGML_VK_VISIBLE_DEVICES");
+    if(!existingenv && vulkan_info_str!="")
     {
         whispervulkandeviceenv = "GGML_VK_VISIBLE_DEVICES="+vulkan_info_str;
         putenv((char*)whispervulkandeviceenv.c_str());

@@ -303,7 +303,8 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
             vulkan_info_str += ",";
         }
     }
-    if(vulkan_info_str!="")
+    const char* existingenv = getenv("GGML_VK_VISIBLE_DEVICES");
+    if(!existingenv && vulkan_info_str!="")
     {
         sdvulkandeviceenv = "GGML_VK_VISIBLE_DEVICES="+vulkan_info_str;
         putenv((char*)sdvulkandeviceenv.c_str());

@@ -604,6 +604,12 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
+    if([rsets->data count] != 0)
+    {
+        //kcpp try fix for assert below
+        return;
+    }
+
     // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
     GGML_ASSERT([rsets->data count] == 0);
 
@@ -781,6 +787,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             }
 
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+
+            dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_working_set_size       = dev->mtl_device.recommendedMaxWorkingSetSize;

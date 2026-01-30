@@ -256,7 +256,7 @@ static const char * cu_get_error_str(CUresult err) {
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
-#    define BLACKWELL_MMA_AVAILABLE
+// #    define BLACKWELL_MMA_AVAILABLE // kcpp: no blackwell mma for now, requires too high cuda
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -266,6 +266,10 @@ static const char * cu_get_error_str(CUresult err) {
 #if !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 #define FLASH_ATTN_AVAILABLE
 #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
+
+#if defined(TURING_MMA_AVAILABLE)
+#define LDMATRIX_TRANS_AVAILABLE
+#endif // defined(TURING_MMA_AVAILABLE)
 
 static bool fp16_available(const int cc) {
     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL ||
@@ -331,6 +335,7 @@ static bool cp_async_available(const int cc) {
 }
 
 static bool blackwell_mma_available(const int cc) {
+    return false; //kcpp: no blackwell mma for now, requires too high cuda
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
@@ -530,6 +535,86 @@ static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
     NO_DEVICE_CODE;
     return a;
 #endif // FP16_AVAILABLE
+}
+
+enum class block_reduce_method {
+    MAX,
+    SUM,
+};
+
+template<block_reduce_method method_t, typename T>
+struct block_reduce_policy;
+
+template <typename T, typename... Ts>
+inline constexpr bool is_any = (std::is_same_v<T, Ts> || ...);
+
+template<typename...>
+inline constexpr bool ggml_cuda_dependent_false_v = false;
+
+template <typename T> struct block_reduce_policy<block_reduce_method::SUM, T> {
+    static __device__ T reduce(T val) {
+        if constexpr(is_any<T, float, float2, half2, int>) {
+            return warp_reduce_sum(val);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce sum");
+        }
+    }
+
+    static __device__ T sentinel() {
+        if constexpr (std::is_same_v<T, float>) {
+            return 0.0f;
+        } else if constexpr (std::is_same_v<T, float2>) {
+            return make_float2(0.0f, 0.0f);
+        } else if constexpr (std::is_same_v<T, half2>) {
+            return make_half2(0.0f, 0.0f);
+        } else if constexpr (std::is_same_v<T, int>) {
+            return 0;
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce sum");
+        }
+    }
+};
+
+template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
+    static __device__ T reduce(T val) {
+        if constexpr (is_any<T, float, half2>) {
+            return warp_reduce_max(val);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce max");
+        }
+    }
+
+    static __device__ T sentinel() {
+        if constexpr (std::is_same_v<T, float>) {
+            return -INFINITY;
+        } else if constexpr (std::is_same_v<T, half2>) {
+            return make_half2(-INFINITY, -INFINITY);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce max");
+        }
+    }
+};
+
+template <block_reduce_method reduce_method_t, const unsigned int block_size_template = 0, typename T>
+static __device__ T block_reduce(T val, T * shared_vals) {
+    val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
+    const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
+    if (block_size > WARP_SIZE) {
+        assert((block_size <= 1024) && (block_size % WARP_SIZE) == 0);
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            shared_vals[warp_id] = val;
+        }
+        __syncthreads();
+        val = block_reduce_policy<reduce_method_t, T>::sentinel();
+        if (lane_id < (static_cast<int>(block_size) / WARP_SIZE)) {
+            val = shared_vals[lane_id];
+        }
+        return block_reduce_policy<reduce_method_t, T>::reduce(val);
+    }
+
+    return val;
 }
 
 static __device__ __forceinline__ half ggml_cuda_hmax(const half a, const half b) {
@@ -956,15 +1041,16 @@ struct ggml_cuda_device_info {
     int device_count;
 
     struct cuda_device_info {
-        int     cc;                 // compute capability
-        int     nsm;                // number of streaming multiprocessors
-        size_t  smpb;               // max. shared memory per block
-        size_t  smpbo;              // max. shared memory per block (with opt-in)
-        bool    integrated;         // Device is integrated as opposed to discrete
-        bool    vmm;                // virtual memory support
-        size_t  vmm_granularity;    // granularity of virtual memory
+        int     cc;                             // compute capability
+        int     nsm;                            // number of streaming multiprocessors
+        size_t  smpb;                           // max. shared memory per block
+        size_t  smpbo;                          // max. shared memory per block (with opt-in)
+        bool    integrated;                     // Device is integrated as opposed to discrete
+        bool    vmm;                            // virtual memory support
+        size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
-        int     warp_size;          // Number of threads in a dispatch
+        int     warp_size;                      // Number of threads in a dispatch
+        bool    supports_cooperative_launch;    // whether cooperative launch is supported
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -1041,7 +1127,7 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
-struct ggml_graph_node_properties {
+struct ggml_cuda_graph_node_properties {
     void * node_address;
     ggml_op node_op;
     int64_t ne[GGML_MAX_DIMS];
@@ -1064,12 +1150,27 @@ struct ggml_cuda_graph {
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
-    std::vector<cudaKernelNodeParams> params;
     bool disable_due_to_gpu_arch = false;
     bool disable_due_to_too_many_updates = false;
-    bool disable_due_to_failed_graph_capture = false;
     int number_consecutive_updates = 0;
-    std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    std::vector<ggml_cuda_graph_node_properties> props;
+
+    void record_update(bool use_graph, bool update_required) {
+        if (use_graph && update_required) {
+            number_consecutive_updates++;
+        } else {
+            number_consecutive_updates = 0;
+        }
+        if (number_consecutive_updates >= 4) {
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
+            disable_due_to_too_many_updates = true;
+        }
+    }
+
+    bool is_enabled() const {
+        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env || disable_due_to_too_many_updates);
+    }
 #endif
 };
 

@@ -154,8 +154,8 @@ static int delayed_generated_tokens_limit = 0;
 std::deque<std::string> delayed_generated_tokens; //for use with antislop sampling
 static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the npast position, second is the array of banned ids at that index
 
-const int savestate_limit = 10;
-static savestate_data savestates[savestate_limit];
+static int savestate_limit = 0;
+static std::vector<savestate_data> savestates;
 
 inline int kcpp_cpu_has_blas(void) {
 #if defined(GGML_USE_BLAS) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_CLBLAST) || defined(GGML_USE_SYCL)
@@ -641,7 +641,9 @@ static void speculative_decoding_setup(std::string spec_model_filename, const ll
 
     draft_model_params.use_mmap = base_model_params.use_mmap;
     draft_model_params.use_mlock = base_model_params.use_mlock;
+    draft_model_params.use_direct_io = base_model_params.use_direct_io;
     draft_model_params.n_gpu_layers = draft_gpulayers; //layers offload the speculative model.
+    draft_model_params.devices = base_model_params.devices;
     draft_ctx_params.n_ctx = base_ctx_params.n_ctx;
     draft_ctx_params.offload_kqv = base_ctx_params.offload_kqv;
     draft_model_params.main_gpu = base_model_params.main_gpu;
@@ -2143,6 +2145,13 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     kcpp_data->use_contextshift = inputs.use_contextshift;
     kcpp_data->use_fastforward = inputs.use_fastforward;
     kcpp_data->smartcache = inputs.smartcache;
+    //prepare savestate slots
+    savestate_limit = inputs.smartcacheslots;
+    savestates.resize(savestate_limit);
+    if(kcpp_data->smartcache)
+    {
+        printf("SmartCache: Prepared %d KV slots\n",savestate_limit);
+    }
     kcpp_pipeline_parallelism = inputs.pipelineparallel;
     if(!kcpp_data->use_fastforward && kcpp_data->smartcache)
     {
@@ -2364,7 +2373,21 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.kv_unified = true;
         model_params.use_mmap = inputs.use_mmap;
         model_params.use_mlock = inputs.use_mlock;
+        model_params.use_direct_io = false; //no direct io for now until stable
         model_params.n_gpu_layers = inputs.gpulayers;
+
+        //set device overrides if needed
+        std::vector<ggml_backend_dev_t> devices_override;
+        std::string dev_override_str = inputs.devices_override;
+        if(dev_override_str!="")
+        {
+            devices_override = kcpp_parse_device_list(dev_override_str);
+            if(devices_override.size()>0)
+            {
+                printf("\nOverriding with %d devices...\n",devices_override.size()-1);
+                model_params.devices = devices_override.data();
+            }
+        }
 
         #if defined(GGML_USE_CLBLAST)
         if(file_format==FileFormat::GGUF_GENERIC && model_params.n_gpu_layers>0)
@@ -2474,11 +2497,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         //handle override tensor
         std::string tensoroverrides = inputs.override_tensors;
-        // if(file_format_meta.model_architecture==GGUFArch::ARCH_GEMMA3N)
-        // {
-        //     std::string forced = "per_layer_token_embd.weight=CPU"; //this tensor on gpu is problematic on unsloth q4_0
-        //     tensoroverrides = (tensoroverrides=="" ? forced: (forced+","+tensoroverrides));
-        // }
+
         if(ggml_backend_dev_count()>1 && inputs.moecpu>0)
         {
             std::string toadd = "";
@@ -2542,6 +2561,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
         //apply overrides from autofit
         float tensor_split_temp[128] = {0}; //temp buffer for autofit
+        std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(),1024*1024*1024);
         if(inputs.autofit)
         {
             common_params temp_params;
@@ -2554,8 +2574,9 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             model_params.tensor_split = tensor_split_temp;
             model_params.n_gpu_layers = -1; //must be this value to be considered default
             printf("Autofit Reserve Space: %d MB\n",taxmb);
+            fit_params_target[0] = taxmb*1024*1024;
             llama_params_fit(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
-            tensor_split_temp, tenos.data(), taxmb*1024*1024, kcpp_data->n_ctx,
+            tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx,
             GGML_LOG_LEVEL_DEBUG);
             printf("Autofit Result: ");
             print_fitted_params(model_params,llama_ctx_params);
@@ -4711,7 +4732,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     std::string topstr = toppick.selected_token;
                     ::utreplace(topstr, "\n", "\\n");
                     printf("(%s <%d> %.2f%%)", RemoveBell(topstr).c_str(), toppick.selected_tokenid, toppick.selected_probability*100);
-                    int maxtoshow = (toppick.tokenid.size()>4?4:toppick.tokenid.size());
+                    int maxtoshow = (toppick.tokenid.size()>4?4:toppick.tokenid.size()); //hardcode limit even if we have more logprobs_max
                     for (int i=0;i<maxtoshow;++i)
                     {
                         if(toppick.tokenid[i]==toppick.selected_tokenid)

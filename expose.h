@@ -4,7 +4,7 @@
 const int tensor_split_max = 16;
 const int images_max = 8;
 const int audio_max = 4;
-const int logprobs_max = 5;
+const int logprobs_max = 10;
 const int overridekv_max = 4;
 
 // match kobold's sampler list and order
@@ -77,8 +77,10 @@ struct load_model_inputs
     const bool highpriority = false;
     const bool swa_support = false;
     const bool smartcache = false;
+    const int smartcacheslots = 0;
     const bool pipelineparallel = false;
     const float lora_multiplier = 1.0f;
+    const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
 };
@@ -156,7 +158,9 @@ struct logprob_item {
     int option_count;
     const char * selected_token;
     float selected_logprob;
+    int32_t selected_token_id;
     const char * tokens[logprobs_max];
+    int32_t token_ids[logprobs_max];
     float * logprobs = nullptr;
 };
 struct last_logprobs_outputs {
@@ -191,6 +195,7 @@ struct sd_load_model_inputs
     const char * photomaker_filename = nullptr;
     const int img_hard_limit = 0;
     const int img_soft_limit = 0;
+    const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
 };
@@ -240,6 +245,7 @@ struct whisper_load_model_inputs
     const int clblast_info = 0;
     const int kcpp_main_gpu = 0;
     const char * vulkan_info = nullptr;
+    const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
 };
@@ -268,6 +274,7 @@ struct tts_load_model_inputs
     const int gpulayers = 0;
     const bool flash_attention = false;
     const int ttsmaxlen = 4096;
+    const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
 };
@@ -298,6 +305,7 @@ struct embeddings_load_model_inputs
     const bool flash_attention = false;
     const bool use_mmap = false;
     const int embeddingsmaxctx = 0;
+    const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
 };
