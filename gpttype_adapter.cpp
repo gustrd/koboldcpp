@@ -46,6 +46,11 @@
 #include "tools/mtmd/mtmd-audio.h"
 #include "common/common.h"
 
+#if defined(GGML_USE_HIP)
+// for rocblas_initialize()
+#include "rocblas/rocblas.h"
+#endif
+
 //const
 const int extra_context_handle_fragmentation = 128;
 const int MEDIA_TOKEN_IDENTIFIER_A = -998; //alternate between both, changing when image changes
@@ -187,6 +192,10 @@ inline bool LogitsDuplicated(std::vector<float> & arr1, std::vector<float> & arr
         }
     }
     return true;
+}
+
+static inline void log_callback_off(ggml_log_level level, const char* text, void*) {
+    return;
 }
 
 static inline void string_trim_whitespace(std::string & s) {
@@ -2549,8 +2558,12 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(),1024*1024*1024);
         if(inputs.autofit)
         {
+            #if defined(GGML_USE_HIP)
+            rocblas_initialize();
+            #endif // defined(GGML_USE_HIP)
+
             common_params temp_params;
-            size_t taxmb = 1024 + inputs.autofit_tax_mb;
+            size_t taxmb = inputs.autofit_tax_mb;
             printf("\nAttempting to use llama.cpp's automating fitting code. This will override all your layer configs, may or may not work!\n");
             //zero out any customizations made
             tenos.clear();
@@ -2559,12 +2572,30 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             model_params.tensor_split = tensor_split_temp;
             model_params.n_gpu_layers = -1; //must be this value to be considered default
             printf("Autofit Reserve Space: %d MB\n",taxmb);
+            //disable log spam
+            bool dospam = (debugmode==1 && !is_quiet);
+            ggml_log_callback currlogger;
+            void * curruserdat;
+            if(!dospam)
+            {
+                llama_log_get(&currlogger, &curruserdat);
+                llama_log_set(log_callback_off, nullptr);
+            }
             fit_params_target[0] = taxmb*1024*1024;
-            llama_params_fit(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
+            bool success = (llama_params_fit(kcpp_data->model_filename.c_str(), &model_params, &llama_ctx_params,
             tensor_split_temp, tenos.data(), fit_params_target.data(), kcpp_data->n_ctx,
-            GGML_LOG_LEVEL_DEBUG);
-            printf("Autofit Result: ");
+            GGML_LOG_LEVEL_NONE)==0);
+            if(!dospam)
+            {
+                llama_log_set(currlogger, curruserdat);
+            }
+            printf("Autofit Success: %d, Autofit Result: ",success);
             print_fitted_params(model_params,llama_ctx_params);
+            if(!success)
+            {
+                //revert to previous
+                model_params.n_gpu_layers = inputs.gpulayers;
+            }
         }
 
         llama_model * llamamodel = llama_model_load_from_file(kcpp_data->model_filename.c_str(), model_params);
@@ -2650,6 +2681,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         llama_attach_threadpool(llama_ctx_v4, threadpool1, threadpool2);
 
+        std::vector<llama_adapter_lora *> loras;
+        std::vector<float> lorascales;
         if (lora_filename != "")
         {
             printf("\nAttempting to apply LORA adapter: %s\n", lora_filename.c_str());
@@ -2658,7 +2691,10 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 fprintf(stderr, "%s: error: failed to apply lora adapter\n", __func__);
                 return ModelLoadResult::FAIL;
             }
-            llama_set_adapter_lora(llama_ctx_v4, adapter, inputs.lora_multiplier);
+
+            loras.push_back(adapter);
+            lorascales.push_back(inputs.lora_multiplier);
+            llama_set_adapters_lora(llama_ctx_v4, loras.data(), loras.size(), lorascales.data());
         }
 
         if(mmproj_filename != "" && file_format==FileFormat::GGUF_GENERIC)
@@ -2835,7 +2871,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         printf("\nRWKV Vocab: %u\n", vocabsiz);
         logits.resize(vocabsiz);
 
-        n_vocab = vocab.id_to_token.size(); //handled seperately
+        n_vocab = vocab.id_to_token.size(); //handled separately
 
         if (file_format == FileFormat::RWKV_1)
         {
@@ -3396,7 +3432,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         output.text = nullptr;
         output.status = 0;
         output.prompt_tokens = output.completion_tokens = 0;
-        output.stopreason = stop_reason::INVALID;
+        last_stop_reason = stop_reason::ERROR_ENCOUNTERED;
+        output.stopreason = last_stop_reason;
         generation_finished = true;
         return output;
     }
@@ -4482,7 +4519,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 output.text = nullptr;
                 output.status = 0;
                 output.prompt_tokens = output.completion_tokens = 0;
-                output.stopreason = stop_reason::INVALID;
+                last_stop_reason = stop_reason::ERROR_ENCOUNTERED;
+                output.stopreason = last_stop_reason;
                 generation_finished = true;
                 return output;
             }
@@ -4944,7 +4982,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                     output.text = nullptr;
                                     output.status = 0;
                                     output.prompt_tokens = output.completion_tokens = 0;
-                                    output.stopreason = stop_reason::INVALID;
+                                    last_stop_reason = stop_reason::ERROR_ENCOUNTERED;
+                                    output.stopreason = last_stop_reason;
                                     generation_finished = true;
                                     return output;
                                 }
@@ -4974,7 +5013,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             output.text = nullptr;
                             output.status = 0;
                             output.prompt_tokens = output.completion_tokens = 0;
-                            output.stopreason = stop_reason::INVALID;
+                            last_stop_reason = stop_reason::ERROR_ENCOUNTERED;
+                            output.stopreason = last_stop_reason;
                             generation_finished = true;
                             return output;
                         }

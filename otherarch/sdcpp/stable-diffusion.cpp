@@ -69,6 +69,8 @@ const char* sampling_methods_str[] = {
     "LCM",
     "DDIM \"trailing\"",
     "TCD",
+    "Res Multistep",
+    "Res 2s",
 };
 
 /*================================================== Helper Functions ================================================*/
@@ -583,7 +585,7 @@ public:
                     }
                 }
                 if (is_chroma) {
-                    if (sd_ctx_params->diffusion_flash_attn && sd_ctx_params->chroma_use_dit_mask) {
+                    if ((sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) && sd_ctx_params->chroma_use_dit_mask) {
                         LOG_WARN(
                             "!!!It looks like you are using Chroma with flash attention. "
                             "This is currently unsupported. "
@@ -706,14 +708,6 @@ public:
                 if (sd_ctx_params->diffusion_conv_direct) {
                     LOG_INFO("Using Conv2d direct in the diffusion model");
                     std::dynamic_pointer_cast<UNetModel>(diffusion_model)->unet.set_conv2d_direct_enabled(true);
-                }
-            }
-
-            if (sd_ctx_params->diffusion_flash_attn) {
-                LOG_INFO("Using flash attention in the diffusion model");
-                diffusion_model->set_flash_attn_enabled(true);
-                if (high_noise_diffusion_model) {
-                    high_noise_diffusion_model->set_flash_attn_enabled(true);
                 }
             }
 
@@ -865,6 +859,31 @@ public:
                     return false;
                 }
                 pmid_model->get_param_tensors(tensors, "pmid");
+            }
+
+            if (sd_ctx_params->flash_attn) {
+                LOG_INFO("Using flash attention");
+                if(!sd_version_is_qwen_image(version)) //kcpp: edit 14feb, breaks qwen image edit
+                {
+                    cond_stage_model->set_flash_attention_enabled(true);
+                }
+                if (clip_vision) {
+                    clip_vision->set_flash_attention_enabled(true);
+                }
+                if (first_stage_model) {
+                    first_stage_model->set_flash_attention_enabled(true);
+                }
+                if (tae_first_stage) {
+                    tae_first_stage->set_flash_attention_enabled(true);
+                }
+            }
+
+            if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
+                LOG_INFO("Using flash attention in the diffusion model");
+                diffusion_model->set_flash_attention_enabled(true);
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->set_flash_attention_enabled(true);
+                }
             }
 
             diffusion_model->set_circular_axes(sd_ctx_params->circular_x, sd_ctx_params->circular_y);
@@ -1686,7 +1705,7 @@ public:
                 if (vae_tiling_params.enabled) {
                     // split latent in 32x32 tiles and compute in several steps
                     auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                        first_stage_model->compute(n_threads, in, true, &out, nullptr);
+                        return first_stage_model->compute(n_threads, in, true, &out, nullptr);
                     };
                     silent_tiling(latents, result, get_vae_scale_factor(), 32, 0.5f, on_tiling);
 
@@ -1705,7 +1724,7 @@ public:
                 if (vae_tiling_params.enabled) {
                     // split latent in 64x64 tiles and compute in several steps
                     auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                        tae_first_stage->compute(n_threads, in, true, &out, nullptr);
+                        return tae_first_stage->compute(n_threads, in, true, &out, nullptr);
                     };
                     silent_tiling(latents, result, get_vae_scale_factor(), 64, 0.5f, on_tiling);
                 } else {
@@ -2674,7 +2693,7 @@ public:
                 LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
 
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                    first_stage_model->compute(n_threads, in, false, &out, work_ctx);
+                    return first_stage_model->compute(n_threads, in, false, &out, work_ctx);
                 };
                 sd_tiling_non_square(x, result, vae_scale_factor, tile_size_x, tile_size_y, tile_overlap, on_tiling);
             } else {
@@ -2685,7 +2704,7 @@ public:
             if (vae_tiling_params.enabled && !encode_video) {
                 // split latent in 32x32 tiles and compute in several steps
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                    tae_first_stage->compute(n_threads, in, false, &out, nullptr);
+                    return tae_first_stage->compute(n_threads, in, false, &out, nullptr);
                 };
                 sd_tiling(x, result, vae_scale_factor, 64, 0.5f, on_tiling);
             } else {
@@ -2803,11 +2822,15 @@ public:
 
                 // split latent in 32x32 tiles and compute in several steps
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                    first_stage_model->compute(n_threads, in, true, &out, nullptr);
+                    return first_stage_model->compute(n_threads, in, true, &out, nullptr);
                 };
                 sd_tiling_non_square(x, result, vae_scale_factor, tile_size_x, tile_size_y, tile_overlap, on_tiling);
             } else {
-                first_stage_model->compute(n_threads, x, true, &result, work_ctx);
+                if (!first_stage_model->compute(n_threads, x, true, &result, work_ctx)) {
+                    LOG_ERROR("Failed to decode latetnts");
+                    first_stage_model->free_compute_buffer();
+                    return nullptr;
+                }
             }
             first_stage_model->free_compute_buffer();
             process_vae_output_tensor(result);
@@ -2815,11 +2838,15 @@ public:
             if (vae_tiling_params.enabled) {
                 // split latent in 64x64 tiles and compute in several steps
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
-                    tae_first_stage->compute(n_threads, in, true, &out);
+                    return tae_first_stage->compute(n_threads, in, true, &out);
                 };
                 sd_tiling(x, result, vae_scale_factor, 64, 0.5f, on_tiling);
             } else {
-                tae_first_stage->compute(n_threads, x, true, &result);
+                if (!tae_first_stage->compute(n_threads, x, true, &result)) {
+                    LOG_ERROR("Failed to decode latetnts");
+                    tae_first_stage->free_compute_buffer();
+                    return nullptr;
+                }
             }
             tae_first_stage->free_compute_buffer();
         }
@@ -2907,6 +2934,8 @@ const char* sample_method_to_str[] = {
     "lcm",
     "ddim_trailing",
     "tcd",
+    "res_multistep",
+    "res_2s",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {
@@ -2936,6 +2965,7 @@ const char* scheduler_to_str[] = {
     "smoothstep",
     "kl_optimal",
     "lcm",
+    "bong_tangent",
 };
 
 const char* sd_scheduler_name(enum scheduler_t scheduler) {
@@ -3101,6 +3131,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "keep_clip_on_cpu: %s\n"
              "keep_control_net_on_cpu: %s\n"
              "keep_vae_on_cpu: %s\n"
+             "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
              "circular_x: %s\n"
              "circular_y: %s\n"
@@ -3132,6 +3163,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->keep_clip_on_cpu),
              BOOL_STR(sd_ctx_params->keep_control_net_on_cpu),
              BOOL_STR(sd_ctx_params->keep_vae_on_cpu),
+             BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
              BOOL_STR(sd_ctx_params->circular_x),
              BOOL_STR(sd_ctx_params->circular_y),
@@ -3604,6 +3636,7 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         ggml_free(work_ctx);
         return nullptr;
     }
+    memset(result_images, 0, batch_count * sizeof(sd_image_t));
 
     for (size_t i = 0; i < decoded_images.size(); i++) {
         result_images[i].width   = width;

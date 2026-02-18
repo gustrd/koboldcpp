@@ -168,6 +168,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
@@ -249,6 +250,8 @@ struct common_params_model {
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
 };
 
+struct common_ngram_mod;
+
 struct common_params_speculative {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE; // type of speculative decoding
 
@@ -263,8 +266,9 @@ struct common_params_speculative {
 
     uint16_t ngram_size_n     = 12; // ngram size for lookup
     uint16_t ngram_size_m     = 48; // mgram size for speculative tokens
-    uint16_t ngram_check_rate =  1; // check rate for ngram lookup
     uint16_t ngram_min_hits   =  1; // minimum hits at ngram/mgram lookup for mgram to be proposed
+
+    std::shared_ptr<common_ngram_mod> ngram_mod;
 
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding           // NOLINT
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
@@ -663,7 +667,7 @@ static std::vector<T> string_split(const std::string & str, char delim) {
 }
 
 template<>
-std::vector<std::string> string_split<std::string>(const std::string & input, char separator)
+inline std::vector<std::string> string_split<std::string>(const std::string & input, char separator)
 {
     std::vector<std::string> parts;
     size_t begin_pos = 0;
@@ -678,7 +682,7 @@ std::vector<std::string> string_split<std::string>(const std::string & input, ch
     return parts;
 }
 
-static bool string_starts_with(const std::string & str,
+inline bool string_starts_with(const std::string & str,
                                const std::string & prefix) {  // While we wait for C++20's std::string::starts_with...
     return str.rfind(prefix, 0) == 0;
 }
@@ -773,16 +777,6 @@ void common_batch_add(
                                bool   logits);
 
 //
-// Token utils
-//
-
-// longest common prefix
-size_t common_lcp(const llama_tokens & a, const llama_tokens & b);
-
-// longet common subsequence
-size_t common_lcs(const llama_tokens & a, const llama_tokens & b);
-
-//
 // Vocab utils
 //
 
@@ -873,11 +867,11 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate)_(ch|)exps";
 
-static std::string llm_ffn_exps_block_regex(int idx) {
+inline std::string llm_ffn_exps_block_regex(int idx) {
     return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
 }
 
-static llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
 

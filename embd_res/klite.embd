@@ -12,7 +12,7 @@ Current version indicated by LITEVER below.
 -->
 <head>
 	<script id="init-config">
-	const LITEVER = 310;
+	const LITEVER = 313;
 	const urlParams = new URLSearchParams(window.location.search);
 	var localflag = urlParams.get('local'); //this will be replaced automatically in embedded kcpp
 	const STORAGE_PREFIX = (localflag?"e_":"")+"kaihordewebui_";
@@ -1357,7 +1357,7 @@ Current version indicated by LITEVER below.
 		padding-top: 4px;
 		margin-left: 4px;
 		margin-bottom: 2px;
-		/* disabled because it's a lot of hassle with light colorschemes */'
+		/* disabled because it's a lot of hassle with light colorschemes */
 		/* text-shadow: 1px 1px 1px var(--theme_color_bg_muted); */
 	}
 	.unstarted_block
@@ -1384,7 +1384,7 @@ Current version indicated by LITEVER below.
 		padding-right: 6px;
 	}
 	#actionmenuitems button.slim,#actionmenuitems2 button.slim {
-		width: 38px;
+		width: 34px;
 		padding-left: 4px;
 		padding-right: 4px;
 	}
@@ -2255,7 +2255,7 @@ Current version indicated by LITEVER below.
 		display: inline-block;
 		padding: 0 0 0 10px;
 		vertical-align: top;
-		max-width: 92%;
+		max-width: 75%;
 	}
 
 	.chat_received_withd_msg p {
@@ -2267,7 +2267,7 @@ Current version indicated by LITEVER below.
 	}
 
 	.chat_received_withd_msg {
-		width: 75%;
+		width: 100%;
 		background: var(--theme_color_ai_msg_bg) none repeat scroll 0 0;
 		border-radius: 0 15px 15px 15px;
 		color: var(--theme_color_ai_msg_fg);
@@ -4240,7 +4240,7 @@ Current version indicated by LITEVER below.
 	var uses_cors_proxy = false; //we start off attempting a direct connection. switch to proxy if that fails
 	var synchro_polled_response = null;
 	var synchro_polled_respimg = null; //sometimes a LLM response can also include an image.
-	var synchro_polled_resptoolcall = null; //set if a tool call was triggered
+	var synchro_polled_resptoolcalls = null; //set if a tool call was triggered
 	var last_stop_reason = ""; //update stop reason if known
 	var synchro_pending_stream = ""; //used for storing incomplete streaming text
 	var streaming_was_thinking = false; //used as a switch to determine when thinking ends, to wrap output in tags
@@ -4457,8 +4457,9 @@ Current version indicated by LITEVER below.
 		darkmode: true,
 		colortheme: 0, // 0=newtheme, 1=oldtheme, 2=fruity, 3=black
 		render_streaming_markdown: true,
+		show_nametags: true,
 		enable_tool_use: false,
-		tools_auto_exec: true,
+		tools_auto_exec: false,
 		corsproxy_mcp: false,
 		kcpp_mcp_bridge: true,
 		cached_mcp_tools: {}, //key is url, value is tools array
@@ -4485,6 +4486,7 @@ Current version indicated by LITEVER below.
 		start_thinking_tag: "<think>",
 		stop_thinking_tag: "</think>",
 		hide_think_stream: false,
+		handle_mismatched_think: true,
 		think_injected: 0, //0=normal, 1=force
 		strip_thinking_mode: 1, //0=no stripping, 1=strip except recent, 2=strip all
 		websearch_enabled: false,
@@ -6925,7 +6927,7 @@ Current version indicated by LITEVER below.
 			}else if (custom_gemini_key != "" && data.candidates != null && data.candidates.length>0 && data.candidates[0].content && data.candidates[0].content.parts != null && data.candidates[0].content.parts.length>0) {
 				synchro_polled_response = "";
 				synchro_polled_respimg = null;
-				synchro_polled_resptoolcall = null;
+				synchro_polled_resptoolcalls = null;
 				for(let x=0;x<data.candidates[0].content.parts.length;++x)
 				{
 					if(!synchro_polled_respimg && data.candidates[0].content.parts[x].inlineData && data.candidates[0].content.parts[x].inlineData.data)
@@ -6976,7 +6978,7 @@ Current version indicated by LITEVER below.
 		.then((data) => {
 			console.log("sync finished response: " + JSON.stringify(data));
 			last_response_obj = JSON.parse(JSON.stringify(data));
-			if (custom_oai_key != "" && data.choices != null && data.choices.length > 0) {
+			if ((custom_oai_key != "" || determine_if_mcp_active()) && data.choices != null && data.choices.length > 0) {
 				let dch = data.choices[0];
 				if (dch.text) {
 					synchro_polled_response = dch.text;
@@ -7001,6 +7003,15 @@ Current version indicated by LITEVER below.
 						else
 						{
 							synchro_polled_response = `${localsettings.start_thinking_tag}${reasoningtxt}${localsettings.stop_thinking_tag}${dch.message.content}`;
+						}
+					}
+
+					if(dch.message.tool_calls && dch.message.tool_calls.length>0)
+					{
+						synchro_polled_resptoolcalls = dch.message.tool_calls;
+						if(!synchro_polled_response)
+						{
+							synchro_polled_response = "";
 						}
 					}
 
@@ -7042,7 +7053,8 @@ Current version indicated by LITEVER below.
 		synchro_pending_stream = "";
 		streaming_was_thinking = false;
 		let logprobs_content_arr = [];
-		let pending_toolcall_obj = null;
+		let pending_toolcall_objs = [];
+		let pending_toolcall_last_obj = null;
 		let reqOpt =
 		{method: 'POST',
 		headers: submit_headers,
@@ -7170,6 +7182,14 @@ Current version indicated by LITEVER below.
 									else if(streaming_was_thinking)
 									{
 										streaming_was_thinking = false;
+										//if there is some final reasoning, add it
+										if(event.data.choices[0].delta.reasoning_content!=null&& event.data.choices[0].delta.reasoning_content!="")
+										{
+											synchro_pending_stream += event.data.choices[0].delta.reasoning_content;
+										}else if(event.data.choices[0].delta.reasoning!=null&& event.data.choices[0].delta.reasoning!="")
+										{
+											synchro_pending_stream += event.data.choices[0].delta.reasoning;
+										}
 										synchro_pending_stream = `${localsettings.start_thinking_tag}${synchro_pending_stream}${localsettings.stop_thinking_tag}`;
 									}
 									synchro_pending_stream += cnt;
@@ -7187,37 +7207,39 @@ Current version indicated by LITEVER below.
 								else if(event.data.choices[0].delta && !event.data.choices[0].delta.content && event.data.choices[0].delta.tool_calls && event.data.choices[0].delta.tool_calls.length>0)
 								{
 									//handle tool calls
-									if(pending_toolcall_obj==null)
+									if(pending_toolcall_last_obj==null)
 									{
-										pending_toolcall_obj = {};
+										pending_toolcall_last_obj = {};
 									}
-									let itm = event.data.choices[0].delta.tool_calls[0];
-									if(itm.id)
+
+									for(let x=0;x<event.data.choices[0].delta.tool_calls.length;++x)
 									{
-										pending_toolcall_obj.id = itm.id;
-									}
-									if(itm.function)
-									{
-										if(itm.function.name)
-										{
-											if(!pending_toolcall_obj.name)
-											{
-												pending_toolcall_obj.name = itm.function.name;
-											}
-											else if(pending_toolcall_obj.name!=itm.function.name)
-											{
-												pending_toolcall_obj.name += itm.function.name;
-											}
+										let itm = event.data.choices[0].delta.tool_calls[x];
+
+										//if the incoming tool chunk has a different id, it's the next tool. stash current tool and proceed
+										if ((pending_toolcall_last_obj.id && itm.id && pending_toolcall_last_obj.id != itm.id)) {
+											pending_toolcall_objs.push(pending_toolcall_last_obj);
+											pending_toolcall_last_obj = {};
 										}
-										if(itm.function.arguments)
-										{
-											if(!pending_toolcall_obj.arguments)
-											{
-												pending_toolcall_obj.arguments = itm.function.arguments;
+										if (itm.id) {
+											pending_toolcall_last_obj.id = itm.id;
+										}
+										if (itm.function) {
+											if (itm.function.name) {
+												if (!pending_toolcall_last_obj.name) {
+													pending_toolcall_last_obj.name = itm.function.name;
+												}
+												else if (pending_toolcall_last_obj.name != itm.function.name) {
+													pending_toolcall_last_obj.name += itm.function.name;
+												}
 											}
-											else
-											{
-												pending_toolcall_obj.arguments += itm.function.arguments;
+											if (itm.function.arguments) {
+												if (!pending_toolcall_last_obj.arguments) {
+													pending_toolcall_last_obj.arguments = itm.function.arguments;
+												}
+												else {
+													pending_toolcall_last_obj.arguments += itm.function.arguments;
+												}
 											}
 										}
 									}
@@ -7296,10 +7318,31 @@ Current version indicated by LITEVER below.
 					{
 						synchro_polled_response = cleanup_story_completion(synchro_polled_response);
 					}
-					if(synchro_polled_response=="" && last_stop_reason=="tool_calls" && pending_toolcall_obj!=null)
+					//cleanup incomplete tool
+					if(pending_toolcall_last_obj && pending_toolcall_last_obj.id)
+					{
+						pending_toolcall_objs.push(pending_toolcall_last_obj);
+						pending_toolcall_last_obj = null;
+					}
+					if(synchro_polled_response=="" && last_stop_reason=="tool_calls" && pending_toolcall_objs!=null && pending_toolcall_objs.length>0)
 					{
 						//a tool call was triggered instead
-						synchro_polled_resptoolcall = pending_toolcall_obj;
+						synchro_polled_resptoolcalls = [];
+						for(let i=0;i<pending_toolcall_objs.length;++i)
+						{
+							let item = pending_toolcall_objs[i];
+							let tool =
+							{
+								"id": item.id,
+								"type": "function",
+								"function": {
+									"name": item.name,
+									"arguments": item.arguments
+								}
+							};
+							synchro_polled_resptoolcalls.push(tool);
+
+						}
 					}
 					synchro_pending_stream = "";
 					streaming_was_thinking = false;
@@ -7448,6 +7491,7 @@ Current version indicated by LITEVER below.
 			return `<pre>${cpybtn}<code>${code}</code></pre>`;
 		};
 		const convertMarkdownTableToHtml = (t) => {
+			t = t.trim();
 			let hsep = /^[\s]*\|(?:[\s]*[-:]+[-:|\s]*)+\|[\s]*$/gm;
 			let l = /^[\s]*\|(.*)\|[\s]*$/gm;
 			let r = t.split(/\r?\n|\r/);
@@ -7672,7 +7716,7 @@ Current version indicated by LITEVER below.
 			.replace(/~~(\w.*?)~~/gm, "<del>$1</del>")
 			.replace(/\^\^(\w.*?)\^\^/gm, "<ins>$1</ins>")
 			.replace(/\{\{(\w.*?)\}\}/gm, "<mark>$1</mark>")
-			.replace(/^((?:(?:\|[^|\r\n]+)*\|[^|\r\n]*[^\s|\r\n][^|\r\n]*(?:\|[^|\r\n]+)*\| {0,2}(?:\r?\n|\r|$))+)/gm,
+			.replace(/^((?: {0,3}(?:\|[^|\r\n]+)*\|[^|\r\n]*[^\s|\r\n][^|\r\n]*(?:\|[^|\r\n]+)*\| {0,2}(?:\r?\n|\r|$))+)/gm,
 				(matchedTable) => convertMarkdownTableToHtml(matchedTable))
 			.replace(/&lt;sub&gt;(.+?)&lt;\/sub&gt;/g, "<sub>$1</sub>")
 			.replace(/&lt;sup&gt;(.+?)&lt;\/sup&gt;/g, "<sup>$1</sup>");
@@ -8194,17 +8238,33 @@ Current version indicated by LITEVER below.
 			}).then(function (response) {
 				if(response.content && response.content.length>0)
 				{
-					let tgt = replaceStringsInObject(response.content[0],"&quot;","\""); //we must remove existing escaped quotes or things break later
-					callresp.content = JSON.stringify(tgt);
+					let outitems = [];
+					for(let i=0;i<response.content.length;++i)
+					{
+						let tgt = replaceStringsInObject(response.content[i], "&quot;", "\""); //we must remove existing escaped quotes or things break later
+						outitems.push(tgt);
+					}
+					callresp.content = JSON.stringify(outitems);
 				}
-				callresptxt += JSON.stringify(callresp) + get_instructendplaceholder();
+				callresptxt += JSON.stringify(callresp);
+				if(toolcall_obj.tool_calls.length < 2)
+				{
+					callresptxt += get_instructendplaceholder();
+				}
 				gametext_arr.push(callresptxt);
 				console.log(response);
-				pending_response_id = "";
-				poll_in_progress = false;
-				show_abort_button(false);
-				submit_generation(""); //generate final response or new toolcall
-				render_gametext(false,false);
+				if(toolcall_obj.tool_calls.length > 1)
+				{
+					MCPToolCall({"tool_calls":toolcall_obj.tool_calls.slice(1)});
+				}
+				else
+				{
+					pending_response_id = "";
+					poll_in_progress = false;
+					show_abort_button(false);
+					submit_generation(""); //generate final response or new toolcall
+					render_gametext(false,false);
+				}
 			}).catch(function (error) {
 				// Handle errors
 				callresp.content = "{\"error\": \"Tool call failed\"}";
@@ -9317,6 +9377,11 @@ Current version indicated by LITEVER below.
 	function determine_if_can_use_mcp()
 	{
 		return (custom_oai_key!="" && document.getElementById("useoaichatcompl").checked) || is_using_kcpp_with_streaming();
+	}
+
+	function determine_if_mcp_active()
+	{
+		return (localsettings.enable_tool_use && determine_if_can_use_mcp() && localsettings.cached_mcp_tools && Object.keys(localsettings.cached_mcp_tools).length>0);
 	}
 
 	//returns true if the current multimodal setup for some media can be used, otherwise false.
@@ -12857,6 +12922,43 @@ Current version indicated by LITEVER below.
 		return (epchoice==7 || epchoice==10 || epchoice==11);
 	}
 
+	function find_oai_model()
+	{
+		inputBox("Find model by name (case insensitive)\nBest match will be selected.","Find model by name","","", ()=>{
+			let coai = getInputBoxValue().trim();
+			let dropdown = get_custom_ep_model_dropdown();
+			var mdlopt = dropdown.querySelector('option.custom_model_option');
+			if(coai!="")
+			{
+				coai = coai.toLowerCase();
+				let findparts = coai.split(" ").filter(x => (x && x != ""));
+				//first search for all matches
+				let foundidx = -1;
+				let bestmatches = 0;
+				for (var i = 0; i < dropdown.options.length; i++)
+				{
+					let matchcount = 0;
+					for(let x=0;x<findparts.length;++x)
+					{
+						let part = findparts[x];
+						if (dropdown.options[i].text.toLowerCase().indexOf(part) !== -1) {
+							++matchcount;
+						}
+					}
+					if (matchcount > bestmatches)
+					{
+						foundidx = i;
+						bestmatches = matchcount;
+					}
+				}
+				if(foundidx>=0)
+				{
+					dropdown.selectedIndex = foundidx;
+				}
+			}
+			oai_model_change(ep_should_always_use_chat_completions());
+		},false);
+	}
 	function select_custom_oai_model()
 	{
 		inputBox("Enter custom model name","Custom Model Name",localsettings.saved_oai_custommodel,"", ()=>{
@@ -13135,9 +13237,6 @@ Current version indicated by LITEVER below.
 
 	function toggleclaudemodel()
 	{
-		document.getElementById("claudesystemprompt").classList.remove("hidden");
-		document.getElementById("claudejailbreakprompt").classList.remove("hidden");
-
 		if(document.getElementById("custom_claude_model").value.toLowerCase().includes("claude-3-7")||
 		document.getElementById("custom_claude_model").value.toLowerCase().includes("claude-sonnet-4")||
 		document.getElementById("custom_claude_model").value.toLowerCase().includes("claude-haiku-4")||
@@ -15308,6 +15407,7 @@ Current version indicated by LITEVER below.
 		document.getElementById("allow_continue_user_turn").checked = localsettings.allow_continue_user_turn;
 		document.getElementById("proxy_disable_stream").checked = localsettings.proxy_disable_stream;
 		document.getElementById("render_streaming_markdown").checked = localsettings.render_streaming_markdown;
+		document.getElementById("show_nametags").checked = localsettings.show_nametags;
 		document.getElementById("min_p").value = localsettings.min_p;
 		document.getElementById("dynatemp_range").value = localsettings.dynatemp_range;
 		document.getElementById("dynatemp_exponent").value = localsettings.dynatemp_exponent;
@@ -15635,32 +15735,32 @@ Current version indicated by LITEVER below.
 			document.getElementById("tfs_s").value = found.tfs;
 			document.getElementById("min_p").value = found.min_p;
 			document.getElementById("presence_penalty").value = found.presence_penalty;
-			document.getElementById("sampler_seed").value = found.sampler_seed ? found.sampler_seed : defaultsettings.sampler_seed;
+			document.getElementById("sampler_seed").value = found.sampler_seed == null? defaultsettings.sampler_seed : found.sampler_seed;
 			document.getElementById("rep_pen_range").value = found.rep_pen_range;
 			document.getElementById("rep_pen_slope").value = found.rep_pen_slope;
 			document.getElementById("smoothing_factor").value = found.smoothing_factor;
 			document.getElementById("smoothing_curve").value = found.smoothing_curve;
 			document.getElementById("sampler_order").value = found.sampler_order.toString();
 			document.getElementById("nsigma").value = found.nsigma;
-			document.getElementById("dry_multiplier").value = found.dry_multiplier ? found.dry_multiplier : defaultsettings.dry_multiplier;
-			document.getElementById("dry_base").value = found.dry_base ? found.dry_base : defaultsettings.dry_base;
-			document.getElementById("dry_allowed_length").value = found.dry_allowed_length ? found.dry_allowed_length : defaultsettings.dry_allowed_length;
-			document.getElementById("dry_penalty_last_n").value = found.dry_penalty_last_n ? found.dry_penalty_last_n : defaultsettings.dry_penalty_last_n;
+			document.getElementById("dry_multiplier").value = found.dry_multiplier == null? defaultsettings.dry_multiplier : found.dry_multiplier;
+			document.getElementById("dry_base").value = found.dry_base == null? defaultsettings.dry_base : found.dry_base;
+			document.getElementById("dry_allowed_length").value = found.dry_allowed_length == null? defaultsettings.dry_allowed_length : found.dry_allowed_length;
+			document.getElementById("dry_penalty_last_n").value = found.dry_penalty_last_n == null? defaultsettings.dry_penalty_last_n : found.dry_penalty_last_n;
 			pendingsequencebreakers = found.dry_sequence_breakers || defaultsettings.dry_sequence_breakers;
-			document.getElementById("xtc_threshold").value = found.xtc_threshold ? found.xtc_threshold : defaultsettings.xtc_threshold;
-			document.getElementById("xtc_probability").value = found.xtc_probability ? found.xtc_probability : defaultsettings.xtc_probability;
-			document.getElementById("adaptivep_target").value = found.adaptivep_target ? found.adaptivep_target : defaultsettings.adaptivep_target;
-			document.getElementById("adaptivep_decay").value = found.adaptivep_decay ? found.adaptivep_decay : defaultsettings.adaptivep_decay;
-			document.getElementById("miro_type").value = found.miro_type ? found.miro_type : defaultsettings.miro_type;
-			document.getElementById("miro_tau").value = found.miro_tau ? found.miro_tau : defaultsettings.miro_tau;
-			document.getElementById("miro_eta").value = found.miro_eta ? found.miro_eta : defaultsettings.miro_eta;
-			pendinggrammar = found.grammar ? found.grammar : defaultsettings.grammar;
+			document.getElementById("xtc_threshold").value = found.xtc_threshold == null ? defaultsettings.xtc_threshold : found.xtc_threshold;
+			document.getElementById("xtc_probability").value = found.xtc_probability == null? defaultsettings.xtc_probability : found.xtc_probability;
+			document.getElementById("adaptivep_target").value = found.adaptivep_target == null? defaultsettings.adaptivep_target : found.adaptivep_target;
+			document.getElementById("adaptivep_decay").value = found.adaptivep_decay == null? defaultsettings.adaptivep_decay : found.adaptivep_decay;
+			document.getElementById("miro_type").value = found.miro_type == null? defaultsettings.miro_type : found.miro_type;
+			document.getElementById("miro_tau").value = found.miro_tau == null? defaultsettings.miro_tau : found.miro_tau;
+			document.getElementById("miro_eta").value = found.miro_eta == null? defaultsettings.miro_eta : found.miro_eta;
+			pendinggrammar = found.grammar == null? defaultsettings.grammar : found.grammar;
 			document.getElementById("dynatemp_range").value = found.dynatemp_range;
 			document.getElementById("dynatemp_exponent").value = found.dynatemp_exponent;
 			document.getElementById("dynatemp_overview").innerText = (document.getElementById("dynatemp_range").value!=0?"ON":"OFF");
-			document.getElementById("second_ep_qty").value = found.second_ep_qty || defaultsettings.second_ep_qty;
-			document.getElementById("second_ep_model").value = found.second_ep_model || defaultsettings.second_ep_model;
-			document.getElementById("second_ep_url").value = found.second_ep_url || defaultsettings.second_ep_url;
+			document.getElementById("second_ep_qty").value = found.second_ep_qty == null? defaultsettings.second_ep_qty : found.second_ep_qty;
+			document.getElementById("second_ep_model").value = found.second_ep_model == null? defaultsettings.second_ep_model : found.second_ep_model;
+			document.getElementById("second_ep_url").value = found.second_ep_url == null? defaultsettings.second_ep_url : found.second_ep_url;
 			document.getElementById("second_ep_overview").innerText = (document.getElementById("second_ep_qty").value>0 && document.getElementById("second_ep_url").value!=""?"ON":"OFF");
 		} else {
 			document.getElementById("presetsdesc").innerText = "";
@@ -16176,6 +16276,7 @@ Current version indicated by LITEVER below.
 		localsettings.allow_continue_user_turn = (document.getElementById("allow_continue_user_turn").checked ? true : false);
 		localsettings.proxy_disable_stream = (document.getElementById("proxy_disable_stream").checked ? true : false);
 		localsettings.render_streaming_markdown = (document.getElementById("render_streaming_markdown").checked ? true : false);
+		localsettings.show_nametags = (document.getElementById("show_nametags").checked ? true : false);
 		if(document.getElementById("opmode").value==1)
 		{
 			localsettings.gui_type_story = document.getElementById("gui_type").value;
@@ -16325,6 +16426,7 @@ Current version indicated by LITEVER below.
 			localsettings.stop_thinking_tag = defaultsettings.stop_thinking_tag;
 		}
 		localsettings.hide_think_stream = (document.getElementById("hide_think_stream").checked?true:false);
+		localsettings.handle_mismatched_think = (document.getElementById("handle_mismatched_think").checked?true:false);
 
 		localsettings.tts_mode = document.getElementById("ttsselect").value;
 		localsettings.xtts_voice = document.getElementById("xtts_voices").value;
@@ -17296,7 +17398,7 @@ Current version indicated by LITEVER below.
 		poll_in_progress = false;
 		synchro_polled_response = null;
 		synchro_polled_respimg = null;
-		synchro_polled_resptoolcall = null;
+		synchro_polled_resptoolcalls = null;
 		last_stop_reason = "";
 		synchro_pending_stream = "";
 		streaming_was_thinking = false;
@@ -17328,7 +17430,7 @@ Current version indicated by LITEVER below.
 		pending_response_id = "";
 		synchro_polled_response = null;
 		synchro_polled_respimg = null;
-		synchro_polled_resptoolcall = null;
+		synchro_polled_resptoolcalls = null;
 		last_stop_reason = "";
 		synchro_pending_stream = "";
 		streaming_was_thinking = false;
@@ -17518,6 +17620,18 @@ Current version indicated by LITEVER below.
 						}
 					});
 					inputtxt = inputtxt.replace(pat, "%ExpandBtn%");
+				}
+				else
+				{
+					if(localsettings.handle_mismatched_think && !inputtxt.includes(localsettings.start_thinking_tag) && inputtxt.includes(localsettings.stop_thinking_tag))
+					{
+						let chunks = inputtxt.split(localsettings.stop_thinking_tag);
+						if(chunks.length==2) //exactly 2 parts
+						{
+							matches.push(chunks[0]);
+							inputtxt = `%ExpandBtn%${chunks[1]}`;
+						}
+					}
 				}
 			}
 			else //just hide
@@ -20266,7 +20380,7 @@ Current version indicated by LITEVER below.
 			poll_in_progress = false;
 			synchro_polled_response = null;
 			synchro_polled_respimg = null;
-			synchro_polled_resptoolcall = null;
+			synchro_polled_resptoolcalls = null;
 			last_stop_reason = "";
 			synchro_pending_stream = "";
 			streaming_was_thinking = false;
@@ -20285,7 +20399,7 @@ Current version indicated by LITEVER below.
 				last_response_streamlog = "";
 
 				if(localsettings.opmode==4 &&
-				(is_using_kcpp_with_jinja() || (localsettings.enable_tool_use && determine_if_can_use_mcp() && localsettings.cached_mcp_tools && Object.keys(localsettings.cached_mcp_tools).length>0)))
+				(is_using_kcpp_with_jinja() || determine_if_mcp_active()))
 				{
 					//for tool calling, we hijack the oai endpoint in order to utilize
 					let combinedprompt = submit_payload.prompt;
@@ -20323,7 +20437,7 @@ Current version indicated by LITEVER below.
 						}
 						submit_payload.messages.push(cturn);
 					}
-					if(localsettings.enable_tool_use && determine_if_can_use_mcp() && localsettings.cached_mcp_tools && Object.keys(localsettings.cached_mcp_tools).length>0)
+					if(determine_if_mcp_active())
 					{
 						let senttools = MCPGetAllowedTools();
 						if(senttools.length>0)
@@ -20386,7 +20500,7 @@ Current version indicated by LITEVER below.
 						oai_payload.logprobs = 5;
 					}
 				}
-				if(!targetep.toLowerCase().includes("api.x.ai"))
+				if(!targetep.toLowerCase().includes("api.x.ai") && !targetep.toLowerCase().includes("api.perplexity.ai"))
 				{
 					//grok has no support for stop
 					oai_payload.stop = get_stop_sequences().slice(0, 4); //lets try adding stop sequences, limit to first 4
@@ -20514,7 +20628,7 @@ Current version indicated by LITEVER below.
 						}
 					}
 
-					if(localsettings.enable_tool_use && determine_if_can_use_mcp() && localsettings.cached_mcp_tools && Object.keys(localsettings.cached_mcp_tools).length>0)
+					if(determine_if_mcp_active())
 					{
 						let senttools = MCPGetAllowedTools();
 						if(senttools.length>0)
@@ -20649,6 +20763,7 @@ Current version indicated by LITEVER below.
 
 				let sysprompt = document.getElementById("claudesystemprompt").value;
 				let assistantprompt = document.getElementById("claudejailbreakprompt").value;
+				let assistantpromptrole = document.getElementById("claudejailbreakpromptrole").value;
 				let claudethinking = (document.getElementById("claudethinking").checked?true:false);
 
 				claude_payload =
@@ -20712,7 +20827,8 @@ Current version indicated by LITEVER below.
 				}
 				if(assistantprompt)
 				{
-					claude_payload.messages.push({"role": "assistant", "content": assistantprompt});
+					let usedrole = (assistantpromptrole==2)?"system":(assistantpromptrole==1?"assistant":"user");
+					claude_payload.messages.push({"role": usedrole, "content": assistantprompt});
 				}
 
 
@@ -21074,12 +21190,7 @@ Current version indicated by LITEVER below.
 						//something went wrong.
 						clear_poll_flags();
 						render_gametext();
-						if (data.message != "") {
-							msgbox(data.message);
-						}
-						else {
-							msgbox("Unspecified error while submitting prompt");
-						}
+						msgbox("Error Submitting Prompt: " + JSON.stringify(data));
 					}
 				})
 				.catch((error) => {
@@ -23369,19 +23480,10 @@ Current version indicated by LITEVER below.
 						render_gametext(true,false); //only scroll to bottom if autoscroll is on
 						sync_multiplayer(false);
 					}
-					if(synchro_polled_resptoolcall && localsettings.cached_mcp_tools)
+					if(synchro_polled_resptoolcalls && synchro_polled_resptoolcalls.length>0 && localsettings.cached_mcp_tools)
 					{
 						//if valid, execute the tool call and get the result
-						let savedcallobj = {"tool_calls": [
-							{
-							"id": synchro_polled_resptoolcall.id,
-							"type": "function",
-							"function": {
-								"name": synchro_polled_resptoolcall.name,
-								"arguments": synchro_polled_resptoolcall.arguments
-							}
-							}
-						]};
+						let savedcallobj = {"tool_calls": synchro_polled_resptoolcalls};
 
 						let calltxt = "";
 						if(!(gametext_arr.length>0 && gametext_arr[gametext_arr.length-1].trim().endsWith("{{[OUTPUT]}}")))
@@ -23396,7 +23498,7 @@ Current version indicated by LITEVER below.
 							MCPToolCall(savedcallobj);
 						}
 
-						synchro_polled_resptoolcall = null;
+						synchro_polled_resptoolcalls = null;
 						render_gametext(false,false);
 					}
 					if(synchro_polled_respimg)
@@ -24027,6 +24129,7 @@ Current version indicated by LITEVER below.
 	var suppressScrollEvent = false;
 	var autoscrollTimeout = null;
 	let autoscrollRAF = null;
+	var lastScrollTop = 0;
 	function handle_autoscroll(alwaysscroll = true) {
 		if (!localsettings.autoscroll) return;
 
@@ -24043,8 +24146,7 @@ Current version indicated by LITEVER below.
 			if (!boxes.length) return;
 
 			// ---- READ PHASE (no writes) ----
-			const threshold = autoscrollEnabled ? 210 : 75;
-
+			const threshold = autoscrollEnabled ? 195 : 70;
 			const scrollData = boxes.map(el => {
 				const maxScrollTop = el.scrollHeight - el.clientHeight + 10;
 				const isAtBottom =
@@ -24066,14 +24168,18 @@ Current version indicated by LITEVER below.
 	function attach_scroll_detection(element)
 	{
 		element.addEventListener("scroll", () => {
+			const currentScrollTop = element.scrollTop;
+        	const delta = currentScrollTop - lastScrollTop;
+        	lastScrollTop = currentScrollTop;
 			if (suppressScrollEvent) { return; }
+			if (delta>=0) { return; }
 			autoscrollEnabled = false;
 			if (autoscrollTimeout) {
 				clearTimeout(autoscrollTimeout);
 			}
 			autoscrollTimeout = setTimeout(() => {
 				autoscrollEnabled = true;
-			}, 100);
+			}, 180);
 		});
 	}
 
@@ -24123,286 +24229,6 @@ Current version indicated by LITEVER below.
 			document.getElementById("inputrow").classList.remove("show_mode");
 		}
 		populate_corpo_leftpanel_topper();
-
-		if (gametext_arr.length == 0 && synchro_pending_stream=="" && pending_response_id=="") {
-
-			if (perfdata == null) {
-				if(document.getElementById("connectstatus").innerHTML == "Offline Mode")
-				{
-					document.getElementById("gametext").innerHTML = "Welcome to <span class=\"color_kobotext\">KoboldAI Lite</span>!<br>You are in <span class=\"color_red\">Offline Mode</span>.<br>You will still be able to load and edit stories, but not generate new text."
-				}else{
-					document.getElementById("gametext").innerHTML = "Welcome to <span class=\"color_kobotext\">KoboldAI Lite</span>!<br><span class=\"color_orange\">Attempting to Connect...</span>"
-				}
-			} else {
-				let whorun = "";
-
-				if (custom_kobold_endpoint != "") {
-					whorun = "<br>You're using the custom KoboldAI endpoint at <span class=\"color_orange\">"+custom_kobold_endpoint+"</span>";
-				}
-				else if(custom_oai_key!="")
-				{
-					whorun = "<br>You're using the OpenAI API";
-				}
-				else if(custom_claude_key!="")
-				{
-					whorun = "<br>You're using the Claude API";
-				}
-				else if(custom_gemini_key!="")
-				{
-					whorun = "<br>You're using the Gemini API";
-				}
-				else if(custom_cohere_key!="")
-				{
-					whorun = "<br>You're using the Cohere API";
-				}
-				else {
-					whorun = `<br>Horde <a class="color_blueurl mainnav" href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" onclick="get_and_show_workers()">Volunteer(s)</a> are running <span class="color_orange">${selected_models.reduce((s, a) => s + a.count, 0)} threads</span> for selected models with a total queue length of <span class="color_orange">${selected_models.reduce((s, a) => s + a.queued, 0)}</span> tokens`;
-				}
-				let nowmode = (localsettings.opmode==1?"Story Mode":(localsettings.opmode==2?"Adventure Mode":(localsettings.opmode==3?"Chat Mode":"Instruct Mode")));
-				let selmodelstr = "";
-				const maxmodelnames = 7;
-				if(selected_models.length>maxmodelnames)
-				{
-					let shortenedarr = selected_models.slice(0, maxmodelnames-1);
-					selmodelstr = shortenedarr.reduce((s, a) => s + (s == "" ? "" : ", ") + a.name, "") + " and " + (selected_models.length-(maxmodelnames-1)) + " others";
-				}else{
-					selmodelstr = selected_models.reduce((s, a) => s + (s == "" ? "" : ", ") + a.name, "");
-				}
-
-				document.getElementById("gametext").innerHTML = `Welcome to <span class="color_kobotext">KoboldAI Lite</span>!`+
-				`<br>You are using the models <span class="color_lightgreen">${selmodelstr}</span>${(selected_workers.length == 0 ? `` : ` (Pinned to ${selected_workers.length} worker IDs)`)}.`+
-				`${whorun}.`+
-				(multiplayer_active?(!multiplayer_pinged?`<br><br><span class="color_orange">[ Trying to join Multiplayer... ]</span>`:`<br><br><span class="color_green">[ Multiplayer is <b>Active</b>! This session is shared with other server participants.]<br>[ You can leave via exit button in top right corner. ]</span>`):(is_using_kcpp_with_multiplayer()?`<br><br>[ <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="join_multiplayer()"><span class="color_lightgreen">Multiplayer Available</span> - Click Here To Join</a> ]`:``))+
-				`<br><br><span class="color_orange bolded">${nowmode} Selected</span> - Enter a prompt below to begin!`+
-				`<br>Or, <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="document.getElementById('loadfileinput').click()">load a <b>JSON File</b> or a <b>Character Card</b> here.</a>`+
-				`<br>Or, <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="display_scenarios()">select a <b>Quick Start Scenario</b> here.</a>`+
-				`<br>${(welcome!=""?`<br><em>${escape_html(welcome)}</em>`:``)}`;
-			}
-
-			//kick out of edit mode
-			if (document.getElementById("allowediting").checked) {
-				document.getElementById("allowediting").checked = inEditMode = false;
-				toggle_editable();
-			}
-
-		}
-		else {
-
-			let fulltxt = "";
-			if (inEditMode) {
-				fulltxt = concat_gametext(false, "", "%SpnStg%", "%SpnEtg%",true);
-			} else {
-				fulltxt = concat_gametext(false, "", "", "",true);
-				fulltxt = apply_display_only_regex(fulltxt);
-				fulltxt = replace_placeholders(fulltxt,true);
-			}
-
-			let alreadyShowedStreaming = false; //sometimes, streaming is injected inline to preserve indentation
-
-			if(localsettings.opmode==4 && !inEditMode)
-			{
-				//accept all newline formats for backwards compatibility
-				fulltxt = replaceAll(fulltxt, "\n\n"+get_instruct_starttag(true)+"\n\n", `%SpcStg%`);
-				fulltxt = replaceAll(fulltxt, "\n\n"+get_instruct_endtag(true)+"\n\n", `%SpcEtg%`);
-				fulltxt = replaceAll(fulltxt, "\n"+get_instruct_starttag(true)+"\n", `%SpcStg%`);
-				fulltxt = replaceAll(fulltxt, "\n"+get_instruct_endtag(true)+"\n", `%SpcEtg%`);
-				fulltxt = replaceAll(fulltxt, get_instruct_starttag(false), `%SpcStg%`);
-				fulltxt = replaceAll(fulltxt, get_instruct_endtag(false), `%SpcEtg%`);
-				fulltxt = replaceAll(fulltxt, get_instruct_starttag(true), `%SpcStg%`);
-				fulltxt = replaceAll(fulltxt, get_instruct_endtag(true), `%SpcEtg%`);
-				if (localsettings.separate_end_tags) {
-					if (get_instruct_endtag_end(true)) {
-						fulltxt = replaceAll(fulltxt, get_instruct_endtag_end(false), ``);
-						fulltxt = replaceAll(fulltxt, get_instruct_endtag_end(true), ``);
-					}
-					if (get_instruct_starttag_end(true)) {
-						fulltxt = replaceAll(fulltxt, get_instruct_starttag_end(false), ``);
-						fulltxt = replaceAll(fulltxt, get_instruct_starttag_end(true), ``);
-					}
-				}
-
-				let instruct_turns = repack_instruct_turns(fulltxt, `%SpcStg%`,`%SpcEtg%`, true);
-				repact_instruct_turns_beautify_render(instruct_turns);
-				fulltxt = "";
-				for(let i=0;i<instruct_turns.length;++i)
-				{
-					let curr = instruct_turns[i];
-					let currmsg = curr.msg;
-
-					//in some special cases, add streaming text inline
-					let allow_cont_prev_turn = (localsettings.opmode==4 || (localsettings.opmode==3 && localsettings.allow_continue_chat));
-					if(i>0 && (i==instruct_turns.length-1) && curr.myturn==false && currmsg && allow_cont_prev_turn)
-					{
-						let codeblockcount = (currmsg.match(/```/g) || []).length; //only allow continue if not in codeblock
-						if(codeblockcount==0 || codeblockcount%2==0)
-						{
-							//inject into previous turn, only for instruct OR continuechat
-							let pend = escape_html(pending_context_preinjection) + format_streaming_text(escape_html(synchro_pending_stream));
-							if(pend)
-							{
-								currmsg += `<span class="color_pendingtext pending_text">${pend}</span>`;
-								alreadyShowedStreaming = true;
-							}
-						}
-					}
-
-					//apply stylization to time tags
-					if(localsettings.inject_timestamps && localsettings.instruct_has_markdown)
-					{
-						currmsg = currmsg.replace(/(\[\d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2} [AP]M\])/g, "$1\n");
-					}
-					if(localsettings.inject_chatnames_instruct && localsettings.instruct_has_markdown)
-					{
-						let m_name = localsettings.chatname + ": ";
-						currmsg = replaceAll(currmsg, m_name, `<b>` + escape_html(m_name) + `</b>`);
-						let m_opps = localsettings.chatopponent.split("||$||");
-						for(let i=0;i<m_opps.length;++i)
-						{
-							if(m_opps[i] && m_opps[i].trim()!="")
-							{
-								let m_opp = m_opps[i] + ": ";
-								currmsg = replaceAll(currmsg, m_opp, `<b>` + escape_html(m_opp) + `</b>`);
-							}
-						}
-					}
-
-					if(localsettings.instruct_has_markdown && (localsettings.render_streaming_markdown||synchro_pending_stream==""||(i+1)<instruct_turns.length))
-					{
-						//if a list has a starttag on the same line, add a newline before it
-						currmsg = currmsg.replace(/(\n[-*] .+?)(%SpcStg%)/g, "$1\n$2");
-						let codeblockcount = (currmsg.match(/```/g) || []).length;
-						if(codeblockcount>0 && codeblockcount%2!=0 )
-						{
-							currmsg += "```"; //force end code block
-						}
-						currmsg = simpleMarkdown(currmsg,localsettings.instruct_has_latex);
-					}
-
-					if(curr.myturn)
-					{
-						fulltxt += `<hr style="margin-top: 12px; margin-bottom: 12px;"><span class="color_kobotext"><span class="humansquare" onclick="classic_click_turn(this,${i})"></span>${currmsg}</span>`;
-					}
-					else
-					{
-						if (i == 0) {
-							fulltxt += `${currmsg}`;
-						} else {
-							fulltxt += `<hr style="margin-top: 12px; margin-bottom: 12px;"><span><span class="nikosquare" onclick="classic_click_turn(this,${i})"></span>${currmsg}</span>`;
-						}
-					}
-				}
-
-			} else {
-				fulltxt = replaceAll(fulltxt, get_instruct_starttag(true), `%SclStg%`+escape_html(get_instruct_starttag(true))+`%SpnEtg%`);
-				fulltxt = replaceAll(fulltxt, get_instruct_endtag(true), `%SclStg%`+escape_html(get_instruct_endtag(true))+`%SpnEtg%`);
-				if (localsettings.separate_end_tags) {
-					if (get_instruct_starttag_end(true) != "") {
-						fulltxt = replaceAll(fulltxt, get_instruct_starttag_end(true), `%SclStg%` + escape_html(get_instruct_starttag_end(true)) + `%SpnEtg%`);
-					}
-					if (get_instruct_endtag_end(true) != "") {
-						fulltxt = replaceAll(fulltxt, get_instruct_endtag_end(true), `%SclStg%` + escape_html(get_instruct_endtag_end(true)) + `%SpnEtg%`);
-					}
-				}
-				//failsafe to handle removing newline tags
-				fulltxt = replaceAll(fulltxt, instructstartplaceholder.trim(), `%SclStg%`+instructstartplaceholder.trim()+`%SpnEtg%`);
-				fulltxt = replaceAll(fulltxt, instructendplaceholder.trim(), `%SclStg%`+instructendplaceholder.trim()+`%SpnEtg%`);
-				fulltxt = replaceAll(fulltxt, instructstartplaceholder_end.trim(), `%SclStg%`+instructstartplaceholder_end.trim()+`%SpnEtg%`);
-				fulltxt = replaceAll(fulltxt, instructendplaceholder_end.trim(), `%SclStg%`+instructendplaceholder_end.trim()+`%SpnEtg%`);
-
-				if(get_instruct_systag(true)!="")
-				{
-					fulltxt = replaceAll(fulltxt, get_instruct_systag(true), `%SclStg%`+escape_html(get_instruct_systag(true))+`%SpnEtg%`);
-					if(get_instruct_systag_end(true)!="")
-					{
-						fulltxt = replaceAll(fulltxt, get_instruct_systag_end(true), `%SclStg%`+escape_html(get_instruct_systag_end(true))+`%SpnEtg%`);
-					}
-				}
-				fulltxt = replaceAll(fulltxt, instructsysplaceholder.trim(), `%SclStg%`+instructsysplaceholder.trim()+`%SpnEtg%`);
-				fulltxt = replaceAll(fulltxt, instructsysplaceholder_end.trim(), `%SclStg%`+instructsysplaceholder_end.trim()+`%SpnEtg%`);
-			}
-
-			//this is a hacky fix to handle instruct tags that use arrow brackets only
-			fulltxt = replaceAll(fulltxt, `%SpnStg%`, `<span class="txtchunk">`);
-			fulltxt = replaceAll(fulltxt, `%SclStg%`,`<span class="color_muted">`);
-			fulltxt = replaceAll(fulltxt, `%SpnEtg%`, `</span>`);
-
-			if(localsettings.opmode==3)
-			{
-				if(!document.getElementById("allowediting").checked && !fulltxt.startsWith("\n"))
-				{
-					fulltxt = "\n" + fulltxt;
-				}
-
-				//for chat mode, highlight our name in blue and opponent in red
-				let m_name = "\n" + localsettings.chatname + ": ";
-
-				//match anything that is NOT us, ie. opponents
-				var regex = new RegExp("\n(?!" + localsettings.chatname + ").+?\: ", "gi");
-				let colormap = {}, colidx = 0;
-				fulltxt = fulltxt.replace(regex, function (m) {
-					let oname = escape_html(m);
-					let onametrim = oname.trim();
-					if(colormap[onametrim]==null)
-					{
-						colormap[onametrim] = get_unique_color(colidx);
-						++colidx;
-					}
-					return `<span class="`+colormap[onametrim]+`">` + oname + `</span>`;
-				});
-				fulltxt = replaceAll(fulltxt,m_name, `<span class="color_blue">` + escape_html(m_name) + `</span>`);
-			}
-
-			//for adventure mode, highlight our actions in the theme's text highlight color
-			if (localsettings.opmode == 2) {
-				fulltxt = fulltxt.replace(/\n\n\> .+?\n/g, function (m) {
-					return `<span class="color_adventure_action">` + m + `</span>`;
-				});
-			}
-
-			//streaming display for all other cases
-			if(!alreadyShowedStreaming && synchro_pending_stream!="" && waiting_for_summarycall==0)
-			{
-				let pend = escape_html(pending_context_preinjection) + format_streaming_text(escape_html(synchro_pending_stream));
-				fulltxt += `<span class="color_pendingtext pending_text">${pend}</span>`;
-			}
-
-			if(!inEditMode)
-			{
-				let floatimg = (localsettings.opmode!=4);
-
-				//handle images
-				fulltxt = render_all_media_html(fulltxt,floatimg,false);
-			}
-			else
-			{
-				fulltxt = stash_image_placeholders(fulltxt,true);
-			}
-
-
-			fulltxt = fulltxt.replace(/(\r\n|\r|\n)/g, '<br>');
-
-			//if ends with a single <br> and nothing else, trim it
-			if (fulltxt.endsWith("<br>") && !fulltxt.endsWith("<br><br>")) {
-				fulltxt = fulltxt.slice(0, -4);
-			}
-
-			//console.log("FT:" + fulltxt);
-			if(fulltxt == "" && gametext_arr.length == 0 && synchro_pending_stream=="" && pending_response_id!="")
-			{
-				fulltxt = "Generating...";
-			}
-			if(inEditMode)
-			{
-				//fix to prevent layout thrashing due to forced reflow in chrome when deleting text, break into multiple spans with nothing else in between
-				let multigroups = splitIntoGroups(fulltxt, 150);
-				for(let i=0;i<multigroups.length;++i)
-				{
-					multigroups[i] = "<span>"+multigroups[i]+"</span>";
-				}
-				fulltxt = multigroups.join('');
-			}
-			document.getElementById("gametext").innerHTML = fulltxt;
-		}
 
 		if(localflag && is_using_kcpp_with_admin())
 		{
@@ -24528,7 +24354,7 @@ Current version indicated by LITEVER below.
 		}
 
 		// Render onto enhanced chat interface if selected.
-		let isAestheticUiStyle = is_aesthetic_ui();
+		let isAestheticUiStyle = is_aesthetic_ui(); //coverts both aesthetic and messenger
 		let isCorpoUiStyle = is_corpo_ui();
 
 		document.getElementById("corpo_welcome").classList.add("hidden");
@@ -24557,12 +24383,10 @@ Current version indicated by LITEVER below.
 			let textToRender = "";
 			let prepToGen = (gametext_arr.length == 0 && synchro_pending_stream == "" && pending_response_id != "");
 			if (gametext_arr.length == 0 && (prepToGen || pending_response_id == "")) {
-				let intro = document.getElementById("gametext").innerHTML;
+				let intro = render_regular_welcome();
 				document.getElementById("chat_msg_body").innerHTML = `<span class='unstarted_block'>${intro}</span>`;
 			} else {
 				textToRender = concat_gametext(false, "", "", "", true);
-				textToRender = apply_display_only_regex(textToRender);
-				textToRender = replace_placeholders(textToRender,true);
 				if((localsettings.opmode==3 && localsettings.gui_type_chat==1) ||
 				(localsettings.opmode==4 && localsettings.gui_type_instruct==1))
 				{
@@ -24621,10 +24445,11 @@ Current version indicated by LITEVER below.
 			document.getElementById("enhancedchatinterface").classList.remove("hidden");
 			document.getElementById("normalinterface").classList.add("hidden");
 			document.getElementById("corpointerface").classList.add("hidden");
-		} else {
+		} else { //classic ui
 			document.getElementById("enhancedchatinterface").classList.add("hidden");
 			document.getElementById("corpointerface").classList.add("hidden");
 			document.getElementById("normalinterface").classList.remove("hidden");
+			document.getElementById("gametext").innerHTML = render_classic_ui(inEditMode);
 		}
 
 		if (inEditMode && isCorpoUiStyle) {
@@ -24785,6 +24610,272 @@ Current version indicated by LITEVER below.
 		}
 	}
 
+	function render_classic_ui(inEditMode) //classic ui is also used for all edit modes
+	{
+		if (gametext_arr.length == 0 && synchro_pending_stream=="" && pending_response_id=="")
+		{
+			let fulltxt = render_regular_welcome();
+			return fulltxt;
+		}
+		else
+		{
+			let alreadyShowedStreaming = false; //sometimes, streaming is injected inline to preserve indentation
+			let fulltxt = "";
+
+			if (inEditMode) //edit mode only
+			{
+				fulltxt = concat_gametext(false, "", "%SpnStg%", "%SpnEtg%",true);
+				fulltxt = replaceAll(fulltxt, get_instruct_starttag(true), `%SclStg%`+escape_html(get_instruct_starttag(true))+`%SpnEtg%`);
+				fulltxt = replaceAll(fulltxt, get_instruct_endtag(true), `%SclStg%`+escape_html(get_instruct_endtag(true))+`%SpnEtg%`);
+				if (localsettings.separate_end_tags) {
+					if (get_instruct_starttag_end(true) != "") {
+						fulltxt = replaceAll(fulltxt, get_instruct_starttag_end(true), `%SclStg%` + escape_html(get_instruct_starttag_end(true)) + `%SpnEtg%`);
+					}
+					if (get_instruct_endtag_end(true) != "") {
+						fulltxt = replaceAll(fulltxt, get_instruct_endtag_end(true), `%SclStg%` + escape_html(get_instruct_endtag_end(true)) + `%SpnEtg%`);
+					}
+				}
+				//failsafe to handle removing newline tags
+				fulltxt = replaceAll(fulltxt, instructstartplaceholder.trim(), `%SclStg%`+instructstartplaceholder.trim()+`%SpnEtg%`);
+				fulltxt = replaceAll(fulltxt, instructendplaceholder.trim(), `%SclStg%`+instructendplaceholder.trim()+`%SpnEtg%`);
+				fulltxt = replaceAll(fulltxt, instructstartplaceholder_end.trim(), `%SclStg%`+instructstartplaceholder_end.trim()+`%SpnEtg%`);
+				fulltxt = replaceAll(fulltxt, instructendplaceholder_end.trim(), `%SclStg%`+instructendplaceholder_end.trim()+`%SpnEtg%`);
+
+				if(get_instruct_systag(true)!="")
+				{
+					fulltxt = replaceAll(fulltxt, get_instruct_systag(true), `%SclStg%`+escape_html(get_instruct_systag(true))+`%SpnEtg%`);
+					if(get_instruct_systag_end(true)!="")
+					{
+						fulltxt = replaceAll(fulltxt, get_instruct_systag_end(true), `%SclStg%`+escape_html(get_instruct_systag_end(true))+`%SpnEtg%`);
+					}
+				}
+				fulltxt = replaceAll(fulltxt, instructsysplaceholder.trim(), `%SclStg%`+instructsysplaceholder.trim()+`%SpnEtg%`);
+				fulltxt = replaceAll(fulltxt, instructsysplaceholder_end.trim(), `%SclStg%`+instructsysplaceholder_end.trim()+`%SpnEtg%`);
+
+				//this is a hacky fix to handle instruct tags that use arrow brackets only
+				fulltxt = replaceAll(fulltxt, `%SpnStg%`, `<span class="txtchunk">`);
+				fulltxt = replaceAll(fulltxt, `%SclStg%`,`<span class="color_muted">`);
+				fulltxt = replaceAll(fulltxt, `%SpnEtg%`, `</span>`);
+			}
+			else //non edit mode
+			{
+				if(localsettings.opmode==4) //instruct mode only, non edit
+				{
+					fulltxt = concat_gametext(false, "", "", "",true);
+
+					//accept all newline formats for backwards compatibility
+					fulltxt = replaceAll(fulltxt, "\n\n"+get_instruct_starttag(false)+"\n\n", get_instruct_starttag(false));
+					fulltxt = replaceAll(fulltxt, "\n\n"+get_instruct_endtag(false)+"\n\n", get_instruct_endtag(false));
+					fulltxt = replaceAll(fulltxt, "\n"+get_instruct_starttag(false)+"\n", get_instruct_starttag(false));
+					fulltxt = replaceAll(fulltxt, "\n"+get_instruct_endtag(false)+"\n", get_instruct_endtag(false));
+
+					let chatunits = [];
+					fulltxt = replace_instruct_placeholders(fulltxt);
+					chatunits = repack_instruct_history(fulltxt, true);
+					repact_instruct_turns_beautify_render(chatunits);
+
+					fulltxt = "";
+					let countmap = new Map();
+					for(let i=0;i<chatunits.length;++i)
+					{
+						let curr = chatunits[i];
+
+						//in some special cases, add streaming text inline
+						let allow_cont_prev_turn = (localsettings.opmode==4 || (localsettings.opmode==3 && localsettings.allow_continue_chat));
+						if(i>0 && (i==chatunits.length-1) && curr.myturn==false && curr.msg && allow_cont_prev_turn)
+						{
+							let codeblockcount = (curr.msg.match(/```/g) || []).length; //only allow continue if not in codeblock
+							if(codeblockcount==0 || codeblockcount%2==0)
+							{
+								//inject into previous turn, only for instruct OR continuechat
+								let pend = escape_html(pending_context_preinjection) + format_streaming_text(escape_html(synchro_pending_stream));
+								if(pend)
+								{
+									curr.msg += `<span class="color_pendingtext pending_text">${pend}</span>`;
+									alreadyShowedStreaming = true;
+								}
+							}
+						}
+
+						if(curr.msg && curr.msg!="")
+						{
+							curr = repack_postprocess_turn(curr, countmap, false); //change whole object
+						}
+						let currmsg = curr.msg;
+
+						let namepart = (curr.name?`<span style="font-weight: bolder;">${escape_html(curr.name)} </span><br>`:"");
+						if(localsettings.inject_chatnames_instruct && localsettings.show_nametags)
+						{
+							currmsg = namepart + currmsg;
+						}
+
+						if(curr.myturn)
+						{
+							fulltxt += `<hr style="margin-top: 12px; margin-bottom: 12px;"><span class="color_kobotext"><span class="humansquare" onclick="classic_click_turn(this,${i})"></span>${currmsg}</span>`;
+						}
+						else
+						{
+							if (i == 0) {
+								fulltxt += `${currmsg}`;
+							} else {
+								fulltxt += `<hr style="margin-top: 12px; margin-bottom: 12px;"><span><span class="nikosquare" onclick="classic_click_turn(this,${i})"></span>${currmsg}</span>`;
+							}
+						}
+					}
+
+				}
+				else //all other modes besides instruct, non-edit
+				{
+					fulltxt = concat_gametext(false, "", "", "",true);
+					fulltxt = apply_display_only_regex(fulltxt);
+					fulltxt = replace_placeholders(fulltxt,true);
+
+					if(localsettings.opmode==3)
+					{
+						if(!inEditMode && !fulltxt.startsWith("\n"))
+						{
+							fulltxt = "\n" + fulltxt;
+						}
+
+						//for chat mode, highlight our name in blue and opponent in red
+						let m_name = "\n" + localsettings.chatname + ": ";
+
+						//match anything that is NOT us, ie. opponents
+						var regex = new RegExp("\n(?!" + localsettings.chatname + ").+?\: ", "gi");
+						let colormap = {}, colidx = 0;
+						fulltxt = fulltxt.replace(regex, function (m) {
+							let oname = escape_html(m);
+							let onametrim = oname.trim();
+							if(colormap[onametrim]==null)
+							{
+								colormap[onametrim] = get_unique_color(colidx);
+								++colidx;
+							}
+							return `<span class="`+colormap[onametrim]+`">` + oname + `</span>`;
+						});
+						fulltxt = replaceAll(fulltxt,m_name, `<span class="color_blue">` + escape_html(m_name) + `</span>`);
+					}
+
+					//for adventure mode, highlight our actions in the theme's text highlight color
+					if (localsettings.opmode == 2) {
+						fulltxt = fulltxt.replace(/\n\n\> .+?\n/g, function (m) {
+							return `<span class="color_adventure_action">` + m + `</span>`;
+						});
+					}
+				}
+			}
+
+			//streaming display for all other cases
+			if(!alreadyShowedStreaming && synchro_pending_stream!="" && waiting_for_summarycall==0)
+			{
+				let pend = escape_html(pending_context_preinjection) + format_streaming_text(escape_html(synchro_pending_stream));
+				fulltxt += `<span class="color_pendingtext pending_text">${pend}</span>`;
+			}
+
+			if(!inEditMode)
+			{
+				let floatimg = (localsettings.opmode!=4);
+
+				//handle images
+				fulltxt = render_all_media_html(fulltxt,floatimg,false);
+			}
+			else
+			{
+				fulltxt = stash_image_placeholders(fulltxt,true);
+			}
+
+
+			fulltxt = fulltxt.replace(/(\r\n|\r|\n)/g, '<br>');
+
+			//if ends with a single <br> and nothing else, trim it
+			if (fulltxt.endsWith("<br>") && !fulltxt.endsWith("<br><br>")) {
+				fulltxt = fulltxt.slice(0, -4);
+			}
+
+			//console.log("FT:" + fulltxt);
+			if(fulltxt == "" && gametext_arr.length == 0 && synchro_pending_stream=="" && pending_response_id!="")
+			{
+				fulltxt = "Generating...";
+			}
+			if(inEditMode)
+			{
+				//fix to prevent layout thrashing due to forced reflow in chrome when deleting text, break into multiple spans with nothing else in between
+				let multigroups = splitIntoGroups(fulltxt, 150);
+				for(let i=0;i<multigroups.length;++i)
+				{
+					multigroups[i] = "<span>"+multigroups[i]+"</span>";
+				}
+				fulltxt = multigroups.join('');
+			}
+			return fulltxt;
+		}
+
+	}
+
+	function render_regular_welcome()
+	{
+		let outputhtml = "";
+		if (perfdata == null) {
+			if(document.getElementById("connectstatus").innerHTML == "Offline Mode")
+			{
+				outputhtml = "Welcome to <span class=\"color_kobotext\">KoboldAI Lite</span>!<br>You are in <span class=\"color_red\">Offline Mode</span>.<br>You will still be able to load and edit stories, but not generate new text."
+			}else{
+				outputhtml = "Welcome to <span class=\"color_kobotext\">KoboldAI Lite</span>!<br><span class=\"color_orange\">Attempting to Connect...</span>"
+			}
+		} else {
+			let whorun = "";
+
+			if (custom_kobold_endpoint != "") {
+				whorun = "<br>You're using the custom KoboldAI endpoint at <span class=\"color_orange\">"+custom_kobold_endpoint+"</span>";
+			}
+			else if(custom_oai_key!="")
+			{
+				whorun = "<br>You're using the OpenAI API";
+			}
+			else if(custom_claude_key!="")
+			{
+				whorun = "<br>You're using the Claude API";
+			}
+			else if(custom_gemini_key!="")
+			{
+				whorun = "<br>You're using the Gemini API";
+			}
+			else if(custom_cohere_key!="")
+			{
+				whorun = "<br>You're using the Cohere API";
+			}
+			else {
+				whorun = `<br>Horde <a class="color_blueurl mainnav" href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" onclick="get_and_show_workers()">Volunteer(s)</a> are running <span class="color_orange">${selected_models.reduce((s, a) => s + a.count, 0)} threads</span> for selected models with a total queue length of <span class="color_orange">${selected_models.reduce((s, a) => s + a.queued, 0)}</span> tokens`;
+			}
+			let nowmode = (localsettings.opmode==1?"Story Mode":(localsettings.opmode==2?"Adventure Mode":(localsettings.opmode==3?"Chat Mode":"Instruct Mode")));
+			let selmodelstr = "";
+			const maxmodelnames = 7;
+			if(selected_models.length>maxmodelnames)
+			{
+				let shortenedarr = selected_models.slice(0, maxmodelnames-1);
+				selmodelstr = shortenedarr.reduce((s, a) => s + (s == "" ? "" : ", ") + a.name, "") + " and " + (selected_models.length-(maxmodelnames-1)) + " others";
+			}else{
+				selmodelstr = selected_models.reduce((s, a) => s + (s == "" ? "" : ", ") + a.name, "");
+			}
+
+			outputhtml = `Welcome to <span class="color_kobotext">KoboldAI Lite</span>!`+
+			`<br>You are using the models <span class="color_lightgreen">${selmodelstr}</span>${(selected_workers.length == 0 ? `` : ` (Pinned to ${selected_workers.length} worker IDs)`)}.`+
+			`${whorun}.`+
+			(multiplayer_active?(!multiplayer_pinged?`<br><br><span class="color_orange">[ Trying to join Multiplayer... ]</span>`:`<br><br><span class="color_green">[ Multiplayer is <b>Active</b>! This session is shared with other server participants.]<br>[ You can leave via exit button in top right corner. ]</span>`):(is_using_kcpp_with_multiplayer()?`<br><br>[ <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="join_multiplayer()"><span class="color_lightgreen">Multiplayer Available</span> - Click Here To Join</a> ]`:``))+
+			`<br><br><span class="color_orange bolded">${nowmode} Selected</span> - Enter a prompt below to begin!`+
+			`<br>Or, <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="document.getElementById('loadfileinput').click()">load a <b>JSON File</b> or a <b>Character Card</b> here.</a>`+
+			`<br>Or, <a href="#" tabindex="${mainmenu_is_untab?`-1`:`0`}" class="color_blueurl mainnav" onclick="display_scenarios()">select a <b>Quick Start Scenario</b> here.</a>`+
+			`<br>${(welcome!=""?`<br><em>${escape_html(welcome)}</em>`:``)}`;
+		}
+
+		//kick out of edit mode
+		if (document.getElementById("allowediting").checked) {
+			document.getElementById("allowediting").checked = inEditMode = false;
+			toggle_editable();
+		}
+		return outputhtml;
+	}
+
 	function render_corpo_welcome()
 	{
 		return `
@@ -24935,7 +25026,7 @@ Current version indicated by LITEVER below.
 		}
 	}
 
-	function repack_postprocess_turn(currchatunit, countmap)
+	function repack_postprocess_turn(currchatunit, countmap, centerimages)
 	{
 		let processed_msg = currchatunit.msg;
 		processed_msg = apply_display_only_regex(processed_msg);
@@ -24953,7 +25044,7 @@ Current version indicated by LITEVER below.
 			}
 
 			//convert the msg into images
-			processed_msg = render_all_media_html(processed_msg,false,true);
+			processed_msg = render_all_media_html(processed_msg,false,centerimages);
 		}
 
 		let namepart = (currchatunit.myturn ? "User" : cosmetic_corpo_ai_nick);
@@ -25420,11 +25511,11 @@ Current version indicated by LITEVER below.
 			let curr = chatunits[i];
 			if(corpo_editing_turn != i)
 			{
-				curr = repack_postprocess_turn(curr, countmap); //change whole object
+				curr = repack_postprocess_turn(curr, countmap, true); //change whole object
 			}
 			else
 			{
-				let reshaped = repack_postprocess_turn(JSON.parse(JSON.stringify(curr)), countmap);
+				let reshaped = repack_postprocess_turn(JSON.parse(JSON.stringify(curr)), countmap, true);
 				curr.name = reshaped.name; //only change name
 			}
 
@@ -25462,9 +25553,10 @@ Current version indicated by LITEVER below.
 				newbodystr += `<div style="width:100%">`;
 			}
 			else {
+				let nametag = (localsettings.show_nametags?`<div class="corpostyleitemheading">${curr.name}</div>`:``);
 				newbodystr += `<div><img ${(curr.myturn ? "" : `onclick="corpo_click_avatar()"`)} src="${(curr.myturn ? human_square : niko_square)}" class="corpoavatar"/></div>
 				<div style="width:100%">
-				<div class="corpostyleitemheading">`+ curr.name + `</div>`;
+				${nametag}`;
 			}
 
 			newbodystr += bodypart + chunkbtns + `</div></div>`;
@@ -25482,14 +25574,15 @@ Current version indicated by LITEVER below.
 			if (localsettings.opmode == 1) {
 				newbodystr += `
 				<div>
-				<div class="corpostyleitemcontent"><p><span class="pending_text">`+ futuretext + `</span></p></div>
+				<div class="corpostyleitemcontent"><p><span class="pending_text">${futuretext}</span></p></div>
 				</div>`;
 			}
 			else {
-				newbodystr += `<div><img src="` + niko_square + `" class="corpoavatar"/></div>
+				let nametag = (localsettings.show_nametags?`<div class="corpostyleitemheading">${namepart}</div>`:``);
+				newbodystr += `<div><img src="${niko_square}" class="corpoavatar"/></div>
 				<div>
-				<div class="corpostyleitemheading">`+ namepart +`</div>
-				<div class="corpostyleitemcontent"><p><span class="pending_text">`+ futuretext +`</span></p></div>
+				${nametag}
+				<div class="corpostyleitemcontent"><p><span class="pending_text">${futuretext}</span></p></div>
 				</div>`;
 			}
 			newbodystr += `</div>`;
@@ -25729,15 +25822,7 @@ Current version indicated by LITEVER below.
 			let curr = chatunits[i];
 			if(curr.msg && curr.msg!="")
 			{
-				if(localsettings.opmode==4)
-				{
-					curr = repack_postprocess_turn(curr, countmap); //change whole object
-				}
-				else
-				{
-					curr.msg = curr.msg.replace(bold_regex,"<b style='opacity:0.7'>$1</b>");
-					curr.msg = curr.msg.replace(italics_regex,"<em style='opacity:0.7'>$1</em>");
-				}
+				curr = repack_postprocess_turn(curr, countmap, true); //change whole object
 				//convert the msg into images
 				curr.msg = render_all_media_html(curr.msg,false,true);
 			}
@@ -25745,6 +25830,10 @@ Current version indicated by LITEVER below.
 			if(curr.myturn)
 			{
 				let namepart = (curr.name?`<span style="font-weight: bolder;color:var(--theme_color_user_name);">${escape_html(curr.name)}</span><br>`:"");
+				if(!localsettings.show_nametags)
+				{
+					namepart = "";
+				}
 				newbodystr += `<div class="chat_outgoing_msg"><div class="chat_sent_msg"><p>`+namepart+curr.msg+`</p></div></div>`;
 			}else{
 				let oname = (curr.name?escape_html(curr.name):"");
@@ -25755,6 +25844,10 @@ Current version indicated by LITEVER below.
 					++colidx;
 				}
 				let namepart = (curr.name?`<span class='${colormap[onametrim]}' style="font-weight: bolder;">${oname}</span><br>`:"");
+				if(!localsettings.show_nametags)
+				{
+					namepart = "";
+				}
 				newbodystr += `<div class="incoming_msg"><div class="chat_received_msg"><div class="chat_received_withd_msg"><p>`+namepart+curr.msg+`</p></div></div></div>`;
 			}
 
@@ -26082,6 +26175,7 @@ Current version indicated by LITEVER below.
 		document.getElementById("start_thinking_tag").value = localsettings.start_thinking_tag;
 		document.getElementById("stop_thinking_tag").value = localsettings.stop_thinking_tag;
 		document.getElementById("hide_think_stream").checked = (localsettings.hide_think_stream?true:false);
+		document.getElementById("handle_mismatched_think").checked = (localsettings.handle_mismatched_think?true:false);
 	}
 
 	function populate_placeholder_tags()
@@ -26968,7 +27062,6 @@ Current version indicated by LITEVER below.
 			this.portrait_width_you = 80;
 			this.portrait_ratio_you = 1.0;
 
-			this.show_chat_names = true;
 			this.rounded_bubbles = true;
 			this.match_background = false;
 
@@ -27139,7 +27232,6 @@ Current version indicated by LITEVER below.
 
 		aestheticInstructUISettings.match_background = document.getElementById('aui_match_background').checked;
 		aestheticInstructUISettings.rounded_bubbles = document.getElementById('aui_rounded_bubbles').checked;
-		aestheticInstructUISettings.show_chat_names = document.getElementById('aui_show_chat_names').checked;
 		aestheticInstructUISettings.font_size = document.getElementById('instruct-font-size').value;
 		aestheticInstructUISettings.border_style = document.getElementById('instructBorderStyle').value;
 		aestheticInstructUISettings.portrait_width_AI = document.getElementById('portrait_width_AI').value;
@@ -27191,7 +27283,6 @@ Current version indicated by LITEVER below.
 		// Apply the settings from the json file to the UI.
 		document.getElementById('aui_match_background').checked = aestheticInstructUISettings.match_background;
 		document.getElementById('aui_rounded_bubbles').checked = aestheticInstructUISettings.rounded_bubbles;
-		document.getElementById('aui_show_chat_names').checked = aestheticInstructUISettings.show_chat_names;
 		document.getElementById('instruct-font-size').value = aestheticInstructUISettings.font_size;
 		document.getElementById('instructBorderStyle').value = aestheticInstructUISettings.border_style;
 		document.getElementById('portrait_width_AI').value = aestheticInstructUISettings.portrait_width_AI;
@@ -27423,7 +27514,7 @@ Current version indicated by LITEVER below.
 				return temphtmlstash[p];
 			});
 
-			curr = repack_postprocess_turn(curr, countmap);
+			curr = repack_postprocess_turn(curr, countmap, true);
 			if(curr.add_stream_msg)
 			{
 				curr.msg += curr.add_stream_msg; //add it last so it doesnt mess up the pending_text tags
@@ -27434,7 +27525,7 @@ Current version indicated by LITEVER below.
 				continue; //if turn is empty skip it
 			}
 
-			let namepart = (curr.name!="" && as.show_chat_names?`<p class='aui_nametag'>${escape_html(curr.name)}</p>`:"");
+			let namepart = (curr.name!="" && localsettings.show_nametags?`<p class='aui_nametag'>${escape_html(curr.name)}</p>`:"");
 			let showavatar = true;
 
 			//adventure and story has no names or avatars, also handle unlabelled first turns for chat/instruct
@@ -28976,6 +29067,11 @@ Current version indicated by LITEVER below.
 								<input type="checkbox" title="Enable LaTeX (Needs Markdown)" id="instruct_has_latex" class="push-right">
 						</div>
 						<div class="settinglabel">
+							<div class="justifyleft">Show Nametags <span class="helpicon">?<span
+								class="helptext">Controls if user and AI nametags are shown or hidden. Recommended.</span></span></div>
+							<input title="Show Nametags" type="checkbox" id="show_nametags" class="push-right">
+						</div>
+						<div class="settinglabel">
 							<div class="justifyleft">Autoscroll <span class="helpicon">?<span
 								class="helptext">Automatically scrolls the text window down when new text is generated</span></span></div>
 							<input title="Autoscroll Text" type="checkbox" id="autoscroll" class="push-right">
@@ -29089,71 +29185,70 @@ Current version indicated by LITEVER below.
 						</div>
 						</div>
 						<div id="presetsdesc" class="settingsdesctxt justifyright"></div>
-					</div>
 
-					<div class="settingsbox flex wide">
+						<div class="settingsbox flex wide">
+							<div class="settingitem">
+								<div class="settinglabel">
+									<div class="justifyleft">Temperature <span class="helpicon">?<span
+												class="helptext">Randomness of sampling. High values can increase creativity but
+												may make text less sensible. Lower values will make text more predictable but
+												can become repetitious.</span></span></div>
+									<input title="Temperature" inputmode="decimal" class="justifyright push-right" id="temperature" value=0.5
+										oninput="document.getElementById('temperature_slide').value = this.value;">
+								</div>
+								<div><input title="Temperature Slider" type="range" min="0.1" max="2" step="0.01"
+										id="temperature_slide" oninput="
+									document.getElementById('temperature').value = this.value;"></div>
+								<div class="settingminmax">
+									<div class="justifyleft">0.1</div>
+									<div class="justifyright">2</div>
+								</div>
+							</div>
 
-						<div class="settingitem">
-							<div class="settinglabel">
-								<div class="justifyleft">Temperature <span class="helpicon">?<span
-											class="helptext">Randomness of sampling. High values can increase creativity but
-											may make text less sensible. Lower values will make text more predictable but
-											can become repetitious.</span></span></div>
-								<input title="Temperature" inputmode="decimal" class="justifyright push-right" id="temperature" value=0.5
-									oninput="document.getElementById('temperature_slide').value = this.value;">
+							<div class="settingitem">
+								<div class="settinglabel">
+									<div class="justifyleft">Repeat Penalty <span class="helpicon">?<span
+												class="helptext">Used to penalize words that were already generated or belong to
+												the context (too high causes incoherence!).</span></span></div>
+									<input title="Repetition Penalty" inputmode="decimal" class="justifyright push-right" id="rep_pen" oninput="
+									document.getElementById('rep_pen_slide').value = this.value;">
+								</div>
+								<div><input title="Repetition Penalty Slider" type="range" min="1" max="2" step="0.01"
+										id="rep_pen_slide" oninput="document.getElementById('rep_pen').value = this.value;"></div>
+								<div class="settingminmax">
+									<div class="justifyleft">1</div>
+									<div class="justifyright">2</div>
+								</div>
 							</div>
-							<div><input title="Temperature Slider" type="range" min="0.1" max="2" step="0.01"
-									id="temperature_slide" oninput="
-								document.getElementById('temperature').value = this.value;"></div>
-							<div class="settingminmax">
-								<div class="justifyleft">0.1</div>
-								<div class="justifyright">2</div>
-							</div>
-						</div>
 
-						<div class="settingitem">
-							<div class="settinglabel">
-								<div class="justifyleft">Repeat Penalty <span class="helpicon">?<span
-											class="helptext">Used to penalize words that were already generated or belong to
-											the context (too high causes incoherence!).</span></span></div>
-								<input title="Repetition Penalty" inputmode="decimal" class="justifyright push-right" id="rep_pen" oninput="
-								document.getElementById('rep_pen_slide').value = this.value;">
+							<div class="settingitem">
+								<div class="settinglabel">
+									<div class="justifyleft">Top-P Sampling <span class="helpicon">?<span class="helptext">Used
+												to discard unlikely text in a nucleus sampling process. Lower values will make text
+												more predictable but can become repetitious. Set to 1 to deactivate it.</span></span></div>
+									<input title="Top-P Sampling" inputmode="decimal" class="justifyright push-right" id="top_p" oninput="
+									document.getElementById('top_p_slide').value = this.value;">
+								</div>
+								<div><input title="Top-P Sampling Slider" type="range" min="0" max="1" step="0.01" id="top_p_slide"
+										oninput="document.getElementById('top_p').value = this.value;"></div>
+								<div class="settingminmax">
+									<div class="justifyleft">0</div>
+									<div class="justifyright">1</div>
+								</div>
 							</div>
-							<div><input title="Repetition Penalty Slider" type="range" min="1" max="2" step="0.01"
-									id="rep_pen_slide" oninput="document.getElementById('rep_pen').value = this.value;"></div>
-							<div class="settingminmax">
-								<div class="justifyleft">1</div>
-								<div class="justifyright">2</div>
-							</div>
-						</div>
 
-						<div class="settingitem">
-							<div class="settinglabel">
-								<div class="justifyleft">Top-P Sampling <span class="helpicon">?<span class="helptext">Used
-											to discard unlikely text in a nucleus sampling process. Lower values will make text
-											more predictable but can become repetitious. Set to 1 to deactivate it.</span></span></div>
-								<input title="Top-P Sampling" inputmode="decimal" class="justifyright push-right" id="top_p" oninput="
-								document.getElementById('top_p_slide').value = this.value;">
-							</div>
-							<div><input title="Top-P Sampling Slider" type="range" min="0" max="1" step="0.01" id="top_p_slide"
-									oninput="document.getElementById('top_p').value = this.value;"></div>
-							<div class="settingminmax">
-								<div class="justifyleft">0</div>
-								<div class="justifyright">1</div>
-							</div>
-						</div>
-
-						<div class="settingitem">
-							<div class="settinglabel">
-								<div class="justifyleft">Top-K Sampling <span class="helpicon">?<span class="helptext">Top-K Sampling. Discards all but the K most likely tokens. Set 0 to Deactivate. Range 0 to 100.</span></span></div>
-								<input title="Top-K Sampling" inputmode="decimal" class="justifyright push-right" id="top_k" oninput="
-								document.getElementById('top_k_slide').value = this.value;">
-							</div>
-							<div><input title="Top-K Sampling Slider" type="range" min="0" max="100" step="1" id="top_k_slide"
-									oninput="document.getElementById('top_k').value = this.value;"></div>
-							<div class="settingminmax">
-								<div class="justifyleft">0</div>
-								<div class="justifyright">100</div>
+							<div class="settingitem">
+								<div class="settinglabel">
+									<div class="justifyleft">Top-K Sampling <span class="helpicon">?<span class="helptext">Top-K Sampling. Discards all but the K most likely tokens. Set 0 to Deactivate. Range 0 to 100.</span></span></div>
+									<input title="Top-K Sampling" inputmode="decimal" class="justifyright push-right" id="top_k" oninput="
+									document.getElementById('top_k_slide').value = this.value;">
+								</div>
+								<div><input title="Top-K Sampling Slider" type="range" min="0" max="100" step="1" id="top_k_slide"
+										oninput="document.getElementById('top_k').value = this.value;"></div>
+								<div class="settingminmax">
+									<div class="justifyleft">0</div>
+									<div class="justifyright">100</div>
+								</div>
 							</div>
 						</div>
 					</div>
@@ -29902,6 +29997,12 @@ Current version indicated by LITEVER below.
 							</span> </div>
 							<input title="Hide Streaming Thinking" type="checkbox" id="hide_think_stream" class="push-right">
 						</div>
+						<div class="settinglabel">
+							<div class="justifyleft">Handle Mismatched Thinking <span class="helpicon">?
+								<span class="helptext">Handles cases where the closing think block exists without the opening. Note that this only visually hides the broken thinking, it will still be treated like normal context.</span>
+							</span> </div>
+							<input title="Handle Mismatched Thinking" type="checkbox" id="handle_mismatched_think" class="push-right">
+						</div>
 					</div>
 
 					<div class="settinglabel">
@@ -30260,10 +30361,6 @@ Current version indicated by LITEVER below.
 										<div>px</div>
 										<div style="margin-left:20px"><span class="rectPortraitMode">A/R: </span><input id="portrait_ratio_AI" type="number" placeholder="1.0" step="0.01" value="1.0" style='width:46px;height:20px;font-size:10px;' class="rectPortraitMode"/></div>
 									</div>
-									<div class="ui-settings-inline" style="font-size: 10px; margin-left: 10px">
-										<div style="padding-top: 2px;">Show Names (Chat Mode): </div>
-										<input id="aui_show_chat_names" type="checkbox" style="height: 10px">
-									</div>
 								</div>
 							</div>
 						</div>
@@ -30578,7 +30675,7 @@ Current version indicated by LITEVER below.
 				<input class="form-control" name="username" autocomplete="username" type="text" id="custom_oai_endpoint" placeholder="OpenAI API URL" value="" onblur="">
 				<input class="form-control" name="password" autocomplete="current-password" type="password" id="custom_oai_key" placeholder="API Key (Required)" value="" onfocus="focus_api_keys()" onblur="blur_api_keys()"><br>
 				Model Choice:<br>
-				<select title="OpenAI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control" id="custom_oai_model" onchange="oai_model_change(true)">
+				<select title="OpenAI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control" id="custom_oai_model" onchange="oai_model_change(true)">
 					<option value="gpt-3.5-turbo-instruct" selected="selected">gpt-3.5-turbo-instruct</option>
 					<option value="davinci-002">davinci-002</option>
 					<option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
@@ -30605,7 +30702,7 @@ Current version indicated by LITEVER below.
 					<option value="o4-mini">o4-mini</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="OpenRouter AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_openrouter_model" onchange="oai_model_change(true)">
+				<select title="OpenRouter AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_openrouter_model" onchange="oai_model_change(true)">
 					<option value="openai/gpt-3.5-turbo">openai/gpt-3.5-turbo</option>
 					<option value="openai/gpt-4">openai/gpt-4</option>
 					<option value="openai/gpt-4o">openai/gpt-4o</option>
@@ -30616,7 +30713,7 @@ Current version indicated by LITEVER below.
 					<option value="gryphe/mythomax-l2-13b">gryphe/mythomax-l2-13b</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="Mistral AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_mistralai_model" onchange="oai_model_change(true)">
+				<select title="Mistral AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_mistralai_model" onchange="oai_model_change(true)">
 					<option value="open-mistral-7b">open-mistral-7b</option>
 					<option value="open-mistral-nemo">open-mistral-nemo</option>
 					<option value="open-mixtral-8x22b">open-mixtral-8x22b</option>
@@ -30632,7 +30729,7 @@ Current version indicated by LITEVER below.
 					<option value="codestral-latest">codestral-latest</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="Featherless AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_featherless_model" onchange="oai_model_change(true)">
+				<select title="Featherless AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_featherless_model" onchange="oai_model_change(true)">
 					<option value="Sao10K/L3-8B-Lunaris-v1">Sao10K/L3-8B-Lunaris-v1</option>
 					<option value="Sao10K/L3-8B-Stheno-v3.2">Sao10K/L3-8B-Stheno-v3.2</option>
 					<option value="unsloth/llama-3-8b-Instruct">unsloth/llama-3-8b-Instruct</option>
@@ -30646,7 +30743,7 @@ Current version indicated by LITEVER below.
 					<option value="meta-llama/Meta-Llama-3.1-405B-Instruct">meta-llama/Meta-Llama-3.1-405B-Instruct</option>
 				<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="Grok AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_grok_model" onchange="oai_model_change(true)">
+				<select title="Grok AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_grok_model" onchange="oai_model_change(true)">
 					<option value="grok-2-1212">grok-2-1212</option>
 					<option value="grok-3" selected>grok-3</option>
 					<option value="grok-3-mini">grok-3-mini</option>
@@ -30654,7 +30751,7 @@ Current version indicated by LITEVER below.
 					<option value="grok-4-0709">grok-4-0709</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="Pollinations AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_pollinations_model" onchange="oai_model_change(true)">
+				<select title="Pollinations AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_pollinations_model" onchange="oai_model_change(true)">
 					<option value="bidara">bidara</option>
 					<option value="chickytutor">chickytutor</option>
 					<option value="gemini">gemini</option>
@@ -30664,7 +30761,7 @@ Current version indicated by LITEVER below.
 					<option value="openai-fast">openai-fast</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<select title="Nvidia NIM AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 220px)" class="form-control hidden" id="custom_nvidianim_model" onchange="oai_model_change(true)">
+				<select title="Nvidia NIM AI Model Selection" style="padding:4px;display:inline;width:calc(100% - 200px)" class="form-control hidden" id="custom_nvidianim_model" onchange="oai_model_change(true)">
 					<option value="deepseek-ai/deepseek-v3.1-terminus">deepseek-ai/deepseek-v3.1-terminus</option>
 					<option value="google/gemma-3-27b-it">google/gemma-3-27b-it</option>
 					<option value="meta/llama-3.3-70b-instruct">meta/llama-3.3-70b-instruct</option>
@@ -30675,8 +30772,9 @@ Current version indicated by LITEVER below.
 					<option value="z-ai/glm4.7">z-ai/glm4.7</option>
 					<option style="display:none;" class="custom_model_option" value="custom">[Custom]</option>
 				</select>
-				<button type="button" class="btn btn-primary" style="display:inline;width:105px;" id="oaifetchlist" onclick="oai_fetch_models()">Fetch List</button>
-				<button type="button" class="btn btn-primary" style="display:inline;width:105px;" id="oaiusecustom" onclick="select_custom_oai_model()">Use Custom</button>
+				<button type="button" class="btn btn-primary" style="display:inline;width:42px;height:34px;vertical-align: top;" id="oaifindmodel" onclick="find_oai_model()">🔎</button>
+				<button type="button" class="btn btn-primary" style="display:inline;width:70px;height:34px;vertical-align: top;" id="oaifetchlist" onclick="oai_fetch_models()">Fetch</button>
+				<button type="button" class="btn btn-primary" style="display:inline;width:70px;height:34px;vertical-align: top;" id="oaiusecustom" onclick="select_custom_oai_model()">Custom</button>
 				<div class="hidden" id="oaiemulatecompletionsbox">
 					<div><input type="checkbox" id="oaiemulatecompletions" title="Emulate Completions with Prefill">
 					<div class="box-label">Emulate Completions API with Prefill</div></div>
@@ -30759,8 +30857,17 @@ Current version indicated by LITEVER below.
 				<input type="checkbox" title="Add endpoint version" id="claudeaddversion" onchange="" checked>
 				<div class="box-label" title="Add endpoint version">Add Endpoint Version</div>
 
-				<textarea class="form-control hidden" title="Claude System Prompt" rows="2" style="resize: vertical; line-height:1.1; padding:4px; display:inline; width: 100%" id="claudesystemprompt" placeholder="(Enter System Prompt, which steers overall AI behavior.)" onload=""></textarea>
-				<textarea class="form-control hidden" title="Claude Assistant Postfix" rows="2" style="resize: vertical; line-height:1.1; padding:4px; display:inline; width: 100%" id="claudejailbreakprompt" placeholder="(Enter Assistant Postfix, which forces the AI to start responses with this text.)" onload=""></textarea>
+				<textarea class="form-control" title="Claude System Prompt" rows="2" style="resize: vertical; line-height:1.1; padding:4px; display:inline; width: 100%" id="claudesystemprompt" placeholder="(Enter System Prompt, which steers overall AI behavior.)" onload=""></textarea>
+
+				<div style="display:flex">
+					<select title="Claude Postfix Role" class="form-control" style="height: 25px; font-size:12px; padding:4px;display:inline;width:100px" id="claudejailbreakpromptrole">
+						<option value="0">User</option>
+						<option value="1" selected>Assistant</option>
+						<option value="2">System</option>
+					</select>
+					<textarea title="Enter Claude Postfix" class="form-control" rows="2" style="resize: vertical; line-height:1.1; padding:4px; display:inline; width: 100%" id="claudejailbreakprompt" placeholder="(Enter a postfix, which forces the AI to start responses with this text.)" onload=""></textarea>
+				</div>
+
 
 				<div id="claudethinkingbox" class="hidden">
 				<div class="box-label" title="Enable Thinking">Enable Thinking </div>

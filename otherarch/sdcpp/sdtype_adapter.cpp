@@ -14,17 +14,8 @@
 #include <algorithm>
 #include <filesystem>
 
-#define KCPP_NO_BAKE_SD_VOCAB
-
 #include "model_adapter.h"
-
-std::string sd_load_merges();
-std::string sd_load_t5();
-std::string sd_load_umt5();
-std::string sd_load_qwen2_merges();
-std::string sd_load_mistral_merges();
-std::string sd_load_mistral_vocab_json();
-
+#include "vocab/vocab.h"
 #include "flux.hpp"
 #include "stable-diffusion.cpp"
 #include "util.cpp"
@@ -150,7 +141,7 @@ static std::string read_str_from_disk(std::string filepath)
     return output;
 }
 
-std::string sd_load_merges()
+std::string load_clip_merges()
 {
     static std::string mergesstr;  // cached string
     if (!mergesstr.empty()) {
@@ -160,7 +151,7 @@ std::string sd_load_merges()
     mergesstr = read_str_from_disk(filepath);
     return mergesstr;
 }
-std::string sd_load_qwen2_merges()
+std::string load_qwen2_merges()
 {
     static std::string qwenmergesstr;  // cached string
     if (!qwenmergesstr.empty()) {
@@ -170,7 +161,7 @@ std::string sd_load_qwen2_merges()
     qwenmergesstr = read_str_from_disk(filepath);
     return qwenmergesstr;
 }
-std::string sd_load_mistral_merges()
+std::string load_mistral_merges()
 {
     static std::string mistralmergesstr;  // cached string
     if (!mistralmergesstr.empty()) {
@@ -180,7 +171,7 @@ std::string sd_load_mistral_merges()
     mistralmergesstr = read_str_from_disk(filepath);
     return mistralmergesstr;
 }
-std::string sd_load_mistral_vocab_json()
+std::string load_mistral_vocab_json()
 {
     static std::string mistralvocabstr;  // cached string
     if (!mistralvocabstr.empty()) {
@@ -190,7 +181,7 @@ std::string sd_load_mistral_vocab_json()
     mistralvocabstr = read_str_from_disk(filepath);
     return mistralvocabstr;
 }
-std::string sd_load_t5()
+std::string load_t5_tokenizer_json()
 {
     static std::string t5str = "";
     if (!t5str.empty()) {
@@ -200,7 +191,7 @@ std::string sd_load_t5()
     t5str = read_str_from_disk(filepath);
     return t5str;
 }
-std::string sd_load_umt5()
+std::string load_umt5_tokenizer_json()
 {
     static std::string umt5str = "";
     if (!umt5str.empty()) {
@@ -369,6 +360,9 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.keep_clip_on_cpu = inputs.clip_cpu;
     params.lora_apply_mode = (lora_apply_mode_t)lora_apply_mode;
     // params.flow_shift = 5.0f;
+
+    // also switches flash attn for the vae and conditioner
+    params.flash_attn = params.diffusion_flash_attn;
 
     if (params.chroma_use_dit_mask && params.diffusion_flash_attn) {
         // note we don't know yet if it's a Chroma model
@@ -620,6 +614,14 @@ static enum sample_method_t sampler_from_name(const std::string& sampler)
     {
         return sample_method_t::DPMPP2M_SAMPLE_METHOD;
     }
+    else if(sampler=="res multistep" || sampler=="k_res_multistep")
+    {
+        return sample_method_t::RES_MULTISTEP_SAMPLE_METHOD;
+    }
+    else if(sampler=="res 2s" || sampler=="k_res_2s")
+    {
+        return sample_method_t::RES_2S_SAMPLE_METHOD;
+    }
     else
     {
         return sample_method_t::SAMPLE_METHOD_COUNT;
@@ -787,6 +789,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     bool is_wan = (loadedsdver == SDVersion::VERSION_WAN2 || loadedsdver == SDVersion::VERSION_WAN2_2_I2V || loadedsdver == SDVersion::VERSION_WAN2_2_TI2V);
     bool is_qwenimg = (loadedsdver == SDVersion::VERSION_QWEN_IMAGE);
     bool is_kontext = (loadedsdver==SDVersion::VERSION_FLUX && !loaded_model_is_chroma(sd_ctx));
+    bool is_flux2 = (loadedsdver == SDVersion::VERSION_FLUX2 || loadedsdver == SDVersion::VERSION_FLUX2_KLEIN);
 
     if (loadedsdver == SDVersion::VERSION_FLUX)
     {
@@ -808,12 +811,12 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
     if(!remove_limits && loadedsdver == SDVersion::VERSION_Z_IMAGE)
     {
-        if(sd_params->cfg_scale > 3.0f)
+        if(sd_params->cfg_scale > 4.0f)
         {
             if (!sd_is_quiet && sddebugmode) {
-                printf("Z-Image: clamping CFG Scale to 3.0 to preserve quality\n");
+                printf("Z-Image: clamping CFG Scale to 4.0 to preserve quality\n");
             }
-            sd_params->cfg_scale = 3.0f;
+            sd_params->cfg_scale = 4.0f;
         }
     }
 
@@ -834,26 +837,22 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         extra_image_data.push_back(img2img_data);
     }
 
-    const int default_res_limit = 8192; // arbitrary, just to simplify the code
-    // avoid crashes due to bugs/limitations on certain models
-    // although it can be possible for a single side to exceed 1024, the total resolution of the image
-    // cannot exceed (832x832) for sd1/sd2 or (1280x1280) for sdxl/sd3/flux, to prevent crashing the server
-    const int hard_megapixel_res_limit = (loadedsdver==SDVersion::VERSION_SD1 || loadedsdver==SDVersion::VERSION_SD2)?832:1280;
-
-    int img_hard_limit = default_res_limit;
+    // limit by image side
+    int img_hard_limit = 8192; // "large enough", just to simplify the code
     if (cfg_side_limit > 0) {
-        img_hard_limit = std::max(std::min(cfg_side_limit, default_res_limit), 64);
+        img_hard_limit = std::max(std::min(cfg_side_limit, img_hard_limit), 64);
     }
 
-    int img_soft_limit = default_res_limit;
-    if (cfg_square_limit > 0) {
-        img_soft_limit = std::max(std::min(cfg_square_limit, default_res_limit), 64);
-    }
-
-    if (cfg_square_limit > 0 && sddebugmode == 1) {
-        img_soft_limit = std::min(hard_megapixel_res_limit * 2, img_soft_limit);  //double the limit for debugmode if cfg_square_limit is set
+    // limit by image area: avoid crashes due to bugs/limitations on certain models
+    // a single side can be larger, but width*height are limited by img_soft_limit²
+    int img_soft_limit;
+    int hard_megapixel_res_limit = 2048; // hard area limit, no matter the config
+    if (cfg_square_limit <= 0) {
+        // default limit is model dependent: ~0.66 megapixel for SD1.5/SD2, 1 megapixel for most models
+        img_soft_limit = ((loadedsdver==SDVersion::VERSION_SD1 || loadedsdver==SDVersion::VERSION_SD2)?832:1024);
     } else {
-        img_soft_limit = std::min(hard_megapixel_res_limit, img_soft_limit);
+        // force 64 <= limit <= hard_megapixel_res_limit
+        img_soft_limit = std::max(std::min(cfg_square_limit, hard_megapixel_res_limit), 64);
     }
 
     sd_fix_resolution(sd_params->width, sd_params->height, img_hard_limit, img_soft_limit);
@@ -914,7 +913,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
                     wan_imgs.push_back(extraimage_reference);
                 }
             }
-            else if(is_qwenimg)
+            else if(is_qwenimg || is_flux2)
             {
                 uint8_t * loaded = load_image_from_b64(extra_image_data[i],nx2,ny2);
                 if(loaded)

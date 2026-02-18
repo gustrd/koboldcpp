@@ -1140,7 +1140,7 @@ struct ggml_cuda_graph_node_properties {
 };
 
 static_assert(std::is_trivial<ggml_cuda_graph_node_properties>::value, "ggml_cuda_graph_node_properties must be trivial");
-
+static bool cugraph_warned_rec = false;
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1173,7 +1173,11 @@ struct ggml_cuda_graph {
             number_consecutive_updates = 0;
         }
         if (number_consecutive_updates >= 4) {
-            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
+            if(!cugraph_warned_rec)
+            {
+                cugraph_warned_rec = true;
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
+            }
             disable_due_to_too_many_updates = true;
         }
     }
