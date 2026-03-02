@@ -550,17 +550,20 @@ def restart_program() -> None:
 
 def detect_repeated_prefix(s: str, min_repeats: int = GRD_REPEATED_CHARS_LIMIT) -> Tuple[Optional[str], int]:
     """
-    Detect if the string `s` begins with some substring repeated at least `min_repeats` times.
+    Detect if the string `s` begins (ignoring leading whitespace) with some substring 
+    repeated at least `min_repeats` times.
     If found, prints the substring and how many times it appears consecutively from the start,
     and returns (substring, count). If not found, returns (None, 0).
 
     Strategy:
+    - Trim leading whitespace from `s`.
     - Try candidate substring lengths from 1 up to floor(len(s) / min_repeats).
       (If len(s) < min_repeats then no candidate possible.)
     - For each candidate length L, take prefix = s[:L] and count how many consecutive copies
       of prefix occur starting at index 0.
     - Return the first (smallest L) match that yields count >= min_repeats.
     """
+    s = s.lstrip()
     n = len(s)
     if n == 0 or n < min_repeats:
         debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
