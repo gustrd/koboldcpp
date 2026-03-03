@@ -366,27 +366,168 @@ std::vector<std::vector<int>> split_big_vector(const std::vector<int>& big_arr, 
     return small_arrs;
 }
 
-std::vector<float> resample_wav(const std::vector<float>& input, uint32_t input_rate, uint32_t output_rate) {
+std::vector<float> resample_wav(const std::vector<float> & input, uint32_t input_rate, uint32_t output_rate) {
+    if (input.empty() || input_rate == 0 || output_rate == 0)
+        return {};
 
-    size_t input_size = input.size();
-
-    double ratio = static_cast<double>(output_rate) / input_rate;
-    size_t newLength = static_cast<size_t>(input.size() * ratio);
-    std::vector<float> output(newLength);
-
-    // Perform simple linear interpolation resampling
-    for (size_t i = 0; i < newLength; ++i) {
-        double srcIndex = i / ratio;
-        size_t srcIndexInt = static_cast<size_t>(srcIndex);
-        double frac = srcIndex - srcIndexInt;
-        if (srcIndexInt + 1 < input_size) {
-            output[i] = static_cast<float>(input[srcIndexInt] * (1 - frac) + input[srcIndexInt + 1] * frac);
-        } else {
-            output[i] = input[srcIndexInt];
+    const size_t input_size = input.size();
+    const double ratio = static_cast<double>(output_rate) / input_rate; // Compute resampling ratio
+    // Use rounding to avoid systematic truncation error
+    const size_t output_size = static_cast<size_t>(std::llround(input_size * ratio));
+    std::vector<float> output(output_size);
+    const double step = static_cast<double>(input_rate) / output_rate;  // Precompute step in source domain
+    double src_pos = 0.0;
+    for (size_t i = 0; i < output_size; ++i)
+    {
+        size_t idx = static_cast<size_t>(src_pos);
+        if (idx >= input_size - 1)    // Clamp to valid range (prevents out-of-bounds)
+        {
+            output[i] = input[input_size - 1];
         }
+        else
+        {
+            const double frac = src_pos - idx;
+            const float s0 = input[idx];
+            const float s1 = input[idx + 1];
+            output[i] = static_cast<float>(s0 + (s1 - s0) * frac);
+        }
+        src_pos += step;
+    }
+    return output;
+}
+
+std::vector<float> mix_planar_stereo_to_mono(const float* audio, int T_audio)
+{
+    std::vector<float> mono(T_audio);
+    const float* left  = audio;
+    const float* right = audio + T_audio;
+    for (int t = 0; t < T_audio; ++t)
+    {
+        mono[t] = 0.5f * (left[t] + right[t]);
+    }
+    return mono;
+}
+
+static uint8_t linear_to_mulaw(int16_t sample)
+{
+    const int16_t BIAS = 0x84;        // 132
+    const int16_t CLIP = 32635;
+
+    int16_t sign = (sample >> 8) & 0x80;
+    if (sign)
+        sample = -sample;
+
+    if (sample > CLIP)
+        sample = CLIP;
+
+    sample += BIAS;
+
+    int16_t exponent = 7;
+    for (int16_t expMask = 0x4000;
+         (sample & expMask) == 0 && exponent > 0;
+         exponent--, expMask >>= 1);
+
+    int16_t mantissa = (sample >> (exponent + 3)) & 0x0F;
+
+    uint8_t ulaw = ~(sign | (exponent << 4) | mantissa);
+    return ulaw;
+}
+
+std::string save_ulaw_wav8_base64(const std::vector<float> &data, int sample_rate)
+{
+    std::ostringstream oss;
+    wav_ulaw_header header;
+
+    header.sample_rate = sample_rate;
+    header.byte_rate   = sample_rate;      // 1 byte per sample (mono)
+    header.block_align = 1;
+    header.data_size   = static_cast<uint32_t>(data.size());
+    header.chunk_size  = 4                       // "WAVE"
+                       + 8 + header.fmt_chunk_size
+                       + 8 + header.data_size;
+
+    // Write header
+    oss.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+    // Convert and write samples
+    for (float s : data)
+    {
+        float clamped = std::clamp(s, -1.0f, 1.0f);
+        int16_t pcm = static_cast<int16_t>(clamped * 32767.0f);
+        uint8_t mu = linear_to_mulaw(pcm);
+        oss.write(reinterpret_cast<const char*>(&mu), 1);
     }
 
-    return output;
+    std::string wav_data = oss.str();
+    return kcpp_base64_encode(wav_data);
+}
+
+std::string save_wav16_base64(const std::vector<float> &data, int sample_rate) {
+    std::ostringstream oss;
+    wav16_header header;
+
+    // Fill header fields
+    header.sample_rate = sample_rate;
+    header.byte_rate = header.sample_rate * header.num_channels * (header.bits_per_sample / 8);
+    header.block_align = header.num_channels * (header.bits_per_sample / 8);
+    header.data_size = data.size() * (header.bits_per_sample / 8);
+    header.chunk_size = 36 + header.data_size;
+
+    // Write header
+    oss.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+    // Write samples
+    for (const auto &sample : data) {
+        int16_t pcm_sample = static_cast<int16_t>(std::clamp(sample * 32767.0, -32768.0, 32767.0));
+        oss.write(reinterpret_cast<const char*>(&pcm_sample), sizeof(pcm_sample));
+    }
+
+    // Get binary WAV data
+    std::string wav_data = oss.str();
+    return kcpp_base64_encode(wav_data); //return as base64 string
+}
+
+//assumes planar stereo input from acestep
+std::string save_stereo_wav16_base64(const std::vector<float> & raw_audio, int T_audio, int sample_rate) {
+    std::ostringstream oss(std::ios::binary);
+    const int n_channels = 2;
+    const int bits = 16;
+    const int byte_rate = sample_rate * n_channels * (bits / 8);
+    const int block_align = n_channels * (bits / 8);
+    const int data_size = T_audio * n_channels * (bits / 8);
+    const int file_size = 36 + data_size;
+    oss.write("RIFF", 4);
+    oss.write(reinterpret_cast<const char*>(&file_size), 4);
+    oss.write("WAVE", 4);
+    oss.write("fmt ", 4);
+    int32_t fmt_size = 16;
+    oss.write(reinterpret_cast<const char*>(&fmt_size), 4);
+    int16_t audio_fmt = 1; // PCM
+    oss.write(reinterpret_cast<const char*>(&audio_fmt), 2);
+    int16_t nc = n_channels;
+    oss.write(reinterpret_cast<const char*>(&nc), 2);
+    oss.write(reinterpret_cast<const char*>(&sample_rate), 4);
+    oss.write(reinterpret_cast<const char*>(&byte_rate), 4);
+    int16_t ba = block_align;
+    oss.write(reinterpret_cast<const char*>(&ba), 2);
+    int16_t bp = bits;
+    oss.write(reinterpret_cast<const char*>(&bp), 2);
+    oss.write("data", 4);
+    oss.write(reinterpret_cast<const char*>(&data_size), 4);
+
+    // EXPECTS PLANAR INPUT:
+    // raw_audio[0 ... T_audio-1]           = Left
+    // raw_audio[T_audio ... 2*T_audio-1]   = Right
+    for (int t = 0; t < T_audio; ++t) {
+        for (int c = 0; c < 2; ++c) {
+            float s = raw_audio[c * T_audio + t];
+            s = std::max(-1.0f, std::min(1.0f, s));  // clamp to [-1, 1]
+            int16_t v = static_cast<int16_t>(s * 32767.0f);
+            oss.write(reinterpret_cast<const char*>(&v), 2);
+        }
+    }
+    std::string wav_data = oss.str();
+    return kcpp_base64_encode(wav_data);
 }
 
 //a very rudimentary all in one sampling function which has no dependencies

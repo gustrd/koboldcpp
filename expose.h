@@ -5,7 +5,8 @@ const int tensor_split_max = 16;
 const int images_max = 8;
 const int audio_max = 4;
 const int logprobs_max = 10;
-const int overridekv_max = 4;
+const int overridekv_max = 16;
+const int lora_filenames_max = 4;
 
 // match kobold's sampler list and order
 enum samplers
@@ -188,7 +189,7 @@ struct sd_load_model_inputs
     const char * clip1_filename = nullptr;
     const char * clip2_filename = nullptr;
     const char * vae_filename = nullptr;
-    const char * lora_filename = nullptr;
+    const char * lora_filenames[lora_filenames_max] = {};
     const float lora_multiplier = 1.0f;
     const int lora_apply_mode = 0;
     const char * photomaker_filename = nullptr;
@@ -212,6 +213,7 @@ struct sd_generation_inputs
     const float cfg_scale = 0.0f;
     const float distilled_guidance = -1.0f;
     const int shifted_timestep = 0;
+    const float flow_shift = 0.0f;
     const int sample_steps = 0;
     const int width = 0;
     const int height = 0;
@@ -290,6 +292,7 @@ struct tts_generation_inputs
     const char * custom_speaker_voice = "";
     const char * custom_speaker_text = "";
     const char * custom_speaker_data = "";
+    const char * reference_audio = "";
 };
 struct tts_generation_outputs
 {
@@ -321,6 +324,34 @@ struct embeddings_generation_outputs
 {
     int status = -1;
     int count = 0;
+    const char * data = "";
+};
+
+struct music_load_model_inputs
+{
+    const char * musicllm_filename = nullptr;
+    const char * musicembedding_filename = nullptr;
+    const char * musicdiffusion_filename = nullptr;
+    const char * musicvae_filename = nullptr;
+    const bool lowvram = false;
+    const char * executable_path = nullptr;
+    const int kcpp_main_gpu = 0;
+    const char * vulkan_info = nullptr;
+    const char * devices_override = nullptr;
+    const bool quiet = false;
+    const int debugmode = 0;
+};
+struct music_generation_inputs
+{
+    const bool is_planner_mode = false; //if true, generate codes, else, generate diffusion music
+    const bool stereo = false;
+    const bool gen_codes = false;
+    const char * input_json = nullptr;
+};
+struct music_generation_outputs
+{
+    int status = -1;
+    const char * music_output_json = "";
     const char * data = "";
 };
 

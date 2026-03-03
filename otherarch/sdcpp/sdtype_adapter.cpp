@@ -69,6 +69,7 @@ struct SDParams {
     int sample_steps              = 20;
     float distilled_guidance      = -1.0f;
     float shifted_timestep        = 0;
+    float flow_shift              = -1.0f;
     float strength                = 0.75f;
     int64_t seed                  = 42;
     bool clip_on_cpu              = false;
@@ -78,8 +79,8 @@ struct SDParams {
 
     bool chroma_use_dit_mask     = true;
 
-    std::string lora_path;
-    sd_lora_t lora_spec;
+    std::vector<std::string> lora_paths;
+    std::vector<sd_lora_t> lora_specs;
     uint32_t lora_count;
 };
 
@@ -207,7 +208,15 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     set_sd_quiet(sd_is_quiet);
     executable_path = inputs.executable_path;
     std::string taesdpath = "";
-    std::string lorafilename = inputs.lora_filename;
+    std::vector<std::string> lorafilenames;
+    for(int i=0;i<lora_filenames_max;++i)
+    {
+        std::string temp = inputs.lora_filenames[i];
+        if(temp!="")
+        {
+            lorafilenames.push_back(temp);
+        }
+    }
     std::string vaefilename = inputs.vae_filename;
     std::string t5xxl_filename = inputs.t5xxl_filename;
     std::string clip1_filename = inputs.clip1_filename;
@@ -223,13 +232,16 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
 
     int lora_apply_mode = std::max(0, std::min(2, inputs.lora_apply_mode));
 
-    if(lorafilename!="")
+    if(lorafilenames.size()>0)
     {
-        const char* lora_apply_mode_name = lora_apply_mode == 1 ? "immediately"
-                                         : lora_apply_mode == 2 ? "at runtime"
-                                         : "auto";
-        printf("With LoRA: %s at %f power, apply mode: %s\n",
-            lorafilename.c_str(),inputs.lora_multiplier,lora_apply_mode_name);
+        for(int i=0;i<lorafilenames.size();++i)
+        {
+            const char* lora_apply_mode_name = lora_apply_mode == 1 ? "immediately"
+                                            : lora_apply_mode == 2 ? "at runtime"
+                                            : "auto";
+            printf("With LoRA: %s at %f power, apply mode: %s\n",
+                lorafilenames[i].c_str(),inputs.lora_multiplier,lora_apply_mode_name);
+        }
     }
     if(inputs.taesd)
     {
@@ -315,7 +327,7 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_params->clip_l_path = clip1_filename;
     sd_params->clip_g_path = clip2_filename;
     sd_params->stacked_id_embeddings_path = photomaker_filename;
-    sd_params->lora_path = lorafilename;
+    sd_params->lora_paths = lorafilenames;
     //if t5 is set, and model is a gguf, load it as a diffusion model path
     bool endswithgguf = (sd_params->model_path.rfind(".gguf") == sd_params->model_path.size() - 5);
     if((sd_params->t5xxl_path!="" || sd_params->clip_l_path!="" || sd_params->clip_g_path!="") && endswithgguf)
@@ -359,7 +371,6 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     params.keep_vae_on_cpu = inputs.vae_cpu;
     params.keep_clip_on_cpu = inputs.clip_cpu;
     params.lora_apply_mode = (lora_apply_mode_t)lora_apply_mode;
-    // params.flow_shift = 5.0f;
 
     // also switches flash attn for the vae and conditioner
     params.flash_attn = params.diffusion_flash_attn;
@@ -405,15 +416,21 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     std::filesystem::path mpath(inputs.model_filename);
     sdmodelfilename = mpath.filename().string();
 
-    sd_params->lora_spec = {};
-    sd_params->lora_spec.path = sd_params->lora_path.c_str();
-    sd_params->lora_spec.multiplier = inputs.lora_multiplier;
-
-    if(sd_params->lora_path!="" && sd_params->lora_spec.multiplier>0)
+    sd_params->lora_specs.clear();
+    sd_params->lora_specs.reserve(lora_filenames_max*2);
+    for(int i=0;i<sd_params->lora_paths.size();++i)
     {
-        printf("\nApply LoRA...\n");
-        sd_params->lora_count = 1;
-        sd_ctx->sd->apply_loras(&sd_params->lora_spec, sd_params->lora_count);
+        sd_lora_t spec = {};
+        spec.path = sd_params->lora_paths[i].c_str();
+        spec.multiplier = inputs.lora_multiplier;
+        sd_params->lora_specs.push_back(spec);
+    }
+
+    if(sd_params->lora_specs.size()>0 && inputs.lora_multiplier>0)
+    {
+        printf("\nApply %d LoRAs...\n",sd_params->lora_specs.size());
+        sd_params->lora_count = sd_params->lora_specs.size();
+        sd_ctx->sd->apply_loras(sd_params->lora_specs.data(), sd_params->lora_count);
     }
 
     input_extraimage_buffers.reserve(max_extra_images);
@@ -475,32 +492,32 @@ static std::string get_image_params(const sd_img_gen_params_t & params) {
         << get_scheduler_name(params.sample_params.scheduler, true);
     if (params.sample_params.shifted_timestep != 0)
         ss << "| Timestep Shift: " << params.sample_params.shifted_timestep;
+    if (params.sample_params.flow_shift > 0.f && params.sample_params.flow_shift != INFINITY)
+        ss << "| Flow Shift: " << params.sample_params.flow_shift;
     ss  << " | Clip skip: " << params.clip_skip
         << " | Model: " << sdmodelfilename
         << " | Version: KoboldCpp";
     return ss.str();
 }
 
-static inline int rounddown_64(int n) {
-    return n - n % 64;
+static inline int rounddown_to(int n, int fac) {
+    return n - n % fac;
 }
 
-static inline int roundup_64(int n) {
-    return ((n + 63) / 64) * 64;
+static inline int roundup_to(int n, int fac) {
+    return ((n + fac - 1) / fac) * fac;
 }
 
-static inline int roundnearest(int multiple, int n) {
-    return ((n + (multiple/2)) / multiple) * multiple;
-}
+const int img_side_min = 64;
 
 //scale dimensions to ensure width and height stay within limits
 //img_hard_limit = sdclamped, hard size limit per side, no side can exceed this
 //square limit = total NxN resolution based limit to also apply
-static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int img_soft_limit) {
+static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int img_soft_limit, int spatial_multiple) {
 
     // sanitize the original values
-    width = std::max(std::min(width, 8192), 64);
-    height = std::max(std::min(height, 8192), 64);
+    width = std::max(std::min(width, 8192), img_side_min);
+    height = std::max(std::min(height, 8192), img_side_min);
 
     bool is_landscape = (width > height);
     int long_side = is_landscape ? width : height;
@@ -509,19 +526,19 @@ static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int i
 
     // for the initial rounding, don't bother comparing to the original
     // requested ratio, since the user can choose those values directly
-    long_side = rounddown_64(long_side);
-    short_side = rounddown_64(short_side);
-    img_hard_limit = rounddown_64(img_hard_limit);
+    long_side = rounddown_to(long_side, spatial_multiple);
+    short_side = rounddown_to(short_side, spatial_multiple);
+    img_hard_limit = rounddown_to(img_hard_limit, spatial_multiple);
 
     //enforce sdclamp side limit
     if (long_side > img_hard_limit) {
         short_side = static_cast<int>(short_side * img_hard_limit / static_cast<float>(long_side));
         long_side = img_hard_limit;
-        if (short_side <= 64) {
-            short_side = 64;
+        if (short_side <= img_side_min) {
+            short_side = img_side_min;
         } else {
-            int down = rounddown_64(short_side);
-            int up = roundup_64(short_side);
+            int down = rounddown_to(short_side, spatial_multiple);
+            int up = roundup_to(short_side, spatial_multiple);
             float longf = static_cast<float>(long_side);
             // Choose better ratio match between rounding up or down
             short_side = (longf / down - original_ratio < original_ratio - longf / up) ? down : up;
@@ -535,14 +552,14 @@ static void sd_fix_resolution(int &width, int &height, int img_hard_limit, int i
         int new_short = static_cast<int>(short_side * scale);
         int new_long = static_cast<int>(long_side * scale);
 
-        if (new_short <= 64) {
-            short_side = 64;
-            long_side = rounddown_64(area_limit / short_side);
+        if (new_short <= img_side_min) {
+            short_side = img_side_min;
+            long_side = rounddown_to(area_limit / short_side, spatial_multiple);
         } else {
-            int new_long_down = rounddown_64(new_long);
-            int new_short_down = rounddown_64(new_short);
-            int new_short_up = roundup_64(new_short);
-            int new_long_up = roundup_64(new_long);
+            int new_long_down = rounddown_to(new_long, spatial_multiple);
+            int new_short_down = rounddown_to(new_short, spatial_multiple);
+            int new_short_up = roundup_to(new_short, spatial_multiple);
+            int new_long_up = roundup_to(new_long, spatial_multiple);
             long_side = new_long_down;
             short_side = new_short_down;
 
@@ -770,6 +787,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     sd_params->distilled_guidance = inputs.distilled_guidance;
     sd_params->sample_steps = inputs.sample_steps;
     sd_params->shifted_timestep = inputs.shifted_timestep;
+    sd_params->flow_shift = inputs.flow_shift;
     sd_params->seed = inputs.seed;
     sd_params->width = inputs.width;
     sd_params->height = inputs.height;
@@ -840,7 +858,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     // limit by image side
     int img_hard_limit = 8192; // "large enough", just to simplify the code
     if (cfg_side_limit > 0) {
-        img_hard_limit = std::max(std::min(cfg_side_limit, img_hard_limit), 64);
+        img_hard_limit = std::max(std::min(cfg_side_limit, img_hard_limit), img_side_min);
     }
 
     // limit by image area: avoid crashes due to bugs/limitations on certain models
@@ -851,11 +869,14 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         // default limit is model dependent: ~0.66 megapixel for SD1.5/SD2, 1 megapixel for most models
         img_soft_limit = ((loadedsdver==SDVersion::VERSION_SD1 || loadedsdver==SDVersion::VERSION_SD2)?832:1024);
     } else {
-        // force 64 <= limit <= hard_megapixel_res_limit
-        img_soft_limit = std::max(std::min(cfg_square_limit, hard_megapixel_res_limit), 64);
+        // force img_side_min <= limit <= hard_megapixel_res_limit
+        img_soft_limit = std::max(std::min(cfg_square_limit, hard_megapixel_res_limit), img_side_min);
     }
 
-    sd_fix_resolution(sd_params->width, sd_params->height, img_hard_limit, img_soft_limit);
+    // unet is limited to multiples of 64; dit models vary
+    int spatial_multiple = sd_ctx->sd->get_vae_scale_factor() * sd_ctx->sd->get_diffusion_model_down_factor();
+
+    sd_fix_resolution(sd_params->width, sd_params->height, img_hard_limit, img_soft_limit, spatial_multiple);
     if (inputs.width != sd_params->width || inputs.height != sd_params->height) {
         printf("\nKCPP SD: Requested dimensions %dx%d changed to %dx%d\n",
             inputs.width, inputs.height, sd_params->width, sd_params->height);
@@ -920,9 +941,10 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
                 {
                     //kcpp fix: qwen image can stack overflow and crash when ref images exceed
                     // a total res of 512x512 = 262144, so we downscale if that's the case
+                    // kcpp edit 2mar2026: this seems to be better now, so limit to 1024x1024 instead
                     int tgtx = nx2;
                     int tgty = ny2;
-                    int res_lim_crash = 512 * 512;
+                    int res_lim_crash = 1024 * 1024;
                     if (nx2 * ny2 > res_lim_crash)
                     {
                         float factor = sqrtf((float)res_lim_crash / ((float)nx2 * (float)ny2));
@@ -1004,6 +1026,9 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     params.sample_params.scheduler = sd_params->scheduler;
     params.sample_params.sample_steps = sd_params->sample_steps;
     params.sample_params.shifted_timestep = sd_params->shifted_timestep;
+    if (sd_params->flow_shift > 0.f && sd_params->flow_shift != INFINITY) {
+        params.sample_params.flow_shift = sd_params->flow_shift;
+    }
     params.seed = sd_params->seed;
     params.strength = sd_params->strength;
     params.vae_tiling_params.enabled = dotile;
@@ -1011,7 +1036,7 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 
     // needs to be "reapplied" because sdcpp tracks previously applied LoRAs
     // and weights, and apply/unapply the differences at each gen
-    params.loras = &sd_params->lora_spec;
+    params.loras = sd_params->lora_specs.data();
     params.lora_count = sd_params->lora_count;
 
     params.ref_images = reference_imgs.data();
@@ -1093,15 +1118,6 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
         results = generate_image(sd_ctx, &params);
 
     } else {
-
-        if (params.width <= 0 || params.width % 64 != 0 || params.height <= 0 || params.height % 64 != 0) {
-            printf("\nKCPP SD: bad request image dimensions!\n");
-            output.data = "";
-            output.data_extra = "";
-            output.animated = 0;
-            output.status = 0;
-            return output;
-        }
 
         if(input_image_buffer!=nullptr) //just in time free old buffer
         {
@@ -1277,6 +1293,11 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     output.animated = (wasanim?1:0);
     output.status = 1;
     total_img_gens += 1;
+    if(!sd_is_quiet)
+    {
+        std::string ts = get_timestamp_str();
+        printf("[%s] Generating Media Complete\n",ts.c_str());
+    }
     return output;
 }
 

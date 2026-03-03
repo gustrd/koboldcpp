@@ -57,8 +57,10 @@ savestate_limit_default = 10
 savestate_limit = 0 #savestate slots start at 0, only set when load model
 default_vae_tile_threshold = 768
 default_native_ctx = 16384
-overridekv_max = 4
+default_genlen = 1024
+overridekv_max = 16
 default_autofit_padding = 1024
+lora_filenames_max = 4
 
 # abuse prevention
 stop_token_max = 256
@@ -68,7 +70,7 @@ dry_seq_break_max = 128
 extra_images_max = 4 # for kontext/qwen img
 
 # global vars
-KcppVersion = "1.108"
+KcppVersion = "1.109"
 showdebug = True
 kcpp_instance = None #global running instance
 global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_override_config_target":""}
@@ -85,6 +87,8 @@ password = "" #if empty, no auth key required
 fullwhispermodelpath = "" #if empty, it's not initialized
 ttsmodelpath = "" #if empty, not initialized
 embeddingsmodelpath = "" #if empty, not initialized
+musicllmmodelpath = "" #if empty, not initialized
+musicdiffusionmodelpath = "" #if empty, not initialized
 maxctx = 8192
 maxhordectx = 0 #set to whatever maxctx is if 0
 maxhordelen = 1024
@@ -113,6 +117,7 @@ importvars_in_progress = False
 has_multiplayer = False
 has_audio_support = False
 has_vision_support = False
+has_whisper = False
 cached_chat_template = None
 savedata_obj = None
 mcp_connections = [] #every element is linked to one mcp source, contains obj {"client":obj, "tools":[]}
@@ -134,6 +139,10 @@ embedded_kcpp_docs_gz = None
 embedded_kcpp_sdui = None
 embedded_kcpp_sdui_gz = None
 embedded_lcpp_ui_gz = None
+embedded_musicui = None
+embedded_musicui_gz = None
+voicebank = {}
+voicelist = ["kobo","cheery","sleepy","shouty","chatty"]
 sslvalid = False
 nocertify = False
 start_time = time.time()
@@ -311,7 +320,7 @@ class sd_load_model_inputs(ctypes.Structure):
                 ("clip1_filename", ctypes.c_char_p),
                 ("clip2_filename", ctypes.c_char_p),
                 ("vae_filename", ctypes.c_char_p),
-                ("lora_filename", ctypes.c_char_p),
+                ("lora_filenames", ctypes.c_char_p * lora_filenames_max),
                 ("lora_multiplier", ctypes.c_float),
                 ("lora_apply_mode", ctypes.c_int),
                 ("photomaker_filename", ctypes.c_char_p),
@@ -334,6 +343,7 @@ class sd_generation_inputs(ctypes.Structure):
                 ("cfg_scale", ctypes.c_float),
                 ("distilled_guidance", ctypes.c_float),
                 ("shifted_timestep", ctypes.c_int),
+                ("flow_shift", ctypes.c_float),
                 ("sample_steps", ctypes.c_int),
                 ("width", ctypes.c_int),
                 ("height", ctypes.c_int),
@@ -401,7 +411,8 @@ class tts_generation_inputs(ctypes.Structure):
                 ("audio_seed", ctypes.c_int),
                 ("custom_speaker_voice", ctypes.c_char_p),
                 ("custom_speaker_text", ctypes.c_char_p),
-                ("custom_speaker_data", ctypes.c_char_p)]
+                ("custom_speaker_data", ctypes.c_char_p),
+                ("reference_audio", ctypes.c_char_p)]
 
 class tts_generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -428,6 +439,30 @@ class embeddings_generation_inputs(ctypes.Structure):
 class embeddings_generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
                 ("count", ctypes.c_int),
+                ("data", ctypes.c_char_p)]
+
+class music_load_model_inputs(ctypes.Structure):
+    _fields_ = [("musicllm_filename", ctypes.c_char_p),
+                ("musicembedding_filename", ctypes.c_char_p),
+                ("musicdiffusion_filename", ctypes.c_char_p),
+                ("musicvae_filename", ctypes.c_char_p),
+                ("lowvram", ctypes.c_bool),
+                ("executable_path", ctypes.c_char_p),
+                ("kcpp_main_gpu", ctypes.c_int),
+                ("vulkan_info", ctypes.c_char_p),
+                ("devices_override", ctypes.c_char_p),
+                ("quiet", ctypes.c_bool),
+                ("debugmode", ctypes.c_int)]
+
+class music_generation_inputs(ctypes.Structure):
+    _fields_ = [("is_planner_mode", ctypes.c_bool),
+                ("stereo", ctypes.c_bool),
+                ("gen_codes", ctypes.c_bool),
+                ("input_json", ctypes.c_char_p)]
+
+class music_generation_outputs(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_int),
+                ("music_output_json", ctypes.c_char_p),
                 ("data", ctypes.c_char_p)]
 
 class StdoutRedirector:
@@ -930,6 +965,10 @@ def init_library():
     handle.embeddings_load_model.restype = ctypes.c_bool
     handle.embeddings_generate.argtypes = [embeddings_generation_inputs]
     handle.embeddings_generate.restype = embeddings_generation_outputs
+    handle.music_load_model.argtypes = [music_load_model_inputs]
+    handle.music_load_model.restype = ctypes.c_bool
+    handle.music_generate.argtypes = [music_generation_inputs]
+    handle.music_generate.restype = music_generation_outputs
     handle.last_logprobs.restype = last_logprobs_outputs
     handle.detokenize.argtypes = [token_count_outputs]
     handle.detokenize.restype = ctypes.c_char_p
@@ -1250,7 +1289,7 @@ def convert_json_to_gbnf(json_obj):
         return ""
 
 def get_capabilities():
-    global savedata_obj, has_multiplayer, KcppVersion, friendlymodelname, friendlysdmodelname, fullsdmodelpath, password, fullwhispermodelpath, ttsmodelpath, embeddingsmodelpath, has_audio_support, has_vision_support, mcp_connections
+    global savedata_obj, has_multiplayer, KcppVersion, friendlymodelname, friendlysdmodelname, fullsdmodelpath, password, fullwhispermodelpath, ttsmodelpath, embeddingsmodelpath, musicdiffusionmodelpath, musicllmmodelpath, has_audio_support, has_vision_support, mcp_connections
     has_llm = not (friendlymodelname=="inactive")
     has_txt2img = not (friendlysdmodelname=="inactive" or fullsdmodelpath=="")
     has_password = (password!="")
@@ -1258,11 +1297,12 @@ def get_capabilities():
     has_search = True if args.websearch else False
     has_tts = (ttsmodelpath!="")
     has_embeddings = (embeddingsmodelpath!="")
+    has_music = (musicdiffusionmodelpath!="" or musicllmmodelpath!="")
     has_guidance = True if args.enableguidance else False
     has_jinja = True if args.jinja else False
     has_mcp = True if (args.mcpfile and mcp_connections and len(mcp_connections) > 0) else False
     admin_type = (2 if args.admin and args.admindir and args.adminpassword else (1 if args.admin and args.admindir else 0))
-    return {"result":"KoboldCpp", "version":KcppVersion, "protected":has_password, "llm":has_llm, "txt2img":has_txt2img,"vision":has_vision_support,"audio":has_audio_support,"transcribe":has_whisper,"multiplayer":has_multiplayer,"websearch":has_search,"tts":has_tts, "embeddings":has_embeddings, "savedata":(savedata_obj is not None), "admin": admin_type, "guidance": has_guidance, "jinja": has_jinja, "mcp":has_mcp}
+    return {"result":"KoboldCpp", "version":KcppVersion, "protected":has_password, "llm":has_llm, "txt2img":has_txt2img,"vision":has_vision_support,"audio":has_audio_support,"transcribe":has_whisper,"multiplayer":has_multiplayer,"websearch":has_search,"tts":has_tts, "embeddings":has_embeddings, "music":has_music, "savedata":(savedata_obj is not None), "admin": admin_type, "guidance": has_guidance, "jinja": has_jinja, "mcp":has_mcp}
 
 def dump_gguf_metadata(file_path): #if you're gonna copy this into your own project at least credit concedo
     chunk_size = 1024*1024*12  # read first 12mb of file
@@ -2069,7 +2109,7 @@ def sd_quant_option(value):
     except Exception:
         return 0
 
-def sd_load_model(model_filename,vae_filename,lora_filename,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename):
+def sd_load_model(model_filename,vae_filename,lora_filenames,t5xxl_filename,clip1_filename,clip2_filename,photomaker_filename,upscaler_filename):
     global args
     inputs = sd_load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
@@ -2092,7 +2132,12 @@ def sd_load_model(model_filename,vae_filename,lora_filename,t5xxl_filename,clip1
     inputs.taesd = True if args.sdvaeauto else False
     inputs.tiled_vae_threshold = args.sdtiledvae
     inputs.vae_filename = vae_filename.encode("UTF-8")
-    inputs.lora_filename = lora_filename.encode("UTF-8")
+    for n in range(lora_filenames_max):
+        if n >= len(lora_filenames):
+            inputs.lora_filenames[n] = "".encode("UTF-8")
+        else:
+            inputs.lora_filenames[n] = lora_filenames[n].encode("UTF-8")
+
     inputs.lora_multiplier = args.sdloramult
     inputs.t5xxl_filename = t5xxl_filename.encode("UTF-8")
     inputs.clip1_filename = clip1_filename.encode("UTF-8")
@@ -2167,6 +2212,7 @@ def gendefaults_parse_meta_field(input_str):
         'sampler': 'sampler_name',
         'sampling-method': 'sampler_name',
         'timestep-shift': 'shifted_timestep',
+        'flow-shift': 'flow_shift',
     }
     if not isinstance(input_str, str) or not input_str.strip():
         return {}
@@ -2235,6 +2281,7 @@ def sd_generate(genparams):
     cfg_scale = tryparsefloat(genparams.get("cfg_scale", 5),5)
     distilled_guidance = tryparsefloat(genparams.get("distilled_guidance", None), None)
     shifted_timestep = tryparseint(genparams.get("shifted_timestep", None), None)
+    flow_shift = tryparsefloat(genparams.get("flow_shift", None), None)
     sample_steps = tryparseint(genparams.get("steps", 20),20)
     width = tryparseint(genparams.get("width", 512),512)
     height = tryparseint(genparams.get("height", 512),512)
@@ -2258,6 +2305,8 @@ def sd_generate(genparams):
         distilled_guidance = None # fall back to the default
     if shifted_timestep is not None and (shifted_timestep < 0 or shifted_timestep > 1000):
         shifted_timestep = None # fall back to the default
+    if flow_shift is not None and flow_shift < 0:
+        flow_shift = None # fall back to the default
     sample_steps = (1 if sample_steps < 1 else (forced_steplimit if sample_steps > forced_steplimit else sample_steps))
     vid_req_frames = (1 if vid_req_frames < 1 else (100 if vid_req_frames > 100 else vid_req_frames))
 
@@ -2283,6 +2332,8 @@ def sd_generate(genparams):
     inputs.denoising_strength = denoising_strength
     if shifted_timestep is not None:
         inputs.shifted_timestep = shifted_timestep
+    if flow_shift is not None:
+        inputs.flow_shift = flow_shift
     inputs.sample_steps = sample_steps
     inputs.width = width
     inputs.height = height
@@ -2375,14 +2426,14 @@ def tts_prepare_voice_json(jsonstr):
         return None
 
 def tts_generate(genparams):
-    global args
+    global args, voicebank, voicelist
     prompt = genparams.get("input", genparams.get("text", ""))
     prompt = prompt.strip()
     voice = 1
-    speaker_json = tts_prepare_voice_json(genparams.get("speaker_json","")) #handle custom cloned voices
+    speaker_json = tts_prepare_voice_json(genparams.get("speaker_json","")) #handle custom json voices
     voicestr = genparams.get("voice", genparams.get("speaker_wav", ""))
     oai_voicemap = ["alloy","onyx","echo","nova","shimmer"] # map to kcpp defaults
-    voice_mapping = ["kobo","cheery","sleepy","shouty","chatty"]
+    voice_mapping = voicelist
     normalized_voice = voicestr.strip().lower() if voicestr else ""
     if normalized_voice.endswith(".wav"):
         normalized_voice = normalized_voice[:-4]
@@ -2409,6 +2460,10 @@ def tts_generate(genparams):
     else:
         inputs.custom_speaker_text = "".encode("UTF-8")
         inputs.custom_speaker_data = "".encode("UTF-8")
+    reference_audio = voicebank.get(voicestr,"") #for cloned voices in qwen3tts
+    if reference_audio and reference_audio.startswith("data:audio"):
+        reference_audio = reference_audio.split(",", 1)[1]
+    inputs.reference_audio = reference_audio.encode("UTF-8")
     ret = handle.tts_generate(inputs)
     outstr = ""
     if ret.status==1:
@@ -2459,6 +2514,47 @@ def embeddings_generate(genparams):
         tokarrs.append(tokarr)
         tokcnt += tmpcnt
     return {"count":tokcnt, "data":tokarrs}
+
+def music_load_model(musicllm,musicembedding,musicdiffusion,musicvae):
+    global args
+    inputs = music_load_model_inputs()
+    inputs.musicllm_filename = musicllm.encode("UTF-8")
+    inputs.musicembedding_filename = musicembedding.encode("UTF-8")
+    inputs.musicdiffusion_filename = musicdiffusion.encode("UTF-8")
+    inputs.musicvae_filename = musicvae.encode("UTF-8")
+    inputs.lowvram = True if args.musiclowvram else False
+    inputs = set_backend_props(inputs)
+    ret = handle.music_load_model(inputs)
+    return ret
+
+def music_generate_codes(genparams):
+    global args
+    input_json = json.dumps(genparams)
+    inputs = music_generation_inputs()
+    inputs.is_planner_mode = True
+    inputs.stereo = genparams.get('stereo', False)
+    inputs.gen_codes =  genparams.get('gen_codes', False)
+    inputs.input_json = input_json.encode("UTF-8")
+    ret = handle.music_generate(inputs)
+    outstr = ""
+    if ret.status==1:
+        outstr = ret.music_output_json.decode("UTF-8","ignore")
+        outstr = json.dumps(json.loads(outstr))
+    return outstr
+
+def music_generate_audio(genparams):
+    global args
+    input_json = json.dumps(genparams)
+    inputs = music_generation_inputs()
+    inputs.is_planner_mode = False
+    inputs.stereo = genparams.get('stereo', False)
+    inputs.gen_codes =  genparams.get('gen_codes', False)
+    inputs.input_json = input_json.encode("UTF-8")
+    ret = handle.music_generate(inputs)
+    outstr = ""
+    if ret.status==1:
+        outstr = ret.data.decode("UTF-8","ignore")
+    return outstr
 
 def tokenize_ids(countprompt,tcaddspecial):
     rawcountdata = handle.token_count(countprompt.encode("UTF-8"),tcaddspecial)
@@ -3264,7 +3360,11 @@ ws ::= | " " | "\n" [ \t]{0,20}
 
                     # If last message, add any tools calls after message content and before message end token if any
                     if message_index == len(messages_array):
-                        used_tool_json = determine_tool_json_to_use(genparams, messages_string, assistant_message_start, (message['role'] == "tool"))
+                        is_followup = (message['role'] == "tool")
+                        #small hack: if the current turn is assistant, but its short (e.g. a prefilled name), and the previous turn was tool, consider it followup as well
+                        if(not is_followup and message_index>1 and message['role'] == "assistant" and messages_array[message_index-2]['role']=="tool" and message['content'] and len(message['content']) < 100): #100 char limit
+                            is_followup = True
+                        used_tool_json = determine_tool_json_to_use(genparams, messages_string, assistant_message_start, is_followup)
 
                         if used_tool_json:
                             toolparamjson = None
@@ -3980,9 +4080,9 @@ Change Mode<br>
         self.wfile.write(finalhtml)
 
     def do_GET(self):
-        global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz
+        global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz, embedded_musicui, embedded_musicui_gz
         global last_req_time, start_time, cached_chat_template, has_vision_support, has_audio_support, has_whisper, friendlymodelname
-        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname
+        global savedata_obj, has_multiplayer, multiplayer_turn_major, multiplayer_turn_minor, multiplayer_story_data_compressed, multiplayer_dataformat, multiplayer_lastactive, maxctx, maxhordelen, friendlymodelname, lastuploadedcomfyimg, lastgeneratedcomfyimg, KcppVersion, totalgens, preloaded_story, exitcounter, currentusergenkey, friendlysdmodelname, fullsdmodelpath, password, friendlyembeddingsmodelname, voicelist
 
         clean_path = self.path.split("?")[0] #for cases where we do not want query params
         if clean_path=="/lcpp": #fix for svelte redirect issues, browser path needs to end with slash
@@ -4048,11 +4148,21 @@ Change Mode<br>
             caps = get_capabilities()
             response_body = (json.dumps(caps).encode())
 
-        elif clean_path.endswith(('/api/admin/list_options')): #used by admin to get info about a kcpp instance
+        elif clean_path.endswith(('/api/admin/list_options')):  # used by admin to get info about a kcpp instance
             opts = []
             if args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
                 dirpath = os.path.abspath(args.admindir)
-                opts = [f for f in sorted(os.listdir(dirpath)) if (f.endswith(".kcpps") or f.endswith(".kcppt") or f.endswith(".gguf")) and os.path.isfile(os.path.join(dirpath, f))]
+                valid_exts = (".kcpps", ".kcppt", ".gguf")
+                for entry in sorted(os.listdir(dirpath)): # Scan top-level directory
+                    full_path = os.path.join(dirpath, entry)
+                    if os.path.isfile(full_path) and entry.endswith(valid_exts): # If toplevel file
+                        opts.append(entry)
+                    elif os.path.isdir(full_path): #if dir, scan up to 1 level deep
+                        for subentry in sorted(os.listdir(full_path)):
+                            sub_full_path = os.path.join(full_path, subentry)
+                            if os.path.isfile(sub_full_path) and subentry.endswith(valid_exts):
+                                rel_path = os.path.join(entry, subentry)
+                                opts.append(rel_path)
                 opts.append("unload_model")
             response_body = (json.dumps(opts).encode())
 
@@ -4169,11 +4279,14 @@ Change Mode<br>
             pass
 
         elif clean_path.endswith('/speakers_list'): #xtts compatible
-            response_body = (json.dumps(["kobo","cheery","sleepy","shouty","chatty"]).encode()) #some random voices for them to enjoy
+            response_body = (json.dumps(voicelist).encode()) #some random voices for them to enjoy
         elif clean_path.endswith('/speakers'): #xtts compatible
-            response_body = (json.dumps([{"name":"kobo","voice_id":"kobo","preview_url":""},{"name":"cheery","voice_id":"cheery","preview_url":""},{"name":"sleepy","voice_id":"sleepy","preview_url":""},{"name":"shouty","voice_id":"shouty","preview_url":""},{"name":"chatty","voice_id":"chatty","preview_url":""}]).encode()) #some random voices for them to enjoy
+            tmplist = []
+            for itm in voicelist:
+                tmplist.append({"name":itm,"voice_id":itm,"preview_url":""})
+            response_body = (json.dumps(tmplist).encode()) #some random voices for them to enjoy
         elif clean_path.endswith('/v1/audio/voices') or clean_path=='/audio/voices':
-            response_body = (json.dumps({"status":"ok","voices":["kobo","cheery","sleepy","shouty","chatty"]}).encode()) #some random voices for them to enjoy
+            response_body = (json.dumps({"status":"ok","voices":voicelist}).encode()) #some random voices for them to enjoy
         elif clean_path.endswith('/get_tts_settings'): #xtts compatible
             response_body = (json.dumps({"temperature":0.75,"speed":1,"length_penalty":1,"repetition_penalty":1,"top_p":1,"top_k":4,"enable_text_splitting":True,"stream_chunk_size":100}).encode()) #some random voices for them to enjoy
 
@@ -4280,6 +4393,16 @@ Change Mode<br>
                 response_body = embedded_kcpp_sdui
             else:
                 response_body = ("KoboldCpp API is running, but KCPP SDUI is not loaded").encode()
+
+        elif clean_path.startswith(("/musicui")):
+            content_type = 'text/html'
+            if supports_gzip and embedded_musicui_gz is not None:
+                response_body = embedded_musicui_gz
+                content_encoding = 'gzip'
+            elif embedded_musicui is not None:
+                response_body = embedded_musicui
+            else:
+                response_body = ("KoboldCpp API is running, but KCPP MusicUI is not loaded").encode()
 
         elif clean_path=="/v1":
             content_type = 'text/html'
@@ -4646,13 +4769,26 @@ Change Mode<br>
                         resp = {"success": True}
                     else:
                         dirpath = os.path.abspath(args.admindir)
-                        targetfilepath = os.path.join(dirpath, targetfile)
-                        opts = [f for f in os.listdir(dirpath) if (f.lower().endswith(".kcpps") or f.lower().endswith(".kcppt") or f.lower().endswith(".gguf")) and os.path.isfile(os.path.join(dirpath, f))]
-                        if targetfile in opts and os.path.exists(targetfilepath):
-                            global_memory["restart_override_config_target"] = ""
+                        valid_exts = (".kcpps", ".kcppt", ".gguf")
+                        allowed_files = []
+                        with os.scandir(dirpath) as entries:  # Scan top-level and 1-level deep
+                            for entry in entries:
+                                if entry.is_file() and entry.name.lower().endswith(valid_exts):
+                                    allowed_files.append(entry.name)
+                                elif entry.is_dir():
+                                    subdir_name = entry.name
+                                    with os.scandir(entry.path) as subentries:
+                                        for subentry in subentries:
+                                            if subentry.is_file() and subentry.name.lower().endswith(valid_exts):
+                                                allowed_files.append(os.path.join(subdir_name, subentry.name))
+                        # Normalize requested target path
+                        targetfilepath = os.path.abspath(os.path.join(dirpath, targetfile))
+
+                        if (targetfile in allowed_files and os.path.commonpath([dirpath, targetfilepath]) == dirpath and os.path.exists(targetfilepath)):
+                            global_memory["restart_override_config_target"] = "" # Jail enforcement
                             if targetfile.lower().endswith(".gguf") and overrideconfig:
-                                overrideconfigfilepath = os.path.join(dirpath, overrideconfig)
-                                if overrideconfig and overrideconfig in opts and os.path.exists(overrideconfigfilepath):
+                                overrideconfigfilepath = os.path.abspath(os.path.join(dirpath, overrideconfig))
+                                if (overrideconfig in allowed_files and os.path.commonpath([dirpath, overrideconfigfilepath]) == dirpath and os.path.exists(overrideconfigfilepath)):
                                     print(f"Admin: Override config set to {overrideconfig}")
                                     global_memory["restart_override_config_target"] = overrideconfig
                             print(f"Admin: Received request to reload config to {targetfile}")
@@ -4791,6 +4927,8 @@ Change Mode<br>
             is_transcribe = False
             is_tts = False
             is_embeddings = False
+            is_music_codes = False
+            is_music_audio = False
             response_body = None
             use_jinja = args.jinja
 
@@ -4887,13 +5025,17 @@ Change Mode<br>
                 is_tts = True
             elif self.path.endswith('/api/extra/embeddings') or self.path.endswith('/v1/embeddings'):
                 is_embeddings = True
+            elif self.path.endswith('/api/extra/music/prepare'):
+                is_music_codes = True
+            elif self.path.endswith('/api/extra/music/generate'):
+                is_music_audio = True
 
             if response_body is not None:
                 self.send_response(response_code)
                 self.send_header('content-length', str(len(response_body)))
                 self.end_headers(content_type='application/json')
                 self.wfile.write(response_body)
-            elif is_imggen or is_img_upscale or is_transcribe or is_tts or is_embeddings or api_format > 0:
+            elif is_imggen or is_img_upscale or is_transcribe or is_tts or is_embeddings or is_music_codes or is_music_audio or api_format > 0:
                 global last_req_time
                 last_req_time = time.time()
 
@@ -5198,6 +5340,37 @@ Change Mode<br>
                         print("Create Embeddings: The response could not be sent, maybe connection was terminated?")
                         time.sleep(0.2) #short delay
                     return
+                elif is_music_codes:
+                    try:
+                        gendat = music_generate_codes(genparams)
+                        genresp = (json.dumps({"error":"music code generation failed"}).encode())
+                        if gendat:
+                            genresp = gendat.encode()
+                        self.send_response(200)
+                        self.send_header('content-length', str(len(genresp)))
+                        self.end_headers(content_type='application/json')
+                        self.wfile.write(genresp)
+                    except Exception as ex:
+                        utfprint(ex,1)
+                        print("Music Gen Codes: The response could not be sent, maybe connection was terminated?")
+                        time.sleep(0.2) #short delay
+                    return
+                elif is_music_audio:
+                    try:
+                        gendat = music_generate_audio(genparams)
+                        wav_data = b''
+                        if gendat:
+                            wav_data = base64.b64decode(gendat) # Decode the Base64 string into binary data
+                        self.send_response(200)
+                        self.send_header('content-length', str(len(wav_data)))  # Set content length
+                        self.send_header('Content-Disposition', 'attachment; filename="output.wav"')
+                        self.end_headers(content_type='audio/wav')
+                        self.wfile.write(wav_data) # Write the binary WAV data to the response
+                    except Exception as ex:
+                        utfprint(ex,1)
+                        print("Music Gen Audio: The response could not be sent, maybe connection was terminated?")
+                        time.sleep(0.2) #short delay
+                    return
 
         finally:
             time.sleep(0.05)
@@ -5311,7 +5484,7 @@ def RunServerMultiThreaded(addr, port, server_handler):
             sys.exit(0)
 
 # Based on https://github.com/mathgeniuszach/xdialog/blob/main/xdialog/zenity_dialogs.py - MIT license | - Expanded version by Henk717
-def zenity(filetypes=None, initialdir="", initialfile="", **kwargs) -> Tuple[int, str]:
+def zenity(filetypes=None, initialdir="", initialfile="", multiple=False, **kwargs) -> Tuple[int, object]:
     global zenity_recent_dir, zenity_permitted
 
     if not zenity_permitted:
@@ -5376,6 +5549,10 @@ def zenity(filetypes=None, initialdir="", initialfile="", **kwargs) -> Tuple[int
     initialpath = os.path.join(initialdir, initialfile)
     args.append(f'--filename={initialpath}')
 
+    if multiple:
+        args.append("--multiple")
+        args.append("--separator=|")
+
     clean_env = os.environ.copy()
     clean_env.pop("LD_LIBRARY_PATH", None)
     clean_env["PATH"] = "/usr/bin:/bin"
@@ -5390,15 +5567,18 @@ def zenity(filetypes=None, initialdir="", initialfile="", **kwargs) -> Tuple[int
     result = procres.stdout.decode('utf-8').strip()
     if procres.returncode==0 and result:
         directory = result
-        if not os.path.isdir(result):
-            directory = os.path.dirname(result)
+        if multiple:
+            result = tuple(result.split("|"))
+            directory = result[0]
+        if not os.path.isdir(directory):
+            directory = os.path.dirname(directory)
         zenity_recent_dir = directory
     return (procres.returncode, result)
 
 # note: In this section we wrap around file dialogues to allow for zenity
 def zentk_askopenfilename(**options):
     try:
-        result = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), title=options.get("title"))[1]
+        result = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), multiple=False, title=options.get("title"))[1]
         if result and not os.path.isfile(result):
             print("A folder was selected while we need a file, ignoring selection.")
             return ''
@@ -5407,9 +5587,21 @@ def zentk_askopenfilename(**options):
         result = askopenfilename(**options)
     return result
 
+def zentk_askopenfilenames(**options):
+    try:
+        result = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), multiple=True, title=options.get("title"))[1]
+        for itm in result:
+            if itm and not os.path.isfile(itm):
+                print("A folder was selected while we need a file, ignoring selection.")
+                return ''
+    except Exception:
+        from tkinter.filedialog import askopenfilenames
+        result = askopenfilenames(**options)
+    return result
+
 def zentk_askdirectory(**options):
     try:
-        result = zenity(initialdir=options.get("initialdir"), title=options.get("title"), directory=True)[1]
+        result = zenity(initialdir=options.get("initialdir"), multiple=False, title=options.get("title"), directory=True)[1]
     except Exception:
         from tkinter.filedialog import askdirectory
         result = askdirectory(**options)
@@ -5417,12 +5609,24 @@ def zentk_askdirectory(**options):
 
 def zentk_asksaveasfilename(**options):
     try:
-        result = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), initialfile=options.get("initialfile"), title=options.get("title"), save=True)[1]
+        result = zenity(filetypes=options.get("filetypes"), initialdir=options.get("initialdir"), initialfile=options.get("initialfile"), multiple=False, title=options.get("title"), save=True)[1]
     except Exception:
         from tkinter.filedialog import asksaveasfilename
         result = asksaveasfilename(**options)
     return result
 ### End of MIT license
+
+def save_config_dict(filename, savdict, template):
+    filenamestr = str(filename).strip()
+    if not filenamestr.endswith(".kcpps") and not template:
+        filenamestr += ".kcpps"
+    if not filenamestr.endswith(".kcppt") and template:
+        filenamestr += ".kcppt"
+    do_not_save = {'analyze', 'config', 'exportconfig', 'exporttemplate', 'testmemory', 'unpack', 'version'}
+    filtered = {k: v for k, v in savdict.items() if k not in do_not_save}
+    with open(filenamestr, 'w') as file:
+        file.write(json.dumps(filtered,indent=2))
+    return filenamestr
 
 # note: customtkinter-5.2.0
 def show_gui():
@@ -5500,7 +5704,7 @@ def show_gui():
             if dlfile:
                 args.model_param = dlfile
             load_config_cli(args.model_param)
-        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.mcpfile and not args.nomodel:
+        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.musicdiffusion and not args.musicllm and not args.mcpfile and not args.nomodel:
             global exitcounter
             exitcounter = 999
             exit_with_error(2,"No gguf model or kcpps file was selected. Exiting.")
@@ -5521,6 +5725,7 @@ def show_gui():
     windowwidth = original_windowwidth
     windowheight = original_windowheight
     ctk.set_appearance_mode("dark")
+    ctk.deactivate_automatic_dpi_awareness()
     root = ctk.CTk(fg_color="#2b2b2b")
     if corrupt_scaler:
         print("Adjusting tk scaling to try and fix scaling issues...")
@@ -5699,7 +5904,7 @@ def show_gui():
     jinja_tools_var = ctk.IntVar(value=0)
     moeexperts_var = ctk.StringVar(value=str(-1))
     moecpu_var = ctk.StringVar(value=str(0))
-    defaultgenamt_var = ctk.StringVar(value=str(896))
+    defaultgenamt_var = ctk.StringVar(value=str(default_genlen))
     genlimit_var = ctk.StringVar(value=str(0))
     nobostoken_var = ctk.IntVar(value=0)
     override_kv_var = ctk.StringVar(value="")
@@ -5768,6 +5973,13 @@ def show_gui():
     ttsgpu_var = ctk.IntVar(value=0)
     tts_threads_var = ctk.StringVar(value=str(default_threads))
     ttsmaxlen_var = ctk.StringVar(value=str(default_ttsmaxlen))
+    tts_dir_var = ctk.StringVar()
+
+    musicllm_var = ctk.StringVar()
+    musicembeddings_var = ctk.StringVar()
+    musicdiffusion_var = ctk.StringVar()
+    musicvae_var = ctk.StringVar()
+    musiclowvram_var = ctk.IntVar(value=0)
 
     embeddings_model_var = ctk.StringVar()
     embeddings_ctx_var = ctk.StringVar(value=str(""))
@@ -5861,7 +6073,7 @@ def show_gui():
         return entry, label
 
     #file dialog types: 0=openfile,1=savefile,2=opendir
-    def makefileentry(parent, text, searchtext, var, row=0, width=200, filetypes=[], onchoosefile=None, singlerow=False, singlecol=True, dialog_type=0, tooltiptxt=""):
+    def makefileentry(parent, text, searchtext, var, row=0, width=200, filetypes=[], onchoosefile=None, singlerow=False, singlecol=True, dialog_type=0, tooltiptxt="", multiple=False):
         label = makelabel(parent, text, row,0,tooltiptxt,columnspan=3)
         def getfilename(var, text):
             initialDir = os.path.dirname(var.get())
@@ -5877,7 +6089,11 @@ def show_gui():
                     fnam = str(fnam).strip()
                     fnam = f"{fnam}.jsondb" if ".jsondb" not in fnam.lower() else fnam
             else:
-                fnam = zentk_askopenfilename(title=text,filetypes=filetypes, initialdir=initialDir)
+                if multiple:
+                    fnam = zentk_askopenfilenames(title=text,filetypes=filetypes, initialdir=initialDir)
+                    fnam = "|".join(fnam)
+                else:
+                    fnam = zentk_askopenfilename(title=text,filetypes=filetypes, initialdir=initialDir)
             if fnam:
                 var.set(fnam)
                 if onchoosefile:
@@ -6092,7 +6308,10 @@ def show_gui():
         pass
 
     def changed_autofit(*args):
+        global runmode_untouched
+        orig_rmu = runmode_untouched
         changerunmode(1,1,1)
+        runmode_untouched = orig_rmu
         changed_gpulayers_estimate()
 
     def changed_gpulayers_estimate(*args):
@@ -6285,7 +6504,7 @@ def show_gui():
         "Use ContextShift": [contextshift_var, "Uses Context Shifting to reduce reprocessing.\nRecommended. Check the wiki for more info."],
         "Remote Tunnel": [remotetunnel_var,  "Creates a trycloudflare tunnel.\nAllows you to access koboldcpp from other devices over an internet URL."],
         "Use FlashAttention": [flashattention_var, "Enable flash attention for GGUF models."],
-        "AutoFit": [autofit_var, "Automatically attempt to fit the model in the best possible way. Overrides everything else.\nNot recommended for multi model setups. Experimental."],
+        "Force AutoFit": [autofit_var, "Automatically attempt to fit the model in the best possible way. Overrides everything else.\nNot recommended for multi model setups. Experimental."],
         "Quiet Mode": [quietmode, "Prevents all generation related terminal output from being displayed."]
     }
 
@@ -6354,7 +6573,7 @@ def show_gui():
 
     makecheckbox(hardware_tab, "Use FlashAttention", flashattention_var, 100, command=toggleflashattn,  tooltiptxt="Enable flash attention for GGUF models.")
 
-    makecheckbox(hardware_tab, "AutoFit", autofit_var, 100,0,command=changed_autofit,padx=160, tooltiptxt="Automatically attempt to fit the model in the best possible way. Overrides everything else.\nNot recommended for multi model setups. Experimental.")
+    makecheckbox(hardware_tab, "Force AutoFit", autofit_var, 100,0,command=changed_autofit,padx=160, tooltiptxt="Automatically attempt to fit the model in the best possible way. Overrides everything else.\nNot recommended for multi model setups. Experimental.")
     ctk.CTkButton(hardware_tab , text = "Run Benchmark", command = guibench ).grid(row=110,column=0, stick="nw", padx= 8, pady=2)
 
 
@@ -6517,7 +6736,7 @@ def show_gui():
     makelabelcombobox(images_tab, "Compress Weights: ", sd_quant_var, 8, width=(60), padx=(126), labelpadx=8, tooltiptxt="Quantizes the SD model weights to save memory.\nHigher levels save more memory, and cause more quality degradation.", values=sd_quant_choices)
     sd_quant_var.trace_add("write", changed_gpulayers_estimate)
 
-    makefileentry(images_tab, "Image LoRA:", "Select SD lora file",sd_lora_var, 20, width=160, singlerow=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded. Should be unquantized!")
+    makefileentry(images_tab, "Image LoRA:", "Select SD lora file",sd_lora_var, 20, width=160, singlerow=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded. Should be unquantized!", multiple=True)
     makelabelentry(images_tab, "Multiplier:" , sd_loramult_var, 20, 50,padx=(390),singleline=True,tooltip="What mutiplier value to apply the SD LoRA with.",labelpadx=(330))
 
     makefileentry(images_tab, "T5-XXL File:", "Select T5-XXL model file (SD3, Flux, WAN)",sd_t5xxl_var, 24, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
@@ -6552,12 +6771,19 @@ def show_gui():
     whisper_model_var.trace_add("write", gui_changed_modelfile)
     makefileentry(audio_tab, "TTS Model (Text-To-Speech):", "Select TTS GGUF Model File", tts_model_var, 3, width=280, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select a TTS GGUF model file on disk to be loaded for Narration.")
     tts_model_var.trace_add("write", gui_changed_modelfile)
-    makelabelentry(audio_tab, "TTS Threads:" , tts_threads_var, 5, 50,padx=290,singleline=True,tooltip="How many threads to use during TTS generation.\nIf left blank, uses same value as threads.")
-    makelabelentry(audio_tab, "TTS Max Tokens:" , ttsmaxlen_var, 7, 50,padx=290,singleline=True,tooltip="Max allowed audiotokens to generate per TTS request.")
-    makecheckbox(audio_tab, "TTS Use GPU", ttsgpu_var, 9, 0,tooltiptxt="Uses the GPU for TTS.")
+    makelabelentry(audio_tab, "TTS Threads:" , tts_threads_var, 5, 50,padx=100,singleline=True,tooltip="How many threads to use during TTS generation.\nIf left blank, uses same value as threads.")
+    makelabelentry(audio_tab, "TTS Max Tokens:" , ttsmaxlen_var, 5, 50,padx=300,singleline=True,tooltip="Max allowed audiotokens to generate per TTS request.", labelpadx=190)
+    makecheckbox(audio_tab, "TTS Use GPU", ttsgpu_var, 9, 0,tooltiptxt="Uses the GPU for TTS. Currently only works on OuteTTS.")
     ttsgpu_var.trace_add("write", gui_changed_modelfile)
-    makefileentry(audio_tab, "WavTokenizer Model (Required for OuteTTS):", "Select WavTokenizer GGUF Model File", wavtokenizer_var, 11, width=280, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select a WavTokenizer GGUF model file on disk to be loaded for Narration.")
+    makefileentry(audio_tab, "WavTokenizer Model (Required for some models):", "Select WavTokenizer GGUF Model File", wavtokenizer_var, 11, width=280, filetypes=[("*.gguf","*.gguf")], tooltiptxt="Select a WavTokenizer GGUF model file on disk to be loaded for Narration.")
     wavtokenizer_var.trace_add("write", gui_changed_modelfile)
+    makefileentry(audio_tab, "TTS Voices Dir:", "Select directory containing voices for voice cloning", tts_dir_var, 20, width=280, singlerow=True, dialog_type=2, tooltiptxt="Select directory containing voices for voice cloning")
+
+    makefileentry(audio_tab, "MusicLLM:", "Select music LLM model (e.g acestep-5Hz-lm-0.6B)", musicllm_var, 30, width=280, singlerow=True, dialog_type=0, tooltiptxt="Select music LLM model (e.g acestep-5Hz-lm)")
+    makefileentry(audio_tab, "MusicEmbeds:", "Select music embedding model (e.g Qwen3-Embedding-0.6B)", musicembeddings_var, 32, width=280, singlerow=True, dialog_type=0, tooltiptxt="Select music embedding model (e.g Qwen3-Embedding-0.6B)")
+    makefileentry(audio_tab, "MusicDiffuser:", "Select music diffusion (DiT) model (e.g acestep-v15-turbo)", musicdiffusion_var, 34, width=280, singlerow=True, dialog_type=0, tooltiptxt="Select music diffusion (DiT) model (e.g acestep-v15-turbo)")
+    makefileentry(audio_tab, "MusicVAE:", "Select music VAE model", musicvae_var, 36, width=280, singlerow=True, dialog_type=0, tooltiptxt="Select music VAE model")
+    makecheckbox(audio_tab, "Music Low VRAM", musiclowvram_var, 38, 0,tooltiptxt="Unload music models when not in use.")
 
     admin_tab = tabcontent["Admin"]
     def toggleadmin(a,b,c):
@@ -6647,7 +6873,7 @@ def show_gui():
 
     # launch
     def guilaunch():
-        if model_var.get() == "" and sd_model_var.get() == "" and whisper_model_var.get() == "" and tts_model_var.get() == "" and embeddings_model_var.get() == "" and nomodel.get()!=1:
+        if model_var.get() == "" and sd_model_var.get() == "" and whisper_model_var.get() == "" and tts_model_var.get() == "" and embeddings_model_var.get() == "" and musicdiffusion_var.get() == "" and musicllm_var.get() == "" and nomodel.get()!=1:
             tmp = zentk_askopenfilename(title="Select ggml model .bin or .gguf file")
             model_var.set(tmp)
         nonlocal nextstate
@@ -6752,7 +6978,7 @@ def show_gui():
             args.overridenativecontext = 0
         args.moeexperts = int(moeexperts_var.get()) if moeexperts_var.get()!="" else -1
         args.moecpu = int(moecpu_var.get()) if moecpu_var.get()!="" else 0
-        args.defaultgenamt = int(defaultgenamt_var.get()) if defaultgenamt_var.get()!="" else 896
+        args.defaultgenamt = int(defaultgenamt_var.get()) if defaultgenamt_var.get()!="" else default_genlen
         args.genlimit = int(genlimit_var.get()) if genlimit_var.get()!="" else 0
         args.nobostoken = (nobostoken_var.get()==1)
         args.jinja = (jinja_var.get()==1)
@@ -6845,10 +7071,10 @@ def show_gui():
             args.sdupscaler = sd_upscaler_var.get()
         args.sdquant = sd_quant_option(sd_quant_var.get())
         if sd_lora_var.get() != "":
-            args.sdlora = sd_lora_var.get()
+            args.sdlora = [item.strip() for item in sd_lora_var.get().split("|") if item]
             args.sdloramult = float(sd_loramult_var.get())
         else:
-            args.sdlora = ""
+            args.sdlora = None
 
         if gen_defaults_var.get() != "":
             args.gendefaults = gen_defaults_var.get()
@@ -6870,6 +7096,13 @@ def show_gui():
             args.ttswavtokenizer = wavtokenizer_var.get()
             args.ttsgpu = (ttsgpu_var.get()==1)
             args.ttsmaxlen = (default_ttsmaxlen if ttsmaxlen_var.get()=="" else int(ttsmaxlen_var.get()))
+            args.ttsdir = tts_dir_var.get()
+
+        args.musicllm = musicllm_var.get()
+        args.musicembeddings = musicembeddings_var.get()
+        args.musicdiffusion = musicdiffusion_var.get()
+        args.musicvae = musicvae_var.get()
+        args.musiclowvram = musiclowvram_var.get()==1
 
         args.admin = (admin_var.get()==1 and not args.cli)
         args.admindir = admin_dir_var.get()
@@ -7093,8 +7326,13 @@ def show_gui():
         sd_upscaler_var.set(dict["sdupscaler"] if ("sdupscaler" in dict and dict["sdupscaler"]) else "")
         sd_vaeauto_var.set(1 if ("sdvaeauto" in dict and dict["sdvaeauto"]) else 0)
         sd_tiled_vae_var.set(str(dict["sdtiledvae"]) if ("sdtiledvae" in dict and dict["sdtiledvae"]) else str(default_vae_tile_threshold))
-
-        sd_lora_var.set(dict["sdlora"] if ("sdlora" in dict and dict["sdlora"]) else "")
+        if "sdlora" in dict and dict["sdlora"]:
+            if isinstance((dict["sdlora"]), list):
+                sd_lora_var.set("|".join(dict["sdlora"]))
+            else:
+                sd_lora_var.set(dict["sdlora"] if ("sdlora" in dict and dict["sdlora"]) else "")
+        else:
+            sd_lora_var.set("")
         sd_loramult_var.set(str(dict["sdloramult"]) if ("sdloramult" in dict and dict["sdloramult"]) else "1.0")
         gen_defaults_var.set(dict["gendefaults"] if ("gendefaults" in dict and dict["gendefaults"]) else "")
         gen_defaults_overwrite_var.set(1 if "gendefaultsoverwrite" in dict and dict["gendefaultsoverwrite"] else 0)
@@ -7106,6 +7344,13 @@ def show_gui():
         wavtokenizer_var.set(dict["ttswavtokenizer"] if ("ttswavtokenizer" in dict and dict["ttswavtokenizer"]) else "")
         ttsgpu_var.set(dict["ttsgpu"] if ("ttsgpu" in dict) else 0)
         ttsmaxlen_var.set(str(dict["ttsmaxlen"]) if ("ttsmaxlen" in dict and dict["ttsmaxlen"]) else str(default_ttsmaxlen))
+        tts_dir_var.set(dict["ttsdir"] if ("ttsdir" in dict and dict["ttsdir"]) else "")
+
+        musicllm_var.set(dict["musicllm"] if ("musicllm" in dict and dict["musicllm"]) else "")
+        musicembeddings_var.set(dict["musicembeddings"] if ("musicembeddings" in dict and dict["musicembeddings"]) else "")
+        musicdiffusion_var.set(dict["musicdiffusion"] if ("musicdiffusion" in dict and dict["musicdiffusion"]) else "")
+        musicvae_var.set(dict["musicvae"] if ("musicvae" in dict and dict["musicvae"]) else "")
+        musiclowvram_var.set(dict["musiclowvram"] if ("musiclowvram" in dict) else 0)
 
         embeddings_model_var.set(dict["embeddingsmodel"] if ("embeddingsmodel" in dict and dict["embeddingsmodel"]) else "")
         embeddings_ctx_var.set(str(dict["embeddingsmaxctx"]) if ("embeddingsmaxctx" in dict and dict["embeddingsmaxctx"]) else "")
@@ -7131,12 +7376,7 @@ def show_gui():
         filename = zentk_asksaveasfilename(filetypes=file_type, defaultextension=".kcpps",title="Save kcpps settings config file")
         if not filename:
             return
-        filenamestr = str(filename).strip()
-        if not filenamestr.lower().endswith(".kcpps"):
-            filenamestr += ".kcpps"
-        file = open(filenamestr, 'w')
-        file.write(json.dumps(savdict,indent=2))
-        file.close()
+        save_config_dict(filename, savdict, False)
         pass
 
     def load_config_gui(): #this is used to populate the GUI with a config file, whereas load_config_cli simply overwrites cli args
@@ -7245,7 +7485,7 @@ def show_gui():
         kcpp_exporting_template = False
         export_vars()
 
-        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.mcpfile and not args.nomodel:
+        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.musicdiffusion and not args.musicllm and not args.mcpfile and not args.nomodel:
             exitcounter = 999
             print("")
             time.sleep(0.5)
@@ -7563,6 +7803,8 @@ def convert_invalid_args(args):
         dict["gendefaults"] = dict["sdgendefaults"]
     if "flashattention" in dict and "noflashattention" not in dict:
         dict["noflashattention"] = not dict["flashattention"]
+    if "sdlora" in dict and isinstance(dict["sdlora"], str):
+        dict["sdlora"] = ([dict["sdlora"]] if dict["sdlora"] else None)
     return args
 
 def setuptunnel(global_memory, has_sd):
@@ -7731,14 +7973,7 @@ def save_config_cli(filename, template):
         savdict["istemplate"] = False
     if filename is None:
         return
-    filenamestr = str(filename).strip()
-    if not filenamestr.endswith(".kcpps") and not template:
-        filenamestr += ".kcpps"
-    if not filenamestr.endswith(".kcppt") and template:
-        filenamestr += ".kcppt"
-    file = open(filenamestr, 'w')
-    file.write(json.dumps(savdict))
-    file.close()
+    filenamestr = save_config_dict(filename, savdict, template)
     print(f"\nSaved configuration file as {filenamestr}\nIt can be loaded with --config [filename] in future.")
     pass
 
@@ -8098,13 +8333,6 @@ def main(launch_args, default_args):
         analyze_gguf_model_wrapper(args.analyze)
         return
 
-    if args.exportconfig and args.exportconfig!="":
-        save_config_cli(args.exportconfig,False)
-        return
-    if args.exporttemplate and args.exporttemplate!="":
-        save_config_cli(args.exporttemplate,True)
-        return
-
     if args.config and len(args.config)==1: #handle initial config loading for launch
         cfgname = args.config[0]
         if isinstance(cfgname, str):
@@ -8127,8 +8355,15 @@ def main(launch_args, default_args):
             args.model_param = dlfile
         load_config_cli(args.model_param)
 
+    if args.exportconfig:
+        save_config_cli(args.exportconfig,False)
+        return
+    if args.exporttemplate:
+        save_config_cli(args.exporttemplate,True)
+        return
+
     # show the GUI launcher if a model was not provided
-    if args.showgui or (not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.mcpfile and not args.nomodel):
+    if args.showgui or (not args.model_param and not args.sdmodel and not args.whispermodel and not args.ttsmodel and not args.embeddingsmodel and not args.musicdiffusion and not args.musicllm and not args.mcpfile and not args.nomodel):
         #give them a chance to pick a file
         print("For command line arguments, please refer to --help")
         print("***")
@@ -8209,8 +8444,14 @@ def main(launch_args, default_args):
                         time.sleep(0.5) #sleep for 0.5s then restart
                         if args.admin and args.admindir:
                             dirpath = os.path.abspath(args.admindir)
-                            targetfilepath = os.path.join(dirpath, restart_target)
-                            targetfilepath2 = os.path.join(dirpath, restart_override_config_target)
+                            targetfilepath = os.path.abspath(os.path.join(dirpath, restart_target))
+                            targetfilepath2 = os.path.abspath(os.path.join(dirpath, restart_override_config_target)) if restart_override_config_target else ""
+                            if os.path.commonpath([dirpath, targetfilepath]) != dirpath: # Enforce admindir jail
+                                print("Security: Invalid restart target path.")
+                                continue
+                            if targetfilepath2 and os.path.commonpath([dirpath, targetfilepath2]) != dirpath:
+                                print("Security: Invalid override config path.")
+                                continue
                             defaultargs = vars(default_args)
                             if (os.path.exists(targetfilepath) or restart_target=="unload_model") and (restart_override_config_target=="" or os.path.exists(targetfilepath2)):
                                 print("Terminating old process...")
@@ -8249,8 +8490,8 @@ def main(launch_args, default_args):
                 input()
 
 def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
-    global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz, start_time, exitcounter, global_memory, using_gui_launcher
-    global libname, args, friendlymodelname, friendlysdmodelname, fullsdmodelpath, password, fullwhispermodelpath, ttsmodelpath, embeddingsmodelpath, friendlyembeddingsmodelname, has_audio_support, has_vision_support, cached_chat_template
+    global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui, embedded_kailite_gz, embedded_kcpp_docs_gz, embedded_kcpp_sdui_gz, embedded_lcpp_ui_gz, embedded_musicui, embedded_musicui_gz, start_time, exitcounter, global_memory, using_gui_launcher
+    global libname, args, friendlymodelname, friendlysdmodelname, fullsdmodelpath, password, fullwhispermodelpath, ttsmodelpath, embeddingsmodelpath, musicdiffusionmodelpath, musicllmmodelpath, friendlyembeddingsmodelname, has_audio_support, has_vision_support, cached_chat_template
 
     start_server = True
 
@@ -8382,10 +8623,11 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         dlfile = download_model_from_url(args.sdvae,[".gguf",".safetensors"],min_file_size=500000)
         if dlfile:
             args.sdvae = dlfile
-    if args.sdlora and args.sdlora!="":
-        dlfile = download_model_from_url(args.sdlora,[".gguf",".safetensors"],min_file_size=500000)
-        if dlfile:
-            args.sdlora = dlfile
+    if args.sdlora and len(args.sdlora)>0:
+        for i in range(0,len(args.sdlora)):
+            dlfile = download_model_from_url(args.sdlora[i],[".gguf",".safetensors"],min_file_size=500000)
+            if dlfile:
+                args.sdlora[i] = dlfile
     if args.mmproj and args.mmproj!="":
         dlfile = download_model_from_url(args.mmproj,[".gguf"],min_file_size=500000)
         if dlfile:
@@ -8410,6 +8652,23 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
         dlfile = download_model_from_url(args.embeddingsmodel,[".gguf"],min_file_size=500000)
         if dlfile:
             args.embeddingsmodel = dlfile
+
+    if args.musicllm and args.musicllm!="":
+        dlfile = download_model_from_url(args.musicllm,[".gguf"],min_file_size=500000)
+        if dlfile:
+            args.musicllm = dlfile
+    if args.musicembeddings and args.musicembeddings!="":
+        dlfile = download_model_from_url(args.musicembeddings,[".gguf"],min_file_size=500000)
+        if dlfile:
+            args.musicembeddings = dlfile
+    if args.musicdiffusion and args.musicdiffusion!="":
+        dlfile = download_model_from_url(args.musicdiffusion,[".gguf"],min_file_size=500000)
+        if dlfile:
+            args.musicdiffusion = dlfile
+    if args.musicvae and args.musicvae!="":
+        dlfile = download_model_from_url(args.musicvae,[".gguf"],min_file_size=500000)
+        if dlfile:
+            args.musicvae = dlfile
 
     # sanitize and replace the default vanity name. remember me....
     if args.model_param and args.model_param!="":
@@ -8661,18 +8920,20 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 exitcounter = 999
                 exit_with_error(2,f"Cannot find image model file: {imgmodel}")
         else:
-            imglora = ""
+            imgloras = []
             imgvae = ""
             imgt5xxl = ""
             imgclip1 = ""
             imgclip2 = ""
             imgphotomaker = ""
             imgupscaler = ""
-            if args.sdlora:
-                if os.path.exists(args.sdlora):
-                    imglora = os.path.abspath(args.sdlora)
-                else:
-                    print("Missing SD LORA model file...")
+            if args.sdlora and len(args.sdlora)>0:
+                for i in range (0,len(args.sdlora)):
+                    curr = args.sdlora[i]
+                    if os.path.exists(curr):
+                        imgloras.append(os.path.abspath(curr))
+                    else:
+                        print(f"Missing SD LORA model file {curr}...")
             if args.sdvae:
                 if os.path.exists(args.sdvae):
                     imgvae = os.path.abspath(args.sdvae)
@@ -8709,7 +8970,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             friendlysdmodelname = os.path.basename(imgmodel)
             friendlysdmodelname = os.path.splitext(friendlysdmodelname)[0]
             friendlysdmodelname = sanitize_string(friendlysdmodelname)
-            loadok = sd_load_model(imgmodel,imgvae,imglora,imgt5xxl,imgclip1,imgclip2,imgphotomaker,imgupscaler)
+            loadok = sd_load_model(imgmodel,imgvae,imgloras,imgt5xxl,imgclip1,imgclip2,imgphotomaker,imgupscaler)
             print("Load Image Model OK: " + str(loadok))
             if not loadok:
                 exitcounter = 999
@@ -8777,6 +9038,56 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 exitcounter = 999
                 exit_with_error(3,"Could not load Embeddings model!")
 
+    #handle music model
+    mu_has_llm = True if (args.musicllm and args.musicllm!="") else False
+    mu_has_embed = True if  (args.musicembeddings and args.musicembeddings!="") else False
+    mu_has_diff = True if (args.musicdiffusion and args.musicdiffusion!="") else False
+    mu_has_vae = True if (args.musicvae and args.musicvae!="") else False
+    if mu_has_llm or mu_has_embed or mu_has_diff or mu_has_vae:
+        if mu_has_llm and not any([mu_has_embed, mu_has_diff, mu_has_vae]):
+            if not os.path.exists(args.musicllm):
+                if args.ignoremissing:
+                    print("Ignoring missing Music LLM model file!")
+                    args.musicllm = None
+                else:
+                    exitcounter = 999
+                    exit_with_error(2, "Cannot find Music LLM model file!")
+            else:
+                musicllmpath = os.path.abspath(args.musicllm)
+                loadok = music_load_model(musicllmpath, "", "", "")
+                print("Load Music LLM Only OK: " + str(loadok))
+                if not loadok:
+                    exitcounter = 999
+                    exit_with_error(3, "Could not load Music LLM model!")
+        elif mu_has_diff:
+            if not (mu_has_embed and mu_has_vae):
+                exitcounter = 999
+                exit_with_error(2,"Invalid config: Music Diffusion requires Music embedding and Music VAE models!")
+
+            paths_to_check = [args.musicdiffusion,args.musicembeddings,args.musicvae]
+            if mu_has_llm:
+                paths_to_check.append(args.musicllm)
+
+            if not all(os.path.exists(p) for p in paths_to_check):
+                if args.ignoremissing:
+                    print("Ignoring missing Music model files!")
+                    args.musicllm = None
+                    args.musicembeddings = None
+                    args.musicdiffusion = None
+                    args.musicvae = None
+                else:
+                    exitcounter = 999
+                    exit_with_error(2,"Cannot find required music diffusion/embedding/VAE model files!")
+            else:
+                musicdiffusionmodelpath = os.path.abspath(args.musicdiffusion)
+                musicembedpath = os.path.abspath(args.musicembeddings)
+                musicvaepath = os.path.abspath(args.musicvae)
+                musicllmpath = os.path.abspath(args.musicllm) if mu_has_llm else ""
+                loadok = music_load_model(musicllmpath,musicembedpath,musicdiffusionmodelpath,musicvaepath)
+                print("Load Music Models OK: " + str(loadok))
+                if not loadok:
+                    exitcounter = 999
+                    exit_with_error(3, "Could not load Music models!")
 
     #load embedded lite
     embddir = os.path.join(os.path.abspath(os.path.dirname(os.path.realpath(__file__))),"embd_res")
@@ -8820,6 +9131,48 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
     except Exception:
         print("Could not find Embedded llama.cpp UI.")
 
+    try:
+        with open(os.path.join(embddir, "kcpp_musicui.embd"), mode='rb') as f:
+            embedded_musicui = f.read()
+            embedded_musicui_gz = gzip.compress(embedded_musicui)
+            if args.musicllm or args.musicdiffusion:
+                print("Embedded MusicUI loaded.")
+    except Exception:
+        print("Could not find Embedded MusicUI.")
+
+    # load all TTS audio files
+    if args.ttsmodel:
+        try:
+            global voicebank, voicelist
+            voicebank = {}
+            voicecount = 0
+            voicelist = []
+
+            try:
+                with open(os.path.join(embddir, "qwen3tts_voices_json.embd"), mode='r', encoding='utf-8', errors='ignore') as f:
+                    vdict = json.load(f)
+                    for key, value in vdict.items():
+                        voicelist.append(key)
+                        voicebank[key] = value
+            except Exception:
+                print("Could not find Embedded Qwen3TTS voices.")
+
+            voicelist.append("random")
+            voicebank["random"] = ""
+
+            if args.ttsdir and os.path.isdir(args.ttsdir):
+                for filename in os.listdir(args.ttsdir):
+                    if filename.lower().endswith((".mp3", ".wav")):
+                        full_path = os.path.join(args.ttsdir, filename)
+                        with open(full_path, "rb") as f:
+                            encoded = base64.b64encode(f.read()).decode("utf-8")
+                            voicebank[filename] = encoded
+                            voicecount += 1
+                            voicelist.append(os.path.basename(filename))
+            print(f"Loaded {voicecount} TTS voices.")
+        except Exception:
+            print("Could not load TTS voices.")
+
     if args.mcpfile and isinstance(args.mcpfile, str):
         threading.Thread(target=load_mcp_async, args=(args,), daemon=True).start()
         time.sleep(0.2) # short delay to allow get_capabilities to work
@@ -8852,6 +9205,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
     enabledmlist.append("VectorEmbeddings") if "embeddings" in caps and caps["embeddings"] else disabledmlist.append("VectorEmbeddings")
     enabledmlist.append("AdminControl") if "admin" in caps and caps["admin"]!=0 else disabledmlist.append("AdminControl")
     enabledmlist.append("MCPBridge") if "mcp" in caps and caps["mcp"] else disabledmlist.append("MCPBridge")
+    enabledmlist.append("MusicGen") if "music" in caps and caps["music"] else disabledmlist.append("MusicGen")
 
     print(f"======\nActive Modules: {' '.join(enabledmlist)}")
     print(f"Inactive Modules: {' '.join(disabledmlist)}")
@@ -8880,6 +9234,8 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             print(f"Starting llama.cpp secondary WebUI at {endpoint_url}/lcpp/")
             if args.sdmodel:
                 print(f"StableUI is available at {endpoint_url}/sdui/")
+            if args.musicdiffusion or args.musicllm:
+                print(f"MusicUI is available at {endpoint_url}/musicui/")
         elif global_memory:
             val = global_memory["tunnel_url"]
             if val:
@@ -8890,6 +9246,8 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 print(f"Starting llama.cpp secondary WebUI at {endpoint_url}/lcpp/")
                 if args.sdmodel:
                     print(f"StableUI is available at {endpoint_url}/sdui/")
+                if args.musicdiffusion or args.musicllm:
+                    print(f"MusicUI is available at {endpoint_url}/musicui/")
             global_memory["load_complete"] = True
         if args.launch:
             def launch_browser_thread():
@@ -8995,7 +9353,7 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
                 print(f"Flags: {benchflagstr}")
                 print(f"Timestamp: {datetimestamp}")
                 print(f"Backend: {libname}")
-                print(f"Layers: {args.gpulayers}")
+                print(f"Layers: {args.gpulayers if not args.autofit else 'Autofit'}")
                 print(f"Model: {benchmodel}")
                 print(f"MaxCtx: {benchmaxctx}")
                 print(f"GenAmount: {benchlen}\n-----")
@@ -9125,7 +9483,7 @@ if __name__ == '__main__':
     advparser.add_argument("--nomodel", help="Allows you to launch the GUI alone, without selecting any model.", action='store_true')
     advparser.add_argument("--moeexperts", metavar=('[num of experts]'), help="How many experts to use for MoE models (default=follow gguf)", type=int, default=-1)
     advparser.add_argument("--moecpu","--n-cpu-moe", "-ncmoe", metavar=('[layers affected]'), help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU. If no value is provided, applies to all layers.", nargs='?', const=999, type=int, default=0)
-    advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,64,8192), default=896)
+    advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,64,8192), default=default_genlen)
     advparser.add_argument("--nobostoken", help="Prevents BOS token from being added at the start of any prompt. Usually NOT recommended for most models.", action='store_true')
     advparser.add_argument("--enableguidance", help="Enables the use of Classifier-Free-Guidance, which allows the use of negative prompts. Has performance and memory impact.", action='store_true')
     advparser.add_argument("--maxrequestsize", metavar=('[size in MB]'), help="Specify a max request payload size. Any requests to the server larger than this size will be dropped. Do not change if unsure.", type=int, default=32)
@@ -9154,7 +9512,7 @@ if __name__ == '__main__':
     sdparsergroup.add_argument("--sdmodel", metavar=('[filename]'), help="Specify an image generation safetensors or gguf model to enable image generation.", default="")
     sdparsergroup.add_argument("--sdthreads", metavar=('[threads]'), help="Use a different number of threads for image generation if specified. Otherwise, has the same value as --threads.", type=int, default=0)
     sdparsergroup.add_argument("--sdclamped", metavar=('[maxres]'), help="If specified, limit generation steps and image size for shared use. Accepts an extra optional parameter that indicates maximum resolution (eg. 768 clamps to 768x768, min 512px, disabled if 0).", nargs='?', const=512, type=int, default=0)
-    sdparsergroup.add_argument("--sdclampedsoft", metavar=('[maxres]'), help="If specified, limit max image size to curb memory usage. Similar to --sdclamped, but less strict, allows trade-offs between width and height (e.g. 640 would allow 640x640, 512x768 and 768x512 images). Total resolution cannot exceed 1MP.", type=int, default=0)
+    sdparsergroup.add_argument("--sdclampedsoft", metavar=('[maxres]'), help="If specified, limit max image size to curb memory usage. Similar to --sdclamped, but less strict, allows trade-offs between width and height (e.g. 640 would allow 640x640, 512x768 and 768x512 images).", type=int, default=0)
     sdparsergroup.add_argument("--sdt5xxl", metavar=('[filename]'), help="Specify a T5-XXL safetensors model. Leave blank if prebaked or unused.", default="")
     sdparsergroup.add_argument("--sdclip1", "--sdclipl", metavar=('[filename]'), help="Specify first safetensors Clip model (SD3 or Flux Clip-L, WAN or QwenImg vision). Leave blank if prebaked or unused.", default="")
     sdparsergroup.add_argument("--sdclip2", "--sdclipg", metavar=('[filename]'), help="Specify second safetensors Clip model (SD3 Clip-G). Leave blank if prebaked or unused.", default="")
@@ -9170,8 +9528,8 @@ if __name__ == '__main__':
     sdparsergroupvae.add_argument("--sdvaeauto", help="Uses a built-in tiny VAE via TAE SD, which is very fast, and fixed bad VAEs.", action='store_true')
     sdparsergrouplora = sdparsergroup.add_mutually_exclusive_group()
     sdparsergrouplora.add_argument("--sdquant",  metavar=('[quantization level 0/1/2]'), help="If specified, loads the model quantized to save memory. 0=off, 1=q8, 2=q4", type=int, choices=[0,1,2], nargs="?", const=2, default=0)
-    sdparsergrouplora.add_argument("--sdlora", metavar=('[filename]'), help="Specify an image generation LORA safetensors model to be applied.", default="")
-    sdparsergroup.add_argument("--sdloramult", metavar=('[amount]'), help="Multiplier for the image LORA model to be applied.", type=float, default=1.0)
+    sdparsergrouplora.add_argument("--sdlora", metavar=('[filename]'), help="Specify image generation LoRAs safetensors models to be applied. Multiple LoRAs are accepted.", nargs='+')
+    sdparsergroup.add_argument("--sdloramult", metavar=('[amount]'), help="Multiplier for the image LoRA model to be applied.", type=float, default=1.0)
     sdparsergroup.add_argument("--sdtiledvae", metavar=('[maxres]'), help="Adjust the automatic VAE tiling trigger for images above this size. 0 disables vae tiling.", type=int, default=default_vae_tile_threshold)
     whisperparsergroup = parser.add_argument_group('Whisper Transcription Commands')
     whisperparsergroup.add_argument("--whispermodel", metavar=('[filename]'), help="Specify a Whisper .bin model to enable Speech-To-Text transcription.", default="")
@@ -9182,6 +9540,14 @@ if __name__ == '__main__':
     ttsparsergroup.add_argument("--ttsgpu", help="Use the GPU for TTS.", action='store_true')
     ttsparsergroup.add_argument("--ttsmaxlen", help="Limit number of audio tokens generated with TTS.",  type=int, default=default_ttsmaxlen)
     ttsparsergroup.add_argument("--ttsthreads", metavar=('[threads]'), help="Use a different number of threads for TTS if specified. Otherwise, has the same value as --threads.", type=int, default=0)
+    ttsparsergroup.add_argument("--ttsdir", metavar=('[directory]'), help="Select directory containing voices for voice cloning.", default="")
+
+    musicparsergroup = parser.add_argument_group('Music Gen Commands')
+    musicparsergroup.add_argument("--musicllm", metavar=('[filename]'), help="Select music LLM model (e.g acestep-5Hz-lm-0.6B)", default="")
+    musicparsergroup.add_argument("--musicembeddings", metavar=('[filename]'), help="Select music embedding model (e.g Qwen3-Embedding-0.6B)", default="")
+    musicparsergroup.add_argument("--musicdiffusion", metavar=('[filename]'), help="Select music diffusion (DiT) model (e.g acestep-v15-turbo)", default="")
+    musicparsergroup.add_argument("--musicvae", metavar=('[filename]'), help="Select music VAE model", default="")
+    musicparsergroup.add_argument("--musiclowvram", help="Unload music models when not in use", action='store_true')
 
     embeddingsparsergroup = parser.add_argument_group('Embeddings Model Commands')
     embeddingsparsergroup.add_argument("--embeddingsmodel", metavar=('[filename]'), help="Specify an embeddings model to be loaded for generating embedding vectors.", default="")
