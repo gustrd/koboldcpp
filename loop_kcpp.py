@@ -55,6 +55,31 @@ from typing import Optional
 import psutil  # required for reliable process tree termination
 
 
+# Global tracking for the last time the worker printed something
+last_activity_time = time.time()
+
+
+def is_local_api_alive(url: str, timeout: int = 5) -> bool:
+    """Verifies if the local KoboldCPP server is responding."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Monitor"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode() == 200
+    except Exception:
+        return False
+
+
+def is_cpu_active(p: subprocess.Popen) -> bool:
+    """Verifies if the process is using CPU (indicating it's not deadlocked)."""
+    try:
+        proc = psutil.Process(p.pid)
+        # 0.5s is usually enough for a quick check without blocking the loop too long
+        cpu_usage = proc.cpu_percent(interval=0.5)
+        return cpu_usage > 1.0
+    except Exception:
+        return False
+
+
 def log(msg: str) -> None:
     BLUE = "\033[94m"
     RESET = "\033[0m"
@@ -213,10 +238,12 @@ def stream_process_output(cmd: str, use_shell: bool = True, start_reason: str = 
         process = subprocess.Popen(cmd_list, shell=False, **kwargs)
 
     def reader(pipe):
+        global last_activity_time
         try:
             for line in iter(pipe.readline, ""):
                 if not line:
                     break
+                last_activity_time = time.time()  # Update activity timestamp
                 sys.stdout.write(f"KOBOLD: {line}")
                 sys.stdout.flush()
         except Exception as e:
@@ -405,14 +432,19 @@ def kill_process_by_name_safe(name: str, exclude_pids: Optional[set[int]] = None
 stop_event = threading.Event()
 
 
-def interruptible_sleep(total_seconds: int, sleep_interval: int) -> bool:
+def interruptible_sleep(total_seconds: int, sleep_interval: int, proc: Optional[subprocess.Popen] = None) -> bool:
     """
     Sleep for total_seconds in chunks of sleep_interval, checking for stop_event.
-    Returns True if interrupted by stop_event, False if completed normally.
+    If proc is provided, also wakes early if the process has exited (but returns False so
+    the main loop continues and can restart it rather than shutting down the monitor).
+    Returns True only if stop_event is set (monitor should stop), False otherwise.
     """
     for _ in range(max(1, total_seconds // sleep_interval)):
         if stop_event.is_set():
             return True
+        if proc is not None and proc.poll() is not None:
+            log(f"Worker process exited unexpectedly (code {proc.returncode}), waking monitor early.")
+            return False
         time.sleep(sleep_interval)
     return False
 
@@ -436,6 +468,8 @@ def main() -> None:
     parser.add_argument("--process-name", default=None, help="Process name (exact/executable) for fallback kill by name (not used by default)")
     parser.add_argument("--allow-name-kill", action="store_true", help="Allow using kill by name as fallback (CAUTION: does not kill python by default)")
     parser.add_argument("--stop-kills-worker", action="store_true", help="When stopping the monitor, also terminate the worker")
+    parser.add_argument("--local-url", default="http://127.0.0.1:5001/api/v1/model", help="Local API URL for double-check (default: http://127.0.0.1:5001/api/v1/model)")
+    parser.add_argument("--activity-timeout", type=int, default=300, help="Seconds of silence before considering the worker stuck (default: 300)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -460,12 +494,25 @@ def main() -> None:
 
     # Initial wait to let worker register (default: interval * 1.5)
     start_wait = args.start_wait if args.start_wait is not None else int(args.interval * 1.5)
-    if interruptible_sleep(start_wait, args.sleep_interval):
+    if interruptible_sleep(start_wait, args.sleep_interval, current_proc):
         log("Interrupted during initial wait")
 
     # Main monitoring loop
     while not stop_event.is_set():
         try:
+            # Check if the worker process exited on its own — restart immediately
+            if current_proc is not None and current_proc.poll() is not None:
+                log(f"Worker process exited unexpectedly (code {current_proc.returncode}). Restarting...")
+                current_proc = None
+                try:
+                    current_proc = stream_process_output(args.start_command, use_shell=not args.no_shell, start_reason="Unexpected worker exit")
+                    log("Restart command executed")
+                except Exception as e:
+                    print(f"{time.asctime()} - Error restarting worker: {e}", file=sys.stderr)
+                if interruptible_sleep(start_wait, args.sleep_interval, current_proc):
+                    break
+                continue
+
             battery_level = get_battery_percent()
             if battery_level is not None and battery_level <= args.battery_threshold:
                 log(f"Low battery ({battery_level}% <= {args.battery_threshold}%), halting...")
@@ -479,7 +526,7 @@ def main() -> None:
                     exclude_pids = {os.getpid()}
                     kill_process_by_name_safe(args.process_name, exclude_pids=exclude_pids, allow_kill_python=False)
                 
-                if interruptible_sleep(args.interval, args.sleep_interval):
+                if interruptible_sleep(args.interval, args.sleep_interval, current_proc):
                     break
                 continue
 
@@ -490,10 +537,26 @@ def main() -> None:
                     break
                 continue
 
-            # Not online -> restart the worker process we launched (only that)
-            log("Worker offline (substring not found). Restarting monitored worker...")
+            # Not online on Horde -> Perform local double-check
+            time_since_last_log = time.time() - last_activity_time
+
+            is_printing = time_since_last_log < args.activity_timeout
+            is_processing = False
+            if current_proc:
+                is_processing = is_cpu_active(current_proc)
+
+            is_api_up = is_local_api_alive(args.local_url)
+
+            if is_printing or is_processing or is_api_up:
+                log(f"Horde reports offline, BUT process is alive locally! (Last log: {int(time_since_last_log)}s ago | CPU active: {is_processing} | Local API: {is_api_up})")
+                log("Ignoring false positive. Model is likely busy (e.g. OpenClaw processing).")
+                if interruptible_sleep(args.interval, args.sleep_interval):
+                    break
+                continue
+
+            log("Worker confirmed offline/stuck (no logs, low CPU, dead API). Restarting...")
             # Try graceful termination by handle first
-            ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason="Worker offline (substring not found)")
+            ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason="Worker confirmed offline/stuck")
             current_proc = None
 
             # Fallback: only if user explicitly allowed, kill by name (careful)

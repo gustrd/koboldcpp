@@ -3632,7 +3632,18 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 global last_non_horde_req_time
                 last_non_horde_req_time = time.time()
 
-            return generate(genparams=genparams,stream_flag=stream_flag)
+            # GRD CUSTOM CODE: catch C backend crashes (e.g. Windows stack overflow) and
+            # trigger a clean process exit so the monitor can restart koboldcpp.
+            try:
+                return generate(genparams=genparams,stream_flag=stream_flag)
+            except OSError as e:
+                print(f"\n[Generate] C backend error ({e}). Returning empty result and restarting in 3s...")
+                def _delayed_exit():
+                    time.sleep(3)
+                    os._exit(1)
+                threading.Thread(target=_delayed_exit, daemon=True).start()
+                return {"text": "", "status": -1, "stopreason": -2, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            # END GRD CUSTOM CODE
 
         genout = {"text": "", "status": -1, "stopreason": -1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
         if stream_flag:
