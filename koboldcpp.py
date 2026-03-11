@@ -3676,45 +3676,55 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         tool_calls = []
         if api_format == 4 or api_format == 2:
             using_openai_tools = genparams.get('using_openai_tools', False)
-            if using_openai_tools:
-                # GRD CUSTOM CODE - OAI_FAKE_STREAMING
-                # Check for custom [TOOL_CALLS]tool_name[ARGS]{json} pattern
-                import re
-                custom_tool_pattern = r'\[TOOL_CALLS\](.*?)\[ARGS\](\{.*?\})'
-                matches = re.finditer(custom_tool_pattern, recvtxt, re.DOTALL)
-                for match in matches:
-                    tool_name = match.group(1).strip()
-                    args_json_str = match.group(2).strip()
-                    try:
-                        args_dict = json.loads(args_json_str)
-                        tool_calls.append({
-                            "type": "function",
-                            "function": {
-                                "name": tool_name,
-                                "arguments": args_json_str
-                            }
-                        })
-                        recvtxt = recvtxt.replace(match.group(0), "")
-                    except Exception:
-                        pass
-                recvtxt = recvtxt.strip()
-                
-                # If no custom tools found, fallback to default regex extractor
-                if len(tool_calls) == 0:
-                    tool_calls = extract_json_from_string(recvtxt)
+            # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+            # Always run tool call extraction for api_format 4/2, regardless of using_openai_tools.
+            # This allows models that self-generate tool calls via system prompts (without KoboldCpp's
+            # own tool decision logic) to still be parsed and forwarded as structured tool_calls,
+            # instead of being returned as raw text in the content field.
 
-                if tool_calls and len(tool_calls)>0:
-                    tool_calls = [normalize_tool_call(obj) for obj in tool_calls]
-                    for tc in tool_calls:
-                        tcarg = tc.get("function",{}).get("arguments",None)
+            # Step 1: Check for custom [TOOL_CALLS]tool_name[ARGS]{json} tag format
+            custom_tool_pattern = r'\[TOOL_CALLS\](.*?)\[ARGS\](\{.*?\})'
+            matches = re.finditer(custom_tool_pattern, recvtxt, re.DOTALL)
+            for match in matches:
+                tool_name = match.group(1).strip()
+                args_json_str = match.group(2).strip()
+                try:
+                    json.loads(args_json_str)  # validate JSON
+                    tool_calls.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": args_json_str
+                        }
+                    })
+                    recvtxt = recvtxt.replace(match.group(0), "")
+                except Exception:
+                    pass
+            recvtxt = recvtxt.strip()
+
+            # Step 2: If no custom tags found, try to extract raw OpenAI-format JSON from text
+            if len(tool_calls) == 0:
+                tool_calls = extract_json_from_string(recvtxt)
+
+            if tool_calls and len(tool_calls) > 0:
+                tool_calls = [normalize_tool_call(obj) for obj in tool_calls]
+                # Keep only objects that are valid tool calls (have a 'function' key)
+                tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
+                for tc in tool_calls:
+                    tcarg = tc.get("function", {}).get("arguments", None)
+                    if not tc.get("id"):
                         tc["id"] = f"call_{random.randint(10000, 99999)}"
-                        if tcarg is not None and not isinstance(tcarg, str):
-                            tc["function"]["arguments"] = json.dumps(tcarg)
-                    
-                    if not recvtxt: # Only set to None if text is completely empty after extraction
-                        recvtxt = None
-                    currfinishreason = "tool_calls"
-                # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
+                    if tcarg is not None and not isinstance(tcarg, str):
+                        tc["function"]["arguments"] = json.dumps(tcarg)
+
+            if tool_calls and len(tool_calls) > 0:
+                if not recvtxt:  # Only null out text if nothing is left after extraction
+                    recvtxt = None
+                currfinishreason = "tool_calls"
+            elif using_openai_tools:
+                # KoboldCpp expected a tool call but didn't find one - clear anyway to avoid garbage
+                recvtxt = None
+            # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
 
         if api_format == 1:
             res = {"data": {"seqs": [recvtxt]}}
