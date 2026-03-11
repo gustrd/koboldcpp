@@ -3737,8 +3737,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "keep-alive")
         self.end_headers(content_type='text/event-stream')
-        if api_format == 4 and using_openai_tools: # if tools, do not send anything else - OAI tool calls will be handled with fakestreaming!
+        # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+        # Abort native streaming if fake streaming is requested for OpenAI endpoints.
+        if (api_format == 4 and using_openai_tools) or (api_format in [3,4] and args.oai_fake_stream): # if tools or forced fake stream, do not send anything else - OAI will be handled with fakestreaming!
             return
+        # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
 
         encap_in_thinking = False
         encap_first_loop = True
@@ -5157,7 +5160,10 @@ Change Mode<br>
                             self.send_header('content-length', str(len(genresp)))
                             self.end_headers(content_type='application/json')
                             self.wfile.write(genresp)
-                        elif api_format == 4 and genparams.get('using_openai_tools', False): #special case, fake streaming for openai tool calls
+                        # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+                        # Handle fake streaming for tool calls OR forced fake streaming for OpenAI compatibility (avoids openclaw tool call parsing issues).
+                        elif (api_format == 4 and (genparams.get('using_openai_tools', False) or args.oai_fake_stream)) or (api_format == 3 and args.oai_fake_stream):
+                        # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
                             content_text = None
                             toolsdata_res = []
                             try:
@@ -5168,29 +5174,43 @@ Change Mode<br>
                                 toolsdata_res = []
                             try:
                                 content_text = gendat['choices'][0]['message'].get('content', None)
+                                # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+                                if not content_text and api_format == 3:
+                                    content_text = gendat['choices'][0].get('text', None)
+                                # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
                             except Exception:
                                 content_text = None
 
                            # Send role chunk first
-                            chunk_role = json.dumps({
-                                "id": "koboldcpp",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": friendlymodelname,
-                                "choices": [{"index": 0, "finish_reason": None, "delta": {"role": "assistant"}}]
-                            })
-                            self.wfile.write(f"data: {chunk_role}\n\n".encode())
-                            self.wfile.flush()
-
-                            # Send content if present
-                            if content_text:
-                                chunk_content = json.dumps({
+                            if api_format == 4:
+                                chunk_role = json.dumps({
                                     "id": "koboldcpp",
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": friendlymodelname,
-                                    "choices": [{"index": 0, "finish_reason": None, "delta": {"content": content_text}}]
+                                    "choices": [{"index": 0, "finish_reason": None, "delta": {"role": "assistant"}}]
                                 })
+                                self.wfile.write(f"data: {chunk_role}\n\n".encode())
+                                self.wfile.flush()
+
+                            # Send content if present
+                            if content_text:
+                                if api_format == 4:
+                                    chunk_content = json.dumps({
+                                        "id": "koboldcpp",
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": friendlymodelname,
+                                        "choices": [{"index": 0, "finish_reason": None, "delta": {"content": content_text}}]
+                                    })
+                                elif api_format == 3:
+                                    chunk_content = json.dumps({
+                                        "id": "koboldcpp",
+                                        "object": "text_completion",
+                                        "created": int(time.time()),
+                                        "model": friendlymodelname,
+                                        "choices": [{"index": 0, "finish_reason": None, "text": content_text}]
+                                    })
                                 self.wfile.write(f"data: {chunk_content}\n\n".encode())
                                 self.wfile.flush()
 
@@ -5234,13 +5254,22 @@ Change Mode<br>
                                     self.wfile.flush()
 
                             # Final chunk
-                            chunk_final = json.dumps({
-                                "id": "koboldcpp",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": friendlymodelname,
-                                "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {}}]
-                            })
+                            if api_format == 4:
+                                chunk_final = json.dumps({
+                                    "id": "koboldcpp",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": friendlymodelname,
+                                    "choices": [{"index": 0, "finish_reason": "tool_calls" if (toolsdata_res and len(toolsdata_res)>0) else "stop", "delta": {}}]
+                                })
+                            elif api_format == 3:
+                                chunk_final = json.dumps({
+                                    "id": "koboldcpp",
+                                    "object": "text_completion",
+                                    "created": int(time.time()),
+                                    "model": friendlymodelname,
+                                    "choices": [{"index": 0, "finish_reason": "stop", "text": ""}]
+                                })
                             self.wfile.write(f"data: {chunk_final}\n\n".encode())
                             self.wfile.write("data: [DONE]\n\n".encode())
                             self.wfile.flush()
@@ -9474,6 +9503,10 @@ if __name__ == '__main__':
     advparser.add_argument("--failsafe", help="Use failsafe mode, extremely old CPU compatibility mode that should work on all devices.", action='store_true')
     advparser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", nargs='?', const=1, type=int, default=0)
     advparser.add_argument("--onready", help="An optional shell command to execute after the model has been loaded.", metavar=('[shell command]'), type=str, default="",nargs=1)
+    # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+    # This feature buffers the entire response and sends it as SSE chunks to avoid client-side parsing issues with tool calls.
+    advparser.add_argument("--oai_fake_stream", action="store_true", help="Forces all OpenAI streaming requests to use fake-streaming (buffers the entire response and sends it as SSE chunks). Useful to bypass strict client streaming issues.")
+    # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
     advparser.add_argument("--benchmark", help="Do not start server, instead run benchmarks. If filename is provided, appends results to provided file.", metavar=('[filename]'), nargs='?', const="stdout", type=str, default=None)
     advparser.add_argument("--prompt","-p", metavar=('[prompt]'), help="Passing a prompt string triggers a direct inference, loading the model, outputs the response to stdout and exits. Can be used alone or with benchmark.", type=str, default="")
     advparser.add_argument("--cli", help="Does not launch KoboldCpp HTTP server. Instead, enables KoboldCpp from the command line, accepting interactive console input and displaying responses to the terminal.", action='store_true')
