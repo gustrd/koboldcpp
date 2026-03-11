@@ -3677,7 +3677,32 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         if api_format == 4 or api_format == 2:
             using_openai_tools = genparams.get('using_openai_tools', False)
             if using_openai_tools:
-                tool_calls = extract_json_from_string(recvtxt)
+                # GRD CUSTOM CODE - OAI_FAKE_STREAMING
+                # Check for custom [TOOL_CALLS]tool_name[ARGS]{json} pattern
+                import re
+                custom_tool_pattern = r'\[TOOL_CALLS\](.*?)\[ARGS\](\{.*?\})'
+                matches = re.finditer(custom_tool_pattern, recvtxt, re.DOTALL)
+                for match in matches:
+                    tool_name = match.group(1).strip()
+                    args_json_str = match.group(2).strip()
+                    try:
+                        args_dict = json.loads(args_json_str)
+                        tool_calls.append({
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": args_json_str
+                            }
+                        })
+                        recvtxt = recvtxt.replace(match.group(0), "")
+                    except Exception:
+                        pass
+                recvtxt = recvtxt.strip()
+                
+                # If no custom tools found, fallback to default regex extractor
+                if len(tool_calls) == 0:
+                    tool_calls = extract_json_from_string(recvtxt)
+
                 if tool_calls and len(tool_calls)>0:
                     tool_calls = [normalize_tool_call(obj) for obj in tool_calls]
                     for tc in tool_calls:
@@ -3685,8 +3710,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         tc["id"] = f"call_{random.randint(10000, 99999)}"
                         if tcarg is not None and not isinstance(tcarg, str):
                             tc["function"]["arguments"] = json.dumps(tcarg)
-                    recvtxt = None
+                    
+                    if not recvtxt: # Only set to None if text is completely empty after extraction
+                        recvtxt = None
                     currfinishreason = "tool_calls"
+                # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
 
         if api_format == 1:
             res = {"data": {"seqs": [recvtxt]}}
