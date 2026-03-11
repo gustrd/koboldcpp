@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import platform
 import re
@@ -49,7 +48,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from typing import Optional
 
 import psutil  # required for reliable process tree termination
@@ -57,27 +55,6 @@ import psutil  # required for reliable process tree termination
 
 # Global tracking for the last time the worker printed something
 last_activity_time = time.time()
-
-
-def is_local_api_alive(url: str, timeout: int = 5) -> bool:
-    """Verifies if the local KoboldCPP server is responding."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Monitor"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode() == 200
-    except Exception:
-        return False
-
-
-def is_cpu_active(p: subprocess.Popen) -> bool:
-    """Verifies if the process is using CPU (indicating it's not deadlocked)."""
-    try:
-        proc = psutil.Process(p.pid)
-        # 0.5s is usually enough for a quick check without blocking the loop too long
-        cpu_usage = proc.cpu_percent(interval=0.5)
-        return cpu_usage > 1.0
-    except Exception:
-        return False
 
 
 def log(msg: str) -> None:
@@ -151,63 +128,6 @@ def get_battery_percent():
         return None
 
     return None
-
-
-def _search_json_for_string(obj, substring: str) -> bool:
-    """Recursive search for substring in JSON (keys/values)."""
-    try:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if substring.lower() in str(k).lower():
-                    return True
-                if _search_json_for_string(v, substring):
-                    return True
-        elif isinstance(obj, list):
-            for it in obj:
-                if _search_json_for_string(it, substring):
-                    return True
-        else:
-            if substring.lower() in str(obj).lower():
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def http_contains(url: str, substring: str, timeout: int = 10) -> bool:
-    """
-    Performs GET request to URL, attempts to parse JSON and searches for substring.
-    Returns False only if the substring is not found in a valid response.
-    Returns True for timeout errors (assumes worker is still online).
-    """
-
-    headers = {
-        "X-Fields": "name",
-        "User-Agent": "Mozilla/5.0",    # prevents bot blocking
-        "Accept": "application/json",   # tells server what you expect  
-    }
-
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            try:
-                text = raw.decode("utf-8", errors="ignore")
-            except Exception:
-                text = str(raw)
-            content_type = (resp.headers.get("Content-Type") or "").lower()
-            if "application/json" in content_type or text.lstrip().startswith(("{", "[")):
-                try:
-                    json_data = json.loads(text)
-                    if _search_json_for_string(json_data, substring):
-                        return True
-                except json.JSONDecodeError as e:
-                    print(f"{time.asctime()} - JSON parse error: {e}. Falling back to text search.", file=sys.stderr)
-            return substring.lower() in text.lower()
-
-    except Exception as e:
-        print(f"{time.asctime()} - HTTP error when querying {url}: {e}. Will try again.", file=sys.stderr)
-        return True
 
 
 def stream_process_output(cmd: str, use_shell: bool = True, start_reason: str = "Unknown") -> subprocess.Popen:
@@ -456,20 +376,23 @@ def handle_signal(sig, frame):
 
 def main() -> None:
     """Main function that sets up and runs the worker monitor."""
-    parser = argparse.ArgumentParser(description="Monitor and auto-restart worker processes (Horde/API)")
-    parser.add_argument("--string", help="Substring to search for in the API response")
-    parser.add_argument("--url", default="https://aihorde.net/api/v2/workers", help="API URL to check for worker status")
+    parser = argparse.ArgumentParser(description="Monitor and auto-restart worker processes")
     parser.add_argument("--start-command", required=True, help="Command to start the worker (string)")
     parser.add_argument("--no-shell", action="store_true", help="Execute start-command without shell (recommended when passing list)")
-    parser.add_argument("--interval", type=int, default=120, help="Interval in seconds between status checks")
+    parser.add_argument("--interval", type=int, default=300, help="Interval in seconds between status checks (default: 300)")
     parser.add_argument("--sleep-interval", type=int, default=10, help="Sleep interval in seconds for sub-loops (default: 10)")
-    parser.add_argument("--start-wait", type=int, default=None, help="Seconds to wait after starting the worker before first API check (default: interval * 1.5)")
+    parser.add_argument("--start-wait", type=int, default=None, help="Seconds to wait after starting the worker before first activity check (default: interval)")
     parser.add_argument("--battery-threshold", type=int, default=58, help="Battery level threshold below which the worker will be halted (default: 58)")
     parser.add_argument("--process-name", default=None, help="Process name (exact/executable) for fallback kill by name (not used by default)")
     parser.add_argument("--allow-name-kill", action="store_true", help="Allow using kill by name as fallback (CAUTION: does not kill python by default)")
     parser.add_argument("--stop-kills-worker", action="store_true", help="When stopping the monitor, also terminate the worker")
-    parser.add_argument("--local-url", default="http://127.0.0.1:5001/api/v1/model", help="Local API URL for double-check (default: http://127.0.0.1:5001/api/v1/model)")
     parser.add_argument("--activity-timeout", type=int, default=300, help="Seconds of silence before considering the worker stuck (default: 300)")
+    
+    # Deprecated/unused arguments kept for compatibility
+    parser.add_argument("--string", help="Substring to search for (deprecated, unused)")
+    parser.add_argument("--url", help="API URL to check (deprecated, unused)")
+    parser.add_argument("--local-url", help="Local API URL (deprecated, unused)")
+    
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -479,7 +402,7 @@ def main() -> None:
         pass
 
     current_proc: Optional[subprocess.Popen] = None
-    log(f"Monitor started: url={args.url}, string={args.string}, interval={args.interval}s")
+    log(f"Monitor started: interval={args.interval}s, activity_timeout={args.activity_timeout}s")
 
     # Start initial worker
     try:
@@ -492,8 +415,8 @@ def main() -> None:
     except Exception as e:
         print(f"{time.asctime()} - Error starting worker initially: {e}", file=sys.stderr)
 
-    # Initial wait to let worker register (default: interval * 1.5)
-    start_wait = args.start_wait if args.start_wait is not None else int(args.interval * 1.5)
+    # Initial wait to let worker start
+    start_wait = args.start_wait if args.start_wait is not None else args.interval
     if interruptible_sleep(start_wait, args.sleep_interval, current_proc):
         log("Interrupted during initial wait")
 
@@ -516,13 +439,10 @@ def main() -> None:
             battery_level = get_battery_percent()
             if battery_level is not None and battery_level <= args.battery_threshold:
                 log(f"Low battery ({battery_level}% <= {args.battery_threshold}%), halting...")
-                # Try graceful termination by handle first
                 ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason=f"Low battery ({battery_level}%)")
                 current_proc = None
 
-                # Fallback: only if user explicitly allowed, kill by name (careful)
                 if args.process_name and args.allow_name_kill:
-                    # Exclude current monitor PID so we don't accidentally kill ourselves
                     exclude_pids = {os.getpid()}
                     kill_process_by_name_safe(args.process_name, exclude_pids=exclude_pids, allow_kill_python=False)
                 
@@ -530,49 +450,30 @@ def main() -> None:
                     break
                 continue
 
-            online = http_contains(args.url, args.string)
-            if online:
-                log("Worker appears online, or request failed.")
-                if interruptible_sleep(args.interval, args.sleep_interval):
-                    break
-                continue
-
-            # Not online on Horde -> Perform local double-check
+            # Check activity based on last log time
             time_since_last_log = time.time() - last_activity_time
-
-            is_printing = time_since_last_log < args.activity_timeout
-            is_processing = False
-            if current_proc:
-                is_processing = is_cpu_active(current_proc)
-
-            is_api_up = is_local_api_alive(args.local_url)
-
-            if is_printing or is_processing or is_api_up:
-                log(f"Horde reports offline, BUT process is alive locally! (Last log: {int(time_since_last_log)}s ago | CPU active: {is_processing} | Local API: {is_api_up})")
-                log("Ignoring false positive. Model is likely busy (e.g. OpenClaw processing).")
-                if interruptible_sleep(args.interval, args.sleep_interval):
+            if time_since_last_log < args.activity_timeout:
+                log(f"Worker appears active. Last log: {int(time_since_last_log)}s ago.")
+                if interruptible_sleep(args.interval, args.sleep_interval, current_proc):
                     break
                 continue
 
-            log("Worker confirmed offline/stuck (no logs, low CPU, dead API). Restarting...")
-            # Try graceful termination by handle first
-            ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason="Worker confirmed offline/stuck")
+            log(f"Worker confirmed stuck (no logs for {int(time_since_last_log)}s). Restarting...")
+            ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason="Worker confirmed stuck (no activity)")
             current_proc = None
 
-            # Fallback: only if user explicitly allowed, kill by name (careful)
             if args.process_name and args.allow_name_kill:
-                # Exclude current monitor PID so we don't accidentally kill ourselves
                 exclude_pids = {os.getpid()}
                 kill_process_by_name_safe(args.process_name, exclude_pids=exclude_pids, allow_kill_python=False)
 
             # Restart the worker
             try:
-                current_proc = stream_process_output(args.start_command, use_shell=not args.no_shell, start_reason="Worker offline restart")
+                current_proc = stream_process_output(args.start_command, use_shell=not args.no_shell, start_reason="Worker activity restart")
                 log("Restart command executed")
             except Exception as e:
                 print(f"{time.asctime()} - Error restarting worker: {e}", file=sys.stderr)
 
-            if interruptible_sleep(args.interval, args.sleep_interval):
+            if interruptible_sleep(start_wait, args.sleep_interval, current_proc):
                 break
         except Exception as e:
             print(f"{time.asctime()} - Error in main loop: {e}", file=sys.stderr)
