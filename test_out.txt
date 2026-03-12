@@ -1,0 +1,30 @@
+--- Texto Original ---
+Algum texto explicativo gerado pelo LLM.
+
+###
+[TOOL_CALLS]message[ARGS]{"action": "send", "channel": "telegram", "to": "7143640756", "message": "Inovação Intel Lunar Lake vs. Panther Lake: Eficiência Energética e Segurança Automotiva\n\nO novo processador da Intel..."}
+###
+
+Mais algum texto complementar do modelo.
+
+----------------------
+
+--- Tool Calls Estruturados (OpenAI Format) ---
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "message",
+      "arguments": "{\"action\": \"send\", \"channel\": \"telegram\", \"to\": \"7143640756\", \"message\": \"Inovação Intel Lunar Lake vs. Panther Lake: Eficiência Energética e Segurança Automotiva\\n\\nO novo processador da Intel...\"}"
+    }
+  }
+]
+
+--- Texto Limpo (Sem a tag da ferramenta) ---
+Algum texto explicativo gerado pelo LLM.
+
+###
+
+###
+
+Mais algum texto complementar do modelo.

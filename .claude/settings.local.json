@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(awk NR>=4920 && NR<=4935:*)"
+    ]
+  }
+}

@@ -3684,7 +3684,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
             # Step 1: Check for custom [TOOL_CALLS]tool_name[ARGS]{json} tag format
             custom_tool_pattern = r'\[TOOL_CALLS\](.*?)\[ARGS\](\{.*?\})'
-            matches = re.finditer(custom_tool_pattern, recvtxt, re.DOTALL)
+            matches = list(re.finditer(custom_tool_pattern, recvtxt, re.DOTALL))
             for match in matches:
                 tool_name = match.group(1).strip()
                 args_json_str = match.group(2).strip()
@@ -3700,29 +3700,54 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     recvtxt = recvtxt.replace(match.group(0), "")
                 except Exception:
                     pass
-            recvtxt = recvtxt.strip()
+            
+            # Step 2: If no custom tags found (or even if they were, check for additional raw JSON blocks)
+            # We use finditer to locate and remove blocks so they don't stay in the text content
+            json_pattern = r'(\{.*?\}|\[.*?\])'
+            potential_matches = list(re.finditer(json_pattern, recvtxt, re.DOTALL))
+            for p_match in potential_matches:
+                p_json = p_match.group(0)
+                try:
+                    parsed = json.loads(p_json)
+                    if not isinstance(parsed, list):
+                        parsed = [parsed]
+                    
+                    match_found_valid_tool = False
+                    for obj in parsed:
+                        normalized = normalize_tool_call(obj)
+                        # Check if it looks like a valid tool call
+                        if normalized.get("function", {}).get("name"):
+                            tool_calls.append(normalized)
+                            match_found_valid_tool = True
+                    
+                    if match_found_valid_tool:
+                        # Remove this specific JSON block from the output text
+                        recvtxt = recvtxt.replace(p_json, "")
+                except Exception:
+                    continue
 
-            # Step 2: If no custom tags found, try to extract raw OpenAI-format JSON from text
-            if len(tool_calls) == 0:
-                tool_calls = extract_json_from_string(recvtxt)
+            # Cleanup and Finalize
+            recvtxt = recvtxt.strip()
+            # Remove leftovers like empty code blocks or separators if the tool call was wrapped
+            recvtxt = re.sub(r'###\s*###', '', recvtxt).strip()
+            recvtxt = re.sub(r'```json\s*```', '', recvtxt).strip()
 
             if tool_calls and len(tool_calls) > 0:
                 tool_calls = [normalize_tool_call(obj) for obj in tool_calls]
-                # Keep only objects that are valid tool calls (have a 'function' key)
-                tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
+                # High-level cleanup of IDs and arguments
                 for tc in tool_calls:
-                    tcarg = tc.get("function", {}).get("arguments", None)
                     if not tc.get("id"):
                         tc["id"] = f"call_{random.randint(10000, 99999)}"
+                    tcarg = tc.get("function", {}).get("arguments", None)
                     if tcarg is not None and not isinstance(tcarg, str):
                         tc["function"]["arguments"] = json.dumps(tcarg)
 
-            if tool_calls and len(tool_calls) > 0:
-                if not recvtxt:  # Only null out text if nothing is left after extraction
+                if not recvtxt or recvtxt == "" or recvtxt == "###":
                     recvtxt = None
                 currfinishreason = "tool_calls"
             elif using_openai_tools:
-                # KoboldCpp expected a tool call but didn't find one - clear anyway to avoid garbage
+                # If KoboldCpp forced a tool call via grammar but we found nothing valid,
+                # we null it out to avoid sending the raw grammar-forced JSON as text.
                 recvtxt = None
             # END GRD CUSTOM CODE - OAI_FAKE_STREAMING
 
