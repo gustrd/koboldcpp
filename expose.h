@@ -82,6 +82,7 @@ struct load_model_inputs
     const bool pipelineparallel = false;
     const float lora_multiplier = 1.0f;
     const char * devices_override = nullptr;
+    const int lookup_ngram_min = 0;
     const bool quiet = false;
     const int debugmode = 0;
 };

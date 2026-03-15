@@ -45,6 +45,7 @@
 #include "tools/mtmd/llava.h"
 #include "tools/mtmd/mtmd-audio.h"
 #include "common/common.h"
+#include "common/ngram-mod.h"
 
 #if defined(GGML_USE_HIP)
 // for rocblas_initialize()
@@ -62,6 +63,9 @@ std::string lora_filename = "";
 std::string mmproj_filename = "";
 std::string draftmodel_filename = "";
 int speculative_chunk_amt = 8; //do it in chunks of this many tokens
+int lookup_ngram_min = 0; //0=disabled, >=2 enables prompt lookup speculative decoding
+common_ngram_mod * ngram_mod_state = nullptr;
+size_t ngram_mod_i_last = 0;
 bool generation_finished;
 bool audio_multimodal_supported = false;
 bool vision_multimodal_supported = false;
@@ -780,6 +784,89 @@ static speculative_draft_result speculative_decoding_eval_chunk(llama_context * 
         results.draftids.push_back(drafted_ids[i+1]);
         results.actual_logits.push_back(fulllogits);
     }
+    results.draft_success = true;
+    return results;
+}
+
+static speculative_draft_result prompt_lookup_eval_chunk(llama_context * main_ctx, const llama_tokens & context_tokens, const llama_tokens & embd, const int & n_past, const int max_draft)
+{
+    speculative_draft_result results;
+    results.draft_success = false;
+    if (embd.size() != 1 || ngram_mod_state == nullptr) {
+        return results;
+    }
+    const size_t ctx_size = context_tokens.size();
+    const size_t n = ngram_mod_state->get_n();
+
+    // Incremental hash population: add new ngrams since last update
+    if (ctx_size >= n) {
+        size_t add_from = (ngram_mod_i_last > n) ? (ngram_mod_i_last - n) : 0;
+        for (size_t i = add_from; i + n < ctx_size; ++i) {
+            ngram_mod_state->add(context_tokens.data() + i);
+        }
+        ngram_mod_i_last = ctx_size;
+
+        // Occupancy guard: reset if too full (>25%) to prevent hash collision degradation
+        const double occupancy = (double)ngram_mod_state->get_used() / (double)ngram_mod_state->size();
+        if (occupancy > 0.25) {
+            ngram_mod_state->reset();
+            for (size_t i = 0; i + n < ctx_size; ++i) {
+                ngram_mod_state->add(context_tokens.data() + i);
+            }
+            ngram_mod_i_last = ctx_size;
+        }
+    }
+
+    // Need at least n tokens in context to form a key
+    if (ctx_size < n) {
+        return results;
+    }
+
+    // Build key: context[-n .. -2] + embd[0] (total n tokens)
+    // Note: context_tokens[-1] == embd[0] (already appended before this call),
+    // so the key prefix is context_tokens[ctx_size-n .. ctx_size-2], NOT ctx_size-n+1.
+    // result is a sliding buffer: result[i..i+n-1] = current key, result[n+i] = drafted token
+    std::vector<llama_token> result(n + max_draft, 0);
+    for (size_t i = 0; i < n - 1; ++i) {
+        result[i] = context_tokens[ctx_size - n + i];
+    }
+    result[n - 1] = embd[0];
+
+    // Greedily draft up to max_draft tokens using the hash
+    int drafted_count = 0;
+    for (int i = 0; i < max_draft; ++i) {
+        const llama_token tok = ngram_mod_state->get(result.data() + i);
+        if (tok == common_ngram_mod::EMPTY) {
+            break;
+        }
+        result[n + i] = tok;
+        drafted_count++;
+    }
+
+    if (drafted_count == 0) {
+        return results; // no prediction found in hash
+    }
+
+    // drafted_ids = [embd[0], drafted[0], drafted[1], ..., drafted[drafted_count-1]]
+    std::vector<llama_token> drafted_ids;
+    drafted_ids.push_back(embd[0]);
+    for (int i = 0; i < drafted_count; ++i) {
+        drafted_ids.push_back(result[n + i]);
+    }
+
+    // Batch-eval [embd[0], drafted[0..N-2]] through main model (mirrors speculative_decoding_eval_chunk)
+    std::vector<llama_token> real_embd = drafted_ids;
+    real_embd.pop_back();
+    kcpp_embd_batch batch = kcpp_embd_batch(real_embd, n_past, use_mrope, true);
+    if (llama_decode(main_ctx, batch.batch) != 0) {
+        printf("\nERROR: Prompt lookup batch eval failed!\n");
+        return results;
+    }
+    for (int i = 0; i < (int)drafted_ids.size() - 1; ++i) {
+        results.draftids.push_back(drafted_ids[i + 1]);
+        results.actual_logits.push_back(llama_get_logits_ith(main_ctx, i));
+    }
+    results.drafted_amount = (int)results.draftids.size();
     results.draft_success = true;
     return results;
 }
@@ -2798,6 +2885,26 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
         }
 
+        if (ngram_mod_state != nullptr) {
+            delete ngram_mod_state;
+            ngram_mod_state = nullptr;
+        }
+        lookup_ngram_min = inputs.lookup_ngram_min;
+        if (lookup_ngram_min > 0 && draft_ctx == nullptr && file_format == FileFormat::GGUF_GENERIC) {
+            if (llama_model_is_recurrent(llamamodel) || llama_model_is_hybrid(llamamodel)) {
+                printf("Warning: Prompt lookup decoding not supported with recurrent models. Disabling.\n");
+                lookup_ngram_min = 0;
+            } else {
+                speculative_chunk_amt = inputs.draft_amount;
+                ngram_mod_state = new common_ngram_mod(lookup_ngram_min, 4*1024*1024);
+                if (lookup_ngram_min < 16) {
+                    printf("Warning: --promptlookup n=%d is small; n>=16 recommended for good quality.\n", lookup_ngram_min);
+                }
+                printf("Prompt lookup speculative decoding enabled (n=%d, draft_amount=%d, table=%.1fMB)\n",
+                       lookup_ngram_min, speculative_chunk_amt, ngram_mod_state->size_bytes()/(1024.0*1024.0));
+            }
+        }
+
         //we cannot really trust the add bos in vocab. old models don't set it.
         // instead, we EXPLICITY need to find the add_bos_token key==false to automatically set it off.
         if(!llamamodel->vocab.get_add_bos() && add_bos_token && file_format_meta.explicitly_no_bos)
@@ -4349,6 +4456,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     int draft_successes = 0;
     int draft_failures = 0;
 
+    // Reset prompt lookup hash at the start of each generation call
+    if (ngram_mod_state != nullptr) {
+        ngram_mod_state->reset();
+        ngram_mod_i_last = 0;
+    }
+
     time0 = timer_check();
     timer_start();
 
@@ -4443,7 +4556,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     }
                     guidance_n_past += 1;
                 }
-                if(embd.size()!=1 || draft_ctx==nullptr || remaining_tokens<=speculative_chunk_amt || grammar!=nullptr || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
+                if(embd.size()!=1 || (draft_ctx==nullptr && lookup_ngram_min<=0) || remaining_tokens<=speculative_chunk_amt || grammar!=nullptr || startedsampling==false) //for large batch, or if no draft/lookup model, PP/TG as usual
                 {
                     draft_used = false;
                     kcpp_embd_batch batch = kcpp_embd_batch(embd, n_past, use_mrope, false);
@@ -4518,12 +4631,26 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     }
                 } else { //individual tokens AND speculative is used (generation)
                     draft_used = true;
-                    draft_results = speculative_decoding_eval_chunk(draft_ctx, llama_ctx_v4, embd, n_vocab, n_past);
-                    evalres = draft_results.draft_success;
-                    if(debugmode==1 && !is_quiet)
-                    {
-                        std::string draftedtoks = get_tok_vec_str(draft_results.draftids);
-                        printf("\nDrafted %d Tokens: [%s]\n",speculative_chunk_amt,draftedtoks.c_str());
+                    if (draft_ctx != nullptr) {
+                        draft_results = speculative_decoding_eval_chunk(draft_ctx, llama_ctx_v4, embd, n_vocab, n_past);
+                        evalres = draft_results.draft_success;
+                        if(debugmode==1 && !is_quiet)
+                        {
+                            std::string draftedtoks = get_tok_vec_str(draft_results.draftids);
+                            printf("\nDrafted %d Tokens: [%s]\n",speculative_chunk_amt,draftedtoks.c_str());
+                        }
+                    } else {
+                        draft_results = prompt_lookup_eval_chunk(llama_ctx_v4, current_context_tokens, embd, n_past, speculative_chunk_amt);
+                        evalres = draft_results.draft_success;
+                        if (!evalres) {
+                            // No ngram match found — fall back to normal single-token eval
+                            draft_used = false;
+                            kcpp_embd_batch batch = kcpp_embd_batch(embd, n_past, use_mrope, false);
+                            evalres = (llama_decode(llama_ctx_v4, batch.batch) == 0);
+                        } else if(debugmode==1 && !is_quiet) {
+                            std::string draftedtoks = get_tok_vec_str(draft_results.draftids);
+                            printf("\nDrafted %d Tokens (lookup): [%s]\n",draft_results.drafted_amount,draftedtoks.c_str());
+                        }
                     }
                 }
             }
