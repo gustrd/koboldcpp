@@ -11,7 +11,7 @@ KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models
 
 ### Features
 - Single file executable, with no installation required and no external dependencies
-- Runs on CPU or GPU, supports full or partial offloaded
+- Runs on CPU or GPU, supports full or partial offloaded (CUDA, Vulkan, ROCm, SYCL for Intel GPUs)
 - LLM text generation (Supports all GGML and GGUF models, backwards compatibility with ALL past models)
 - Image Generation (Stable Diffusion 1.5, SDXL, SD3, Flux)
 - Speech-To-Text (Voice Recognition) via Whisper
@@ -65,6 +65,44 @@ Finally, obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 - For beginners, we recommend the models [L3-8B-Stheno-v3.2](https://huggingface.co/bartowski/L3-8B-Stheno-v3.2-GGUF/resolve/main/L3-8B-Stheno-v3.2-Q4_K_S.gguf) (smaller and weaker) or [Tiefighter 13B](https://huggingface.co/KoboldAI/LLaMA2-13B-Tiefighter-GGUF/resolve/main/LLaMA2-13B-Tiefighter.Q4_K_S.gguf) (old but very versatile model) or [Gemma-3-27B Abliterated](https://huggingface.co/mlabonne/gemma-3-27b-it-abliterated-GGUF/resolve/main/gemma-3-27b-it-abliterated.q4_k_m.gguf) (largest and most powerful)
 - [Alternatively, you can download the tools to convert models to the GGUF format yourself here](https://kcpptools.concedo.workers.dev). Run `convert-hf-to-gguf.py` to convert them, then `quantize_gguf.exe` to quantize the result.
 - Other models for Whisper (speech recognition), Image Generation, Text to Speech or Image Recognition [can be found on the Wiki](https://github.com/LostRuins/koboldcpp/wiki#what-models-does-koboldcpp-support-what-architectures-are-supported)
+
+## Intel GPU Acceleration (SYCL)
+KoboldCpp supports Intel GPU acceleration via SYCL, enabling hardware-accelerated inference on Intel Arc, Flex, Data Center Max GPUs and integrated Intel graphics. This requires the [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html).
+
+### Using SYCL
+```
+python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
+# Specify a device ID (default: autodetect)
+python koboldcpp.py --usesycl 0 --gpulayers 99 --model model.gguf
+```
+
+### Compiling with SYCL on Linux
+1. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html)
+2. Source the oneAPI environment:
+   ```bash
+   source /opt/intel/oneapi/setvars.sh
+   ```
+3. Build the SYCL library:
+   ```bash
+   make LLAMA_SYCL=1 koboldcpp_sycl
+   ```
+4. Run:
+   ```bash
+   python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
+   ```
+
+### Compiling with SYCL on Windows
+1. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html) (includes the `icpx` compiler)
+2. Open the **Intel oneAPI Command Prompt** (sets up environment automatically)
+3. Build the SYCL library (using the w64devkit or MSYS2 make):
+   ```bash
+   make LLAMA_SYCL=1 koboldcpp_sycl
+   ```
+4. The `koboldcpp_sycl.dll` will be created in the project directory. Run:
+   ```bash
+   python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
+   ```
+   On Windows, the oneAPI runtime DLLs are located automatically via the `ONEAPI_ROOT` environment variable.
 
 ## Improving Performance
 - **GPU Acceleration**: If you're on Windows with an Nvidia GPU you can get CUDA support out of the box using the `--usecuda`  flag (Nvidia Only), or `--usevulkan` (Any GPU), make sure you select the correct .exe with CUDA support.
