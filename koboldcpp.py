@@ -708,22 +708,24 @@ lib_cublas = pick_existant_file("koboldcpp_cublas.dll","koboldcpp_cublas.so")
 lib_hipblas = pick_existant_file("koboldcpp_hipblas.dll","koboldcpp_hipblas.so")
 lib_vulkan = pick_existant_file("koboldcpp_vulkan.dll","koboldcpp_vulkan.so")
 lib_vulkan_noavx2 = pick_existant_file("koboldcpp_vulkan_noavx2.dll","koboldcpp_vulkan_noavx2.so")
+lib_sycl = pick_existant_file("koboldcpp_sycl.dll","koboldcpp_sycl.so")
 libname = ""
 lib_option_pairs = [
     (lib_default, "Use CPU"),
     (lib_cublas, "Use CUDA"),
     (lib_hipblas, "Use hipBLAS (ROCm)"),
     (lib_vulkan, "Use Vulkan"),
+    (lib_sycl, "Use SYCL (Intel GPU)"),
     (lib_noavx2, "Use CPU (Old CPU)"),
     (lib_vulkan_noavx2, "Use Vulkan (Old CPU)"),
     (lib_vulkan_failsafe, "Use Vulkan (Older CPU)"),
     (lib_failsafe, "Failsafe Mode (Older CPU)")]
-default_option, cublas_option, hipblas_option, vulkan_option, noavx2_option, vulkan_noavx2_option, vulkan_failsafe_option, failsafe_option = (opt if file_exists(lib) or (os.name == 'nt' and file_exists(opt + ".dll")) else None for lib, opt in lib_option_pairs)
+default_option, cublas_option, hipblas_option, vulkan_option, sycl_option, noavx2_option, vulkan_noavx2_option, vulkan_failsafe_option, failsafe_option = (opt if file_exists(lib) or (os.name == 'nt' and file_exists(opt + ".dll")) else None for lib, opt in lib_option_pairs)
 runopts = [opt for lib, opt in lib_option_pairs if file_exists(lib)]
 
 def init_library():
     global handle, args, libname
-    global lib_default,lib_failsafe,lib_noavx2,lib_vulkan_failsafe,lib_cublas,lib_hipblas,lib_vulkan,lib_vulkan_noavx2
+    global lib_default,lib_failsafe,lib_noavx2,lib_vulkan_failsafe,lib_cublas,lib_hipblas,lib_vulkan,lib_vulkan_noavx2,lib_sycl
 
     libname = lib_default
 
@@ -747,6 +749,9 @@ def init_library():
             libname = lib_vulkan
         elif file_exists(lib_vulkan_noavx2):
             libname = lib_vulkan_noavx2
+    elif (args.usesycl is not None):
+        if file_exists(lib_sycl):
+            libname = lib_sycl
     elif libname == lib_default and not file_exists(lib_default) and file_exists(lib_noavx2):
         libname = lib_noavx2
 
@@ -765,6 +770,10 @@ def init_library():
                 os.add_dll_directory(newpath)
         if libname == lib_hipblas and "HIP_PATH" in os.environ:
             newpath = os.path.join(os.environ["HIP_PATH"], "bin")
+            if os.path.exists(newpath):
+                os.add_dll_directory(newpath)
+        if libname == lib_sycl and "ONEAPI_ROOT" in os.environ:
+            newpath = os.path.join(os.environ["ONEAPI_ROOT"], "compiler", "latest", "bin")
             if os.path.exists(newpath):
                 os.add_dll_directory(newpath)
 
@@ -871,6 +880,10 @@ def set_backend_props(inputs):
                 inputs.kcpp_main_gpu = 2
             elif (args.usecuda and "3" in args.usecuda):
                 inputs.kcpp_main_gpu = 3
+
+    if args.usesycl is not None and len(args.usesycl) > 0:
+        device_id = args.usesycl[0]
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{device_id}"
 
     if args.usevulkan: #is an empty array if using vulkan without defined gpu
         s = ""
@@ -9251,6 +9264,7 @@ if __name__ == '__main__':
     compatgroup = parser.add_mutually_exclusive_group()
     compatgroup.add_argument("--usecuda", "--usecublas", "--usehipblas", help="Use CUDA for GPU Acceleration. Requires CUDA. Enter a number afterwards to select and use 1 GPU. Leaving no number will use all GPUs.", nargs='*',metavar=('[main GPU ID] [mmq|nommq] [rowsplit]'), choices=['normal', 'lowvram', '0', '1', '2', '3', 'all', 'mmq', 'nommq', 'rowsplit'])
     compatgroup.add_argument("--usevulkan", help="Use Vulkan for GPU Acceleration. Can optionally specify one or more GPU Device ID (e.g. --usevulkan 0), leave blank to autodetect.", metavar=('[Device IDs]'), nargs='*', type=int, default=None)
+    compatgroup.add_argument("--usesycl", help="Use SYCL for GPU Acceleration on Intel GPUs. Requires Intel oneAPI. Can optionally specify a device ID (e.g. --usesycl 0), leave blank to autodetect.", metavar=('[Device ID]'), nargs='*', type=int, default=None)
     compatgroup.add_argument("--usecpu", help="Do not use any GPU acceleration (CPU Only)", action='store_true')
     parser.add_argument("--contextsize","--ctx-size", "-c", help="Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default 8192).",metavar=('[256 to 262144]'), type=check_range(int,256,262144), default=8192)
     parser.add_argument("--gpulayers","--gpu-layers","--n-gpu-layers","-ngl", help="Set number of layers to offload to GPU when using GPU. Requires GPU. Set to -1 to try autodetect, set to 0 to disable GPU offload.",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=-1)

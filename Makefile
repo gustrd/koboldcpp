@@ -3,7 +3,7 @@
 
 .PHONY: finishedmsg
 
-default: koboldcpp_default koboldcpp_failsafe koboldcpp_noavx2 koboldcpp_vulkan_failsafe koboldcpp_cublas koboldcpp_hipblas koboldcpp_vulkan koboldcpp_vulkan_noavx2 finishedmsg
+default: koboldcpp_default koboldcpp_failsafe koboldcpp_noavx2 koboldcpp_vulkan_failsafe koboldcpp_cublas koboldcpp_hipblas koboldcpp_vulkan koboldcpp_vulkan_noavx2 koboldcpp_sycl finishedmsg
 tools: quantize_gpt2 quantize_gptj quantize_gguf quantize_neox quantize_mpt quantize_clip ttsmain whispermain sdmain gguf-split
 
 ifndef UNAME_S
@@ -109,6 +109,24 @@ CUBLAS_FLAGS =
 endif
 CUBLASLD_FLAGS =
 CUBLAS_OBJS =
+
+SYCL_FLAGS =
+SYCLCXX =
+SYCLCXXFLAGS =
+SYCLLD_FLAGS =
+SYCL_INCLUDES =
+SYCL_OBJS =
+ifdef LLAMA_SYCL
+SYCL_PATH   ?= /opt/intel/oneapi
+SYCL_FLAGS   = -DGGML_USE_SYCL
+SYCLCXX      = icpx
+SYCLCXXFLAGS = -fsycl
+SYCLLD_FLAGS = -fsycl -lsycl -lOpenCL \
+               -lmkl_sycl_blas -lmkl_intel_ilp64 -lmkl_tbb_thread -lmkl_core \
+               -L$(SYCL_PATH)/mkl/latest/lib -L$(SYCL_PATH)/compiler/latest/lib
+SYCL_INCLUDES = -I$(SYCL_PATH)/mkl/latest/include -Iggml/src/ggml-sycl
+SYCL_OBJS = $(patsubst %.cpp,%.o,$(wildcard ggml/src/ggml-sycl/*.cpp))
+endif
 
 OBJS_FULL += ggml-alloc.o ggml-cpu-traits.o ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm.o common.o llama-impl.o sampling.o kcpputils.o mtmdaudio.o
 OBJS_SIMPLE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx2.o ggml-cpu-quants.o kcpp-quantmapper_noavx2.o kcpp-repackmapper_noavx2.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx2.o common.o llama-impl.o sampling.o kcpputils.o mtmdaudio.o
@@ -413,6 +431,7 @@ NOAVX2_BUILD =
 CUBLAS_BUILD =
 HIPBLAS_BUILD =
 VULKAN_BUILD =
+SYCL_BUILD =
 NOTIFY_MSG =
 
 ifeq ($(OS),Windows_NT)
@@ -432,6 +451,9 @@ endif
 ifdef LLAMA_HIPBLAS
 HIPBLAS_BUILD = $(HCXX) $(CXXFLAGS) $(HIPFLAGS) $^ -shared -o $@.dll $(HIPLDFLAGS) $(LDFLAGS)
 endif
+ifdef LLAMA_SYCL
+SYCL_BUILD = $(SYCLCXX) $(SYCLCXXFLAGS) $(CXXFLAGS) $(SYCL_FLAGS) $(SYCL_INCLUDES) $^ -shared -o $@.dll $(SYCLLD_FLAGS) $(LDFLAGS)
+endif
 else
 DEFAULT_BUILD = $(CXX) $(CXXFLAGS)  $^ -shared -o $@.so $(LDFLAGS)
 ifdef LLAMA_PORTABLE
@@ -449,6 +471,9 @@ HIPBLAS_BUILD = $(HCXX) $(CXXFLAGS) $(HIPFLAGS) $^ -shared -o $@.so $(HIPLDFLAGS
 endif
 ifdef LLAMA_VULKAN
 VULKAN_BUILD = $(CXX) $(CXXFLAGS) $^ -lvulkan -shared -o $@.so $(LDFLAGS)
+endif
+ifdef LLAMA_SYCL
+SYCL_BUILD = $(SYCLCXX) $(SYCLCXXFLAGS) $(CXXFLAGS) $(SYCL_FLAGS) $(SYCL_INCLUDES) $^ -shared -o $@.so $(SYCLLD_FLAGS) $(LDFLAGS)
 endif
 endif
 
@@ -649,6 +674,27 @@ ggml_v1.o: otherarch/ggml_v1.c otherarch/ggml_v1.h
 ggml_v1_failsafe.o: otherarch/ggml_v1.c otherarch/ggml_v1.h
 	$(CC)  $(FASTCFLAGS) $(NONECFLAGS) -c $< -o $@
 
+#sycl
+ifdef LLAMA_SYCL
+ggml/src/ggml-sycl/%.o: ggml/src/ggml-sycl/%.cpp
+	$(SYCLCXX) $(SYCLCXXFLAGS) $(subst -Ofast,-O3,$(CXXFLAGS)) $(SYCL_FLAGS) $(SYCL_INCLUDES) -Wno-pedantic -c $< -o $@
+endif
+
+ggml_v4_sycl.o: ggml/src/ggml.c ggml/include/ggml.h
+	$(CC)  $(FASTCFLAGS) $(FULLCFLAGS) $(SYCL_FLAGS) -c $< -o $@
+ggml-backend_sycl.o: ggml/src/ggml-backend.cpp ggml/src/ggml-backend-impl.h ggml/include/ggml.h ggml/include/ggml-backend.h
+	$(CXX)  $(CXXFLAGS) $(SYCL_FLAGS) -c $< -o $@
+ggml-backend-reg_sycl.o: ggml/src/ggml-backend-reg.cpp ggml/src/ggml-backend-impl.h ggml/include/ggml.h ggml/include/ggml-backend.h ggml/include/ggml-cpu.h
+	$(CXX)  $(CXXFLAGS) $(SYCL_FLAGS) $(SYCL_INCLUDES) -c $< -o $@
+gpttype_adapter_sycl.o: $(GPTTYPE_ADAPTER)
+	$(CXX) $(CXXFLAGS) $(SYCL_FLAGS) $(SYCL_INCLUDES) -c $< -o $@
+sdcpp_sycl.o: otherarch/sdcpp/sdtype_adapter.cpp otherarch/sdcpp/stable-diffusion.h otherarch/sdcpp/stable-diffusion.cpp otherarch/sdcpp/util.cpp otherarch/sdcpp/upscaler.cpp otherarch/sdcpp/model.cpp otherarch/sdcpp/name_conversion.cpp otherarch/sdcpp/tokenize_util.cpp otherarch/sdcpp/thirdparty/zip.c
+	$(CXX) $(CXXFLAGS) $(SYCL_FLAGS) -c $< -o $@
+whispercpp_sycl.o: otherarch/whispercpp/whisper_adapter.cpp
+	$(CXX) $(CXXFLAGS) $(SYCL_FLAGS) -c $< -o $@
+llavaclip_sycl.o: tools/mtmd/clip.cpp tools/mtmd/clip.h
+	$(CXX) $(CXXFLAGS) $(SYCL_FLAGS) $(SYCL_INCLUDES) -c $< -o $@
+
 #vulkan
 ggml-vulkan.o: ggml/src/ggml-vulkan/ggml-vulkan.cpp ggml/include/ggml-vulkan.h $(VKGEN_CPP)
 	$(CXX) $(CXXFLAGS) $(VKGEN_NOEXT_ADD) $(VULKAN_FLAGS) -c $< -o $@
@@ -715,9 +761,10 @@ gpttype_adapter_vulkan_noavx2.o: $(GPTTYPE_ADAPTER)
 	$(CXX) $(CXXFLAGS) $(FAILSAFE_FLAGS) $(VULKAN_FLAGS) -c $< -o $@
 
 clean:
-	rm -vf *.o main ttsmain sdmain whispermain quantize_gguf quantize_clip quantize_gpt2 quantize_gptj quantize_neox quantize_mpt vulkan-shaders-gen vulkan-shaders-gen-noext gguf-split mtmd-cli mainvk fitparams embedding embeddingvk qwen3tts acestep-a acestep-b acestep-b.exe acestep-a.exe qwen3tts.exe embeddingvk.exe embedding.exe fitparams.exe mainvk.exe mtmd-cli.exe gguf-split.exe vulkan-shaders-gen.exe vulkan-shaders-gen-noext.exe main.exe ttsmain.exe sdmain.exe whispermain.exe quantize_clip.exe quantize_gguf.exe quantize_gptj.exe quantize_gpt2.exe quantize_neox.exe quantize_mpt.exe koboldcpp_default.dll koboldcpp_failsafe.dll koboldcpp_noavx2.dll koboldcpp_vulkan_failsafe.dll koboldcpp_cublas.dll koboldcpp_hipblas.dll koboldcpp_vulkan.dll koboldcpp_vulkan_noavx2.dll koboldcpp_default.so koboldcpp_failsafe.so koboldcpp_noavx2.so koboldcpp_vulkan_failsafe.so koboldcpp_cublas.so koboldcpp_hipblas.so koboldcpp_vulkan.so koboldcpp_vulkan_noavx2.so ggml/src/ggml-vulkan-shaders.cpp ggml/src/ggml-vulkan-shaders.hpp ggml/src/ggml-vulkan-shaders-noext.cpp ggml/src/ggml-vulkan-shaders-noext.hpp
+	rm -vf *.o main ttsmain sdmain whispermain quantize_gguf quantize_clip quantize_gpt2 quantize_gptj quantize_neox quantize_mpt vulkan-shaders-gen vulkan-shaders-gen-noext gguf-split mtmd-cli mainvk fitparams embedding embeddingvk qwen3tts acestep-a acestep-b acestep-b.exe acestep-a.exe qwen3tts.exe embeddingvk.exe embedding.exe fitparams.exe mainvk.exe mtmd-cli.exe gguf-split.exe vulkan-shaders-gen.exe vulkan-shaders-gen-noext.exe main.exe ttsmain.exe sdmain.exe whispermain.exe quantize_clip.exe quantize_gguf.exe quantize_gptj.exe quantize_gpt2.exe quantize_neox.exe quantize_mpt.exe koboldcpp_default.dll koboldcpp_failsafe.dll koboldcpp_noavx2.dll koboldcpp_vulkan_failsafe.dll koboldcpp_cublas.dll koboldcpp_hipblas.dll koboldcpp_vulkan.dll koboldcpp_vulkan_noavx2.dll koboldcpp_sycl.dll koboldcpp_default.so koboldcpp_failsafe.so koboldcpp_noavx2.so koboldcpp_vulkan_failsafe.so koboldcpp_cublas.so koboldcpp_hipblas.so koboldcpp_vulkan.so koboldcpp_vulkan_noavx2.so koboldcpp_sycl.so ggml/src/ggml-vulkan-shaders.cpp ggml/src/ggml-vulkan-shaders.hpp ggml/src/ggml-vulkan-shaders-noext.cpp ggml/src/ggml-vulkan-shaders-noext.hpp
 	rm -vrf ggml/src/ggml-cuda/*.o
 	rm -vrf ggml/src/ggml-cuda/template-instances/*.o
+	rm -vrf ggml/src/ggml-sycl/*.o
 	rm -vrf llguidance
 
 # useful tools
@@ -876,6 +923,14 @@ koboldcpp_hipblas: ggml_v4_cublas.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops
 	$(HIPBLAS_BUILD)
 else
 koboldcpp_hipblas:
+	$(DONOTHING)
+endif
+
+ifdef SYCL_BUILD
+koboldcpp_sycl: ggml_v4_sycl.o ggml-cpu.o ggml-ops.o ggml-vec.o ggml-binops.o ggml-unops.o ggml_v3_cublas.o ggml_v2_cublas.o ggml_v1.o expose.o gpttype_adapter_sycl.o sdcpp_sycl.o whispercpp_sycl.o tts_default.o music_default.o embeddings_default.o llavaclip_sycl.o llava.o ggml-backend_sycl.o ggml-backend-reg_sycl.o ggml-repack.o $(SYCL_OBJS) $(OBJS_FULL) $(OBJS)
+	$(SYCL_BUILD)
+else
+koboldcpp_sycl:
 	$(DONOTHING)
 endif
 
