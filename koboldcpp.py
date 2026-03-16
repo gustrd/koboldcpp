@@ -772,12 +772,30 @@ def init_library():
             newpath = os.path.join(os.environ["HIP_PATH"], "bin")
             if os.path.exists(newpath):
                 os.add_dll_directory(newpath)
-        if libname == lib_sycl and "ONEAPI_ROOT" in os.environ:
-            newpath = os.path.join(os.environ["ONEAPI_ROOT"], "compiler", "latest", "bin")
-            if os.path.exists(newpath):
-                os.add_dll_directory(newpath)
+        if libname == lib_sycl:
+            oneapi_root = os.environ.get("ONEAPI_ROOT", "C:/Program Files (x86)/Intel/oneAPI")
+            sycl_dll_dirs = [
+                os.path.join(oneapi_root, "compiler", "latest", "bin"),
+                os.path.join(oneapi_root, "mkl", "latest", "redist", "intel64"),
+                os.path.join(oneapi_root, "tbb", "latest", "redist", "intel64", "vc_mt"),
+            ]
+            for newpath in sycl_dll_dirs:
+                if os.path.exists(newpath):
+                    os.add_dll_directory(newpath)
+            # Also pick up any PATH entries that setvars.bat added for oneAPI
+            for pathentry in os.environ.get("PATH", "").split(os.pathsep):
+                if pathentry and "oneAPI" in pathentry and os.path.isdir(pathentry):
+                    try:
+                        os.add_dll_directory(pathentry)
+                    except Exception:
+                        pass
 
-    handle = ctypes.CDLL(os.path.join(dir_path, libname))
+    if os.name == 'nt' and libname == lib_sycl:
+        # winmode=0 uses classic LoadLibrary search order (respects PATH),
+        # needed because Intel setvars.bat adds DLL dirs to PATH.
+        handle = ctypes.CDLL(os.path.join(dir_path, libname), winmode=0)
+    else:
+        handle = ctypes.CDLL(os.path.join(dir_path, libname))
 
     handle.load_model.argtypes = [load_model_inputs]
     handle.load_model.restype = ctypes.c_bool

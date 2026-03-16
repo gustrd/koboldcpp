@@ -92,17 +92,23 @@ python koboldcpp.py --usesycl 0 --gpulayers 99 --model model.gguf
    ```
 
 ### Compiling with SYCL on Windows
-1. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html) (includes the `icpx` compiler)
-2. Open the **Intel oneAPI Command Prompt** (sets up environment automatically)
-3. Build the SYCL library (using the w64devkit or MSYS2 make):
+1. Install **Visual Studio 2022** (Build Tools or Community) with the **"Desktop development with C++"** workload.
+2. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html).
+3. To keep your build in `w64devkit` while using `icpx`, you must initialize the environment in a standard `cmd.exe` first:
+   - Open `cmd.exe`.
+   - Initialize MSVC (adjust path for Community vs BuildTools):
+     `"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64`
+   - Initialize oneAPI:
+     `"C:\Program Files (x86)\Intel\oneAPI\setvars.bat"`
+   - Launch your build terminal (inherits variables): `C:\path\to\w64devkit.exe`
+4. Now, within the `w64devkit` terminal, build the SYCL library:
    ```bash
    make LLAMA_SYCL=1 koboldcpp_sycl
    ```
-4. The `koboldcpp_sycl.dll` will be created in the project directory. Run:
+5. The `koboldcpp_sycl.dll` will be created. Run:
    ```bash
    python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
    ```
-   On Windows, the oneAPI runtime DLLs are located automatically via the `ONEAPI_ROOT` environment variable.
 
 ## Improving Performance
 - **GPU Acceleration**: If you're on Windows with an Nvidia GPU you can get CUDA support out of the box using the `--usecuda`  flag (Nvidia Only), or `--usevulkan` (Any GPU), make sure you select the correct .exe with CUDA support.
@@ -143,6 +149,15 @@ when you can't use the precompiled binary directly, we provide an automated buil
   - To make your build sharable and capable of working on other devices, you must use `LLAMA_PORTABLE=1`
   - If you want to generate the .exe file, make sure you have the python module PyInstaller installed with pip (`pip install PyInstaller`). Then run the script `make_pyinstaller.bat`
   - The koboldcpp.exe file will be at your dist folder.
+- **Building with Intel SYCL (Windows)**:
+  - Requires: **Visual Studio Build Tools (C++ workload)** and **Intel oneAPI Base Toolkit**.
+  - Open a clean `cmd.exe` (NOT PowerShell) and run the following initialization scripts (paths may vary based on your installation):
+    1. `"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64`
+    2. `"C:\Program Files (x86)\Intel\oneAPI\setvars.bat"`
+  - Launch `w64devkit.exe` from that same command prompt.
+  - Run `MSYS_NO_PATHCONV=1 make clean` first to ensure no incompatible object files remain.
+  - Compile the library with: `MSYS_NO_PATHCONV=1 make LLAMA_SYCL=1 koboldcpp_sycl`
+  - *Note: On Windows, this build requires the Intel compiler for all components to ensure ABI compatibility. The Makefile handles this by forcing CC/CXX to the oneAPI compilers when LLAMA_SYCL is enabled.*
 - **Building with CUDA**: Visual Studio, CMake and CUDA Toolkit is required. Clone the repo, then open the CMake file and compile it in Visual Studio. Copy the `koboldcpp_cublas.dll` generated into the same directory as the `koboldcpp.py` file. If you are bundling executables, you may need to include CUDA dynamic libraries (such as `cublasLt64_11.dll` and `cublas64_11.dll`) in order for the executable to work correctly on a different PC.
 - **Replacing Libraries (Not Recommended)**: If you wish to use your own version of the additional Windows libraries (Vulkan), you can do it with:
   - Move the respectives .lib files to the /lib folder of your project, overwriting the older files.

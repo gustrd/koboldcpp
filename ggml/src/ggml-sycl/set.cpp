@@ -42,7 +42,7 @@ void ggml_sycl_op_set(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     GGML_ASSERT(dst->type == src0->type && src0->type == src1->type && dst->type == GGML_TYPE_F32);
 
     const int32_t* opts = (const int32_t*) dst->op_params;
-    const int64_t nb[3]     = {opts[0]/sizeof(float), opts[1]/sizeof(float), opts[2]/sizeof(float)};
+    const int64_t nb[3]     = { (int64_t)(opts[0]/sizeof(float)), (int64_t)(opts[1]/sizeof(float)), (int64_t)(opts[2]/sizeof(float)) };
     const int64_t offset_elem = opts[3] / sizeof(float);
     const bool inplace = opts[4];
 
@@ -57,7 +57,7 @@ void ggml_sycl_op_set(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
         stream->memcpy(dst_ptr, src0_ptr, ggml_nbytes(dst));
 
     const int64_t ne[4] = {src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]};
-    const int64_t src_nb[3] = {src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float)};
+    const int64_t src_nb[3] = { (int64_t)(src1->nb[1]/sizeof(float)), (int64_t)(src1->nb[2]/sizeof(float)), (int64_t)(src1->nb[3]/sizeof(float)) };
 
     const size_t total_threads = ne[0]*ne[1]*ne[2]*ne[3];
     const size_t grid_size = ((total_threads + SYCL_SET_BLOCK_SIZE - 1) / SYCL_SET_BLOCK_SIZE) * SYCL_SET_BLOCK_SIZE;
