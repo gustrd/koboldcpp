@@ -130,6 +130,9 @@ tests/test-tokenizer-1-bpe
 /koboldcpp_cublas.dll
 /koboldcpp_vulkan.dll
 /koboldcpp_sycl.dll
+/koboldcpp_sycl.def
+/koboldcpp_sycl.exp
+/koboldcpp_sycl.lib
 /cublas64_11.dll
 /cublasLt64_11.dll
 /cublas64_12.dll
