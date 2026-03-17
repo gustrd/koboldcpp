@@ -115,7 +115,7 @@ CUBLASLD_FLAGS =
 CUBLAS_OBJS =
 
 ifdef LLAMA_SYCL
-SYCL_FLAGS   = -DGGML_USE_SYCL -DGGML_SYCL_WARP_SIZE=16
+SYCL_FLAGS   = -DGGML_USE_SYCL -DGGML_SYCL_WARP_SIZE=32
 SYCLCXXFLAGS = -fsycl
 ifeq ($(OS),Windows_NT)
   # Default paths for Windows Intel oneAPI and MSVC
@@ -141,7 +141,7 @@ ifeq ($(OS),Windows_NT)
   # Essential Windows system libraries required for CPU probing/registry access
   LDFLAGS  += -ladvapi32 -lkernel32 -luser32 -lshell32 -Xlinker /NODEFAULTLIB:libucrt.lib -Xlinker /NODEFAULTLIB:libcmt.lib
   # SYCL defines only - no -fsycl here so C files aren't forced into C++ mode
-  SYCL_FLAGS = -DGGML_USE_SYCL -DGGML_SYCL_WARP_SIZE=16
+  SYCL_FLAGS = -DGGML_USE_SYCL -DGGML_SYCL_WARP_SIZE=32
   # SYCL-specific flags - we keep these separate from global CFLAGS/CXXFLAGS
   # -fsycl must come before -fsycl-host-compiler-options and is C++ only
   SYCL_FINAL_CXXFLAGS = $(subst -Ofast,-O3,$(CXXFLAGS)) -fsycl -fsycl-host-compiler-options="/bigobj /MD" -Wno-unused-command-line-argument
