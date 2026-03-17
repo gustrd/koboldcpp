@@ -752,6 +752,45 @@ def init_library():
     elif (args.usesycl is not None):
         if file_exists(lib_sycl):
             libname = lib_sycl
+            if os.name == 'nt':
+                # Check that setvars.bat has been sourced (it sets CMPLR_ROOT, MKLROOT, etc.)
+                oneapi_active = "CMPLR_ROOT" in os.environ
+                if not oneapi_active:
+                    # Fallback: look for oneAPI compiler entries in PATH
+                    for pathentry in os.environ.get("PATH", "").split(os.pathsep):
+                        if "oneAPI" in pathentry and "compiler" in pathentry.lower():
+                            oneapi_active = True
+                            break
+                if not oneapi_active:
+                    print("==========================================================")
+                    print("  ERROR: Intel oneAPI environment not detected!")
+                    print("")
+                    print("  SYCL backend requires the oneAPI runtime libraries.")
+                    print("  Before running KoboldCpp with --usesycl, you must:")
+                    print("")
+                    print("  1. Open cmd.exe and run:")
+                    print(r'     "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"')
+                    print("")
+                    print("  2. Set recommended optimization variables:")
+                    print("     set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1")
+                    print("     set SYCL_CACHE_PERSISTENT=1")
+                    print("")
+                    print("  3. Then launch KoboldCpp from that same terminal.")
+                    print("==========================================================")
+                    sys.exit(1)
+                # Warn if performance-critical variables are missing
+                missing_vars = []
+                if not os.environ.get("SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"):
+                    missing_vars.append("  set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1  (reduces GPU latency)")
+                if not os.environ.get("SYCL_CACHE_PERSISTENT"):
+                    missing_vars.append("  set SYCL_CACHE_PERSISTENT=1  (caches compiled kernels, speeds up future launches)")
+                if missing_vars:
+                    print("----------------------------------------------------------")
+                    print("  WARNING: Recommended SYCL optimization variables not set.")
+                    print("  For best performance, run before launching:")
+                    for v in missing_vars:
+                        print(v)
+                    print("----------------------------------------------------------")
     elif libname == lib_default and not file_exists(lib_default) and file_exists(lib_noavx2):
         libname = lib_noavx2
 
@@ -7804,7 +7843,7 @@ def load_config_cli(filename):
                 setattr(args, key, value)
         if args.istemplate:
             print("\nA .kcppt template was selected from CLI...")
-            if (args.usecuda is None) and (args.usevulkan is None):
+            if (args.usecuda is None) and (args.usevulkan is None) and (args.usesycl is None):
                 print("Automatically selecting your backend...")
                 auto_set_backend_cli()
 
@@ -7823,6 +7862,7 @@ def convert_args_to_template(savdict):
     savdict["ssl"] = None
     savdict["usecuda"] = None
     savdict["usevulkan"] = None
+    savdict["usesycl"] = None
     savdict["usecpu"] = None
     savdict["tensor_split"] = None
     savdict["draftgpusplit"] = None

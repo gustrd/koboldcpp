@@ -1,3 +1,75 @@
+> **[!WARNING]**
+> **This is an experimental SYCL fork** for Intel GPU acceleration, **tested only on Windows** with an Intel Arc 140V (Lunar Lake iGPU).
+> It is not the official KoboldCpp. For the stable, full-featured release see the [upstream project by LostRuins](https://github.com/LostRuins/koboldcpp).
+
+---
+
+## Quick Start — SYCL on Windows (This Fork)
+
+### Prerequisites
+- **Intel oneAPI Base Toolkit** ([download](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html))
+- **Visual Studio 2022 Build Tools** with the "Desktop development with C++" workload ([download](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022))
+- **w64devkit** — the vanilla x64 release ([download](https://github.com/skeeto/w64devkit/releases))
+- Python 3.x
+
+### Building
+
+> **Important:** All objects are compiled with Intel's `icpx` compiler to avoid ABI mismatches with the SYCL runtime. You must initialize both MSVC and oneAPI environments **before** launching w64devkit.
+
+Open `cmd.exe` (**not** PowerShell) and run these commands in order:
+
+```cmd
+:: 1. Initialize MSVC (adjust path if you have Community instead of BuildTools)
+"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+:: 2. Initialize Intel oneAPI
+"C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+
+:: 3. Launch w64devkit from this same prompt (it inherits the environment)
+C:\path\to\w64devkit.exe
+```
+
+Inside the w64devkit terminal:
+
+```bash
+# Clean any old build artifacts (required if switching from a non-SYCL build)
+MSYS_NO_PATHCONV=1 make clean
+
+# Build the SYCL library
+MSYS_NO_PATHCONV=1 make LLAMA_SYCL=1
+```
+
+### Running
+
+The oneAPI runtime DLLs must be resolvable at launch time. The easiest way is to **source `setvars.bat` in the same `cmd.exe` session** before running Python.
+
+**Recommended environment variables** (set these every session, or put them in a launcher script):
+
+| Variable | Value | Effect |
+|---|---|---|
+| `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS` | `1` | Uses immediate command lists — reduces GPU submission latency, especially beneficial on Lunar Lake |
+| `SYCL_CACHE_PERSISTENT` | `1` | Caches JIT-compiled SYCL kernels to disk — first run is slow, subsequent runs are much faster |
+
+Full launch sequence:
+
+```cmd
+:: In cmd.exe — run setvars.bat first
+"C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+
+:: Recommended optimizations
+set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+set SYCL_CACHE_PERSISTENT=1
+
+:: Launch (auto-detects your Intel GPU)
+python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
+```
+
+> **Tip:** To target a specific device use `--usesycl 0` (device index). Leave blank to auto-detect.
+
+KoboldCpp will print an error and exit if `setvars.bat` has not been sourced, guiding you through the correct setup steps.
+
+---
+
 # koboldcpp
 
 KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models, inspired by the original **KoboldAI**. It's a single self-contained distributable that builds off **llama.cpp** and adds many additional powerful features. [Download Releases Here](https://github.com/LostRuins/koboldcpp/releases/latest).
@@ -67,16 +139,36 @@ Finally, obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 - Other models for Whisper (speech recognition), Image Generation, Text to Speech or Image Recognition [can be found on the Wiki](https://github.com/LostRuins/koboldcpp/wiki#what-models-does-koboldcpp-support-what-architectures-are-supported)
 
 ## Intel GPU Acceleration (SYCL)
+
+> **Note:** SYCL support in this fork is **experimental** and has been tested only on Windows with an Intel Arc 140V (Lunar Lake). Linux instructions are included for reference but are **untested on this fork**.
+
 KoboldCpp supports Intel GPU acceleration via SYCL, enabling hardware-accelerated inference on Intel Arc, Flex, Data Center Max GPUs and integrated Intel graphics. This requires the [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html).
 
 ### Using SYCL
-```
+```bash
+# Auto-detect Intel GPU
 python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
-# Specify a device ID (default: autodetect)
+
+# Specify a device ID explicitly
 python koboldcpp.py --usesycl 0 --gpulayers 99 --model model.gguf
 ```
 
-### Compiling with SYCL on Linux
+Before running, set the recommended environment variables (see the [Quick Start](#quick-start--sycl-on-windows-this-fork) section at the top of this README for details):
+```cmd
+set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+set SYCL_CACHE_PERSISTENT=1
+```
+
+### Compiling with SYCL on Windows *(tested)*
+See the full step-by-step instructions in the [Quick Start](#quick-start--sycl-on-windows-this-fork) section above.
+
+In short, from a `cmd.exe` initialized with both MSVC and oneAPI environments, inside w64devkit:
+```bash
+MSYS_NO_PATHCONV=1 make clean
+MSYS_NO_PATHCONV=1 make LLAMA_SYCL=1 koboldcpp_sycl
+```
+
+### Compiling with SYCL on Linux *(untested on this fork)*
 1. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html)
 2. Source the oneAPI environment:
    ```bash
@@ -87,25 +179,6 @@ python koboldcpp.py --usesycl 0 --gpulayers 99 --model model.gguf
    make LLAMA_SYCL=1 koboldcpp_sycl
    ```
 4. Run:
-   ```bash
-   python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
-   ```
-
-### Compiling with SYCL on Windows
-1. Install **Visual Studio 2022** (Build Tools or Community) with the **"Desktop development with C++"** workload.
-2. Install [Intel oneAPI Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html).
-3. To keep your build in `w64devkit` while using `icpx`, you must initialize the environment in a standard `cmd.exe` first:
-   - Open `cmd.exe`.
-   - Initialize MSVC (adjust path for Community vs BuildTools):
-     `"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64`
-   - Initialize oneAPI:
-     `"C:\Program Files (x86)\Intel\oneAPI\setvars.bat"`
-   - Launch your build terminal (inherits variables): `C:\path\to\w64devkit.exe`
-4. Now, within the `w64devkit` terminal, build the SYCL library:
-   ```bash
-   make LLAMA_SYCL=1 koboldcpp_sycl
-   ```
-5. The `koboldcpp_sycl.dll` will be created. Run:
    ```bash
    python koboldcpp.py --usesycl --gpulayers 99 --model model.gguf
    ```
