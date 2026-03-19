@@ -45,6 +45,62 @@
 static_assert((int)SD_TYPE_COUNT == (int)GGML_TYPE_COUNT,
               "inconsistency between SD_TYPE_COUNT and GGML_TYPE_COUNT");
 
+struct LoraMap {
+    std::vector<std::pair<std::string, float>> items;
+    std::unordered_map<std::string, std::size_t> index;
+
+    void add_lora(const std::string& k, float v) {
+        auto it = index.find(k);
+        if (it == index.end()) {
+            index[k] = items.size();
+            items.emplace_back(k, v);
+        } else {
+            items[it->second].second += v;
+        }
+    }
+
+    float check_small_mult(float mult) {
+        if (mult > 1e-6 || mult < -1e-6)
+            return mult;
+        return 0.f;
+    }
+
+    float get_mult(const std::string& k) {
+        auto lora = index.find(k);
+        if (lora == index.end()) return 0.f;
+        return check_small_mult(items[lora->second].second);
+    }
+
+    std::vector<sd_lora_t> get_lora_specs(bool include_zeroes = false) {
+        std::vector<sd_lora_t> lora_specs;
+        for (const auto & lora: items) {
+            float multiplier = check_small_mult(lora.second);
+            if (include_zeroes || multiplier != 0.f) {
+                sd_lora_t spec = {};
+                spec.path = lora.first.c_str();
+                spec.multiplier = multiplier;
+                lora_specs.push_back(spec);
+            }
+        }
+        return lora_specs;
+    }
+
+    std::string get_lora_meta() {
+        std::stringstream lora_meta;
+        lora_meta << std::setprecision(6);
+        for (const auto & lora: items) {
+            float multiplier = check_small_mult(lora.second);
+            if (multiplier != 0.f) {
+                std::string lora_name = std::filesystem::path(lora.first).stem().string();
+                lora_meta << "<lora:" << lora_name << ":" << multiplier << ">";
+            }
+        }
+        return lora_meta.str();
+    }
+
+};
+
+
 struct SDParams {
     int n_threads = -1;
     std::string model_path;
@@ -79,9 +135,11 @@ struct SDParams {
 
     bool chroma_use_dit_mask     = true;
 
-    std::vector<std::string> lora_paths;
-    std::vector<sd_lora_t> lora_specs;
-    uint32_t lora_count;
+    LoraMap lora_map;
+    bool lora_dynamic = false;
+
+    std::string cache_mode;
+    std::string cache_options;
 };
 
 //shared
@@ -208,14 +266,10 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     set_sd_quiet(sd_is_quiet);
     executable_path = inputs.executable_path;
     std::string taesdpath = "";
-    std::vector<std::string> lorafilenames;
-    for(int i=0;i<lora_filenames_max;++i)
+    LoraMap lora_map;
+    for(int i=0;i<inputs.lora_len;++i)
     {
-        std::string temp = inputs.lora_filenames[i];
-        if(temp!="")
-        {
-            lorafilenames.push_back(temp);
-        }
+        lora_map.add_lora(inputs.lora_filenames[i], inputs.lora_multipliers[i]);
     }
     std::string vaefilename = inputs.vae_filename;
     std::string t5xxl_filename = inputs.t5xxl_filename;
@@ -230,19 +284,33 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     cfg_square_limit = inputs.img_soft_limit;
     printf("\nImageGen Init - Load Model: %s\n",inputs.model_filename);
 
-    int lora_apply_mode = std::max(0, std::min(2, inputs.lora_apply_mode));
+    int lora_apply_mode = LORA_APPLY_AT_RUNTIME;
+    bool lora_dynamic = false;
+    bool lora_cache = false;
+    if(inputs.lora_apply_mode >= 0 && inputs.lora_apply_mode <= 2) {
+        lora_apply_mode = inputs.lora_apply_mode;
+    }
+    else {
+        // bit 3: LoRAs can be changed dynamically
+        // bit 4: cache the initial LoRA list in VRAM
+        lora_dynamic = !!(inputs.lora_apply_mode & (1<<3));
+        lora_cache   = lora_dynamic && !!(inputs.lora_apply_mode & (1<<4));
+    }
 
-    if(lorafilenames.size()>0)
+    if(lora_map.items.size() > 0)
     {
-        for(int i=0;i<lorafilenames.size();++i)
+        const char* lora_apply_mode_name = lora_apply_mode == 1 ? "immediately"
+                                         : lora_apply_mode == 2 ? "at runtime"
+                                         : "auto";
+        const char * lora_dynamic_name = lora_dynamic ? ", dynamic" : "";
+        const char * lora_cache_name = lora_cache ? ", with caching" : "";
+        printf("With LoRAs in apply mode %s%s%s:\n", lora_apply_mode_name, lora_dynamic_name, lora_cache_name);
+        for(auto lora: lora_map.items)
         {
-            const char* lora_apply_mode_name = lora_apply_mode == 1 ? "immediately"
-                                            : lora_apply_mode == 2 ? "at runtime"
-                                            : "auto";
-            printf("With LoRA: %s at %f power, apply mode: %s\n",
-                lorafilenames[i].c_str(),inputs.lora_multiplier,lora_apply_mode_name);
+            printf("  %s at %f power\n", lora.first.c_str(), lora.second);
         }
     }
+
     if(inputs.taesd)
     {
         taesdpath = executable_path + "embd_res/taesd.embd";
@@ -327,7 +395,8 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     sd_params->clip_l_path = clip1_filename;
     sd_params->clip_g_path = clip2_filename;
     sd_params->stacked_id_embeddings_path = photomaker_filename;
-    sd_params->lora_paths = lorafilenames;
+    sd_params->lora_map = lora_map;
+    sd_params->lora_dynamic = lora_dynamic;
     //if t5 is set, and model is a gguf, load it as a diffusion model path
     bool endswithgguf = (sd_params->model_path.rfind(".gguf") == sd_params->model_path.size() - 5);
     if((sd_params->t5xxl_path!="" || sd_params->clip_l_path!="" || sd_params->clip_g_path!="") && endswithgguf)
@@ -416,21 +485,14 @@ bool sdtype_load_model(const sd_load_model_inputs inputs) {
     std::filesystem::path mpath(inputs.model_filename);
     sdmodelfilename = mpath.filename().string();
 
-    sd_params->lora_specs.clear();
-    sd_params->lora_specs.reserve(lora_filenames_max*2);
-    for(int i=0;i<sd_params->lora_paths.size();++i)
+    // preload the LoRAs with the initial multipliers
+    std::vector<sd_lora_t> lora_specs = sd_params->lora_map.get_lora_specs(lora_dynamic&& lora_cache);
+    if(lora_specs.size()>0)
     {
-        sd_lora_t spec = {};
-        spec.path = sd_params->lora_paths[i].c_str();
-        spec.multiplier = inputs.lora_multiplier;
-        sd_params->lora_specs.push_back(spec);
-    }
-
-    if(sd_params->lora_specs.size()>0 && inputs.lora_multiplier>0)
-    {
-        printf("\nApply %d LoRAs...\n",sd_params->lora_specs.size());
-        sd_params->lora_count = sd_params->lora_specs.size();
-        sd_ctx->sd->apply_loras(sd_params->lora_specs.data(), sd_params->lora_count);
+        printf("  applying %zu LoRAs...\n", lora_specs.size());
+        sd_ctx->sd->kcpp_lora_cache_populate = lora_cache;
+        sd_ctx->sd->apply_loras(lora_specs.data(), lora_specs.size());
+        sd_ctx->sd->kcpp_lora_cache_populate = false;
     }
 
     input_extraimage_buffers.reserve(max_extra_images);
@@ -478,10 +540,10 @@ static std::string get_scheduler_name(scheduler_t scheduler, bool as_sampler_suf
     }
 }
 
-static std::string get_image_params(const sd_img_gen_params_t & params) {
+static std::string get_image_params(const sd_img_gen_params_t & params, const std::string& lora_meta) {
     std::stringstream ss;
     ss << std::setprecision(3)
-        <<    "Prompt: " << params.prompt
+        <<    "Prompt: " << params.prompt << lora_meta
         << " | NegativePrompt: " << params.negative_prompt
         << " | Steps: " << params.sample_params.sample_steps
         << " | CFGScale: " << params.sample_params.guidance.txt_cfg
@@ -755,6 +817,119 @@ static enum scheduler_t scheduler_from_name(const char * scheduler)
     return scheduler_t::SCHEDULER_COUNT;
 }
 
+static void parse_cache_options(sd_cache_params_t & params, const std::string& cache_mode,
+    const std::string& cache_options) {
+
+    sd_cache_params_init(&params);
+    if (cache_mode == "easycache") {
+        params.mode = SD_CACHE_EASYCACHE;
+    } else if (cache_mode == "ucache") {
+        params.mode = SD_CACHE_UCACHE;
+    } else if (cache_mode == "dbcache") {
+        params.mode  = SD_CACHE_DBCACHE;
+    } else if (cache_mode == "taylorseer") {
+        params.mode  = SD_CACHE_TAYLORSEER;
+    } else if (cache_mode == "cache-dit") {
+        params.mode  = SD_CACHE_CACHE_DIT;
+    } else if (cache_mode == "spectrum") {
+        params.mode  = SD_CACHE_SPECTRUM;
+    } else if (cache_mode != "" && cache_mode != "disabled") {
+        printf("warning: unknown cache mode '%s'", cache_mode.c_str());
+    }
+
+    if (params.mode == SD_CACHE_DISABLED)
+        return;
+
+    if (cache_options == "")
+        return;
+
+    sd_cache_params_t cache_params = params;
+
+    // from examples/common/common.hpp
+    auto parse_named_params = [&](const std::string& opt_str) -> bool {
+        std::stringstream ss(opt_str);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            size_t eq_pos = token.find('=');
+            if (eq_pos == std::string::npos) {
+                printf("error: cache option '%s' missing '=' separator", token.c_str());
+                return false;
+            }
+            std::string key = token.substr(0, eq_pos);
+            std::string val = token.substr(eq_pos + 1);
+            try {
+                if (key == "threshold") {
+                    if (cache_mode == "easycache" || cache_mode == "ucache") {
+                        cache_params.reuse_threshold = std::stof(val);
+                    } else {
+                        cache_params.residual_diff_threshold = std::stof(val);
+                    }
+                } else if (key == "start") {
+                    cache_params.start_percent = std::stof(val);
+                } else if (key == "end") {
+                    cache_params.end_percent = std::stof(val);
+                } else if (key == "decay") {
+                    cache_params.error_decay_rate = std::stof(val);
+                } else if (key == "relative") {
+                    cache_params.use_relative_threshold = (std::stof(val) != 0.0f);
+                } else if (key == "reset") {
+                    cache_params.reset_error_on_compute = (std::stof(val) != 0.0f);
+                } else if (key == "Fn" || key == "fn") {
+                    cache_params.Fn_compute_blocks = std::stoi(val);
+                } else if (key == "Bn" || key == "bn") {
+                    cache_params.Bn_compute_blocks = std::stoi(val);
+                } else if (key == "warmup") {
+                    if (cache_mode == "spectrum") {
+                        cache_params.spectrum_warmup_steps = std::stoi(val);
+                    } else {
+                        cache_params.max_warmup_steps = std::stoi(val);
+                    }
+                } else if (key == "w") {
+                    cache_params.spectrum_w = std::stof(val);
+                } else if (key == "m") {
+                    cache_params.spectrum_m = std::stoi(val);
+                } else if (key == "lam") {
+                    cache_params.spectrum_lam = std::stof(val);
+                } else if (key == "window") {
+                    cache_params.spectrum_window_size = std::stoi(val);
+                } else if (key == "flex") {
+                    cache_params.spectrum_flex_window = std::stof(val);
+                } else if (key == "stop") {
+                    cache_params.spectrum_stop_percent = std::stof(val);
+                } else {
+                    printf("error: unknown cache parameter '%s'", key.c_str());
+                    return false;
+                }
+            } catch (const std::exception&) {
+                printf("error: invalid value '%s' for parameter '%s'", val.c_str(), key.c_str());
+                return false;
+            }
+        }
+
+        switch (cache_params.mode) {
+            case SD_CACHE_EASYCACHE:
+            case SD_CACHE_UCACHE:
+                if (cache_params.reuse_threshold < 0.0f) {
+                    printf("error: cache threshold must be non-negative");
+                    return false;
+                }
+                if (cache_params.start_percent < 0.0f || cache_params.start_percent >= 1.0f ||
+                    cache_params.end_percent <= 0.0f || cache_params.end_percent > 1.0f ||
+                    cache_params.start_percent >= cache_params.end_percent) {
+                    printf("error: cache start/end percents must satisfy 0.0 <= start < end <= 1.0");
+                    return false;
+                }
+                break;
+            default: ;
+        }
+        return true;
+    };
+
+    if (parse_named_params(cache_options)) {
+        params = cache_params;
+    }
+}
+
 sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
 {
     sd_generation_outputs output;
@@ -801,6 +976,9 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     }
 
     SetCircularAxesAll(sd_ctx, inputs.circular_x, inputs.circular_y);
+
+    sd_params->cache_mode    = inputs.cache_mode ? inputs.cache_mode : "";
+    sd_params->cache_options = inputs.cache_options ? inputs.cache_options : "";
 
     auto loadedsdver = get_loaded_sd_version(sd_ctx);
     bool is_img2img = img2img_data != "";
@@ -1032,12 +1210,35 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
     params.seed = sd_params->seed;
     params.strength = sd_params->strength;
     params.vae_tiling_params.enabled = dotile;
+    parse_cache_options(params.cache, sd_params->cache_mode, sd_params->cache_options);
     params.batch_count = 1;
 
-    // needs to be "reapplied" because sdcpp tracks previously applied LoRAs
-    // and weights, and apply/unapply the differences at each gen
-    params.loras = sd_params->lora_specs.data();
-    params.lora_count = sd_params->lora_count;
+    LoraMap lora_map = sd_params->lora_map;
+    if (sd_params->lora_dynamic) {
+        for (int i = 0; i < inputs.lora_len; i++) {
+            std::string path = inputs.lora_filenames[i];
+            float preloaded_mult = sd_params->lora_map.get_mult(path);
+            lora_map.add_lora(path, inputs.lora_multipliers[i]);
+        }
+    }
+
+    std::vector<sd_lora_t> lora_specs = lora_map.get_lora_specs();
+    std::string lora_meta = lora_map.get_lora_meta();
+
+    if(!sd_is_quiet && sddebugmode==1) {
+        if (lora_specs.size() > 0) {
+            printf("Applying LoRAs:\n");
+            for(size_t i=0;i<lora_specs.size();++i)
+            {
+                printf("  %s @ %.3f\n", lora_specs[i].path, lora_specs[i].multiplier);
+            }
+        }
+    }
+
+    // note sdcpp tracks previously applied LoRAs and weights,
+    // and apply/unapply the differences at each gen
+    params.loras = lora_specs.data();
+    params.lora_count = lora_specs.size();
 
     params.ref_images = reference_imgs.data();
     params.ref_images_count = reference_imgs.size();
@@ -1264,9 +1465,9 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
             {
                 printf("Upscaling output image...\n");
                 upscaled_image = upscale(upscaler_ctx, results[i], 2);
-                png = stbi_write_png_to_mem(upscaled_image.data, 0, upscaled_image.width, upscaled_image.height, upscaled_image.channel, &out_data_len, get_image_params(params).c_str());
+                png = stbi_write_png_to_mem(upscaled_image.data, 0, upscaled_image.width, upscaled_image.height, upscaled_image.channel, &out_data_len, get_image_params(params, lora_meta).c_str());
             } else {
-                png = stbi_write_png_to_mem(results[i].data, 0, results[i].width, results[i].height, results[i].channel, &out_data_len, get_image_params(params).c_str());
+                png = stbi_write_png_to_mem(results[i].data, 0, results[i].width, results[i].height, results[i].channel, &out_data_len, get_image_params(params, lora_meta).c_str());
             }
 
             if (png != NULL)

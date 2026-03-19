@@ -23,6 +23,8 @@
 // #define MA_API static
 #include "miniaudio/miniaudio.h"
 
+#include "acestep/mp3/mp3enc.h"
+
 void utreplace(std::string & str, const std::string & needle, const std::string & replacement) {
     size_t pos = 0;
     while ((pos = str.find(needle, pos)) != std::string::npos) {
@@ -366,33 +368,125 @@ std::vector<std::vector<int>> split_big_vector(const std::vector<int>& big_arr, 
     return small_arrs;
 }
 
-std::vector<float> resample_wav(const std::vector<float> & input, uint32_t input_rate, uint32_t output_rate) {
-    if (input.empty() || input_rate == 0 || output_rate == 0)
+std::vector<std::vector<int>> split_big_vector_in_two(const std::vector<int>& big_arr, size_t chunk_size)
+{
+    std::vector<std::vector<int>> result;
+    if (chunk_size == 0 || big_arr.empty())
+        return result;
+
+    if (big_arr.size() <= chunk_size) {
+        // Only one chunk (all elements)
+        result.emplace_back(big_arr);
+        return result;
+    }
+    size_t split_point = big_arr.size() - chunk_size;
+    result.emplace_back(big_arr.begin(), big_arr.begin() + split_point);  // First big chunk
+    result.emplace_back(big_arr.begin() + split_point, big_arr.end()); // Last chunk (size <= chunk_size)
+    return result;
+}
+
+static double audio_resample_bessel_i0(double x) {
+    double sum  = 1.0;
+    double term = 1.0;
+    double y    = x * x * 0.25;
+    for (int k = 1; k < 30; k++) {
+        term *= y / ((double) k * (double) k);
+        sum += term;
+        if (term < sum * 1e-15) {
+            break;
+        }
+    }
+    return sum;
+}
+
+std::vector<float> resample_wav(int num_channels,const std::vector<float>& input,uint32_t input_rate,uint32_t output_rate)
+{
+    if (input.empty() || num_channels <= 0 || input_rate == 0 || output_rate == 0)
         return {};
 
-    const size_t input_size = input.size();
-    const double ratio = static_cast<double>(output_rate) / input_rate; // Compute resampling ratio
-    // Use rounding to avoid systematic truncation error
-    const size_t output_size = static_cast<size_t>(std::llround(input_size * ratio));
-    std::vector<float> output(output_size);
-    const double step = static_cast<double>(input_rate) / output_rate;  // Precompute step in source domain
-    double src_pos = 0.0;
-    for (size_t i = 0; i < output_size; ++i)
+    if (input.size() % num_channels != 0)
+        return {};
+
+    const int n_in = input.size() / num_channels;
+
+    if (input_rate == output_rate)
+        return input;
+
+    const double ratio = (double)output_rate / (double)input_rate;
+    const int n_out = (int)std::lround(n_in * ratio);
+
+    std::vector<float> output((size_t)n_out * num_channels);
+
+    const int half_len = 32;
+    const int taps = half_len * 2;
+
+    const double beta = 9.0;
+
+    const double inv_i0b = 1.0 / audio_resample_bessel_i0(beta);
+    const double fc = 0.5 * ((ratio < 1.0) ? ratio : 1.0);
+
+    // PRECOMPUTE KAISER WINDOW
+    std::vector<double> window(taps + 1);
+
+    for (int k = -half_len; k <= half_len; k++)
     {
-        size_t idx = static_cast<size_t>(src_pos);
-        if (idx >= input_size - 1)    // Clamp to valid range (prevents out-of-bounds)
-        {
-            output[i] = input[input_size - 1];
-        }
+        double t = (double)k / (double)half_len;
+
+        double win;
+
+        if (t < -1.0 || t > 1.0)
+            win = 0.0;
         else
-        {
-            const double frac = src_pos - idx;
-            const float s0 = input[idx];
-            const float s1 = input[idx + 1];
-            output[i] = static_cast<float>(s0 + (s1 - s0) * frac);
-        }
-        src_pos += step;
+            win = audio_resample_bessel_i0(beta * std::sqrt(1.0 - t * t)) * inv_i0b;
+
+        window[k + half_len] = win;
     }
+
+    for (int ch = 0; ch < num_channels; ch++)
+    {
+        const float* src = input.data() + ch * n_in;
+        float* dst = output.data() + ch * n_out;
+
+        for (int i = 0; i < n_out; i++)
+        {
+            double center = (double)i / ratio;
+
+            int base = (int)std::floor(center);
+
+            int start = base - half_len + 1;
+            int end   = base + half_len;
+
+            double sum = 0.0;
+            double wgt = 0.0;
+
+            for (int j = start; j <= end; j++)
+            {
+                double d = center - (double)j;
+
+                double sinc_val;
+
+                if (std::fabs(d) < 1e-9)
+                    sinc_val = 2.0 * fc;
+                else
+                    sinc_val = std::sin(2.0 * M_PI * fc * d) / (M_PI * d);
+
+                double win = window[j - start];
+
+                double h = sinc_val * win;
+
+                int idx = j;
+
+                if (idx < 0) idx = 0;
+                if (idx >= n_in) idx = n_in - 1;
+
+                sum += src[idx] * h;
+                wgt += h;
+            }
+
+            dst[i] = (wgt > 1e-12) ? (float)(sum / wgt) : 0.0f;
+        }
+    }
+
     return output;
 }
 
@@ -528,6 +622,54 @@ std::string save_stereo_wav16_base64(const std::vector<float> & raw_audio, int T
     }
     std::string wav_data = oss.str();
     return kcpp_base64_encode(wav_data);
+}
+
+std::string save_stereo_mp3_base64(const std::vector<float> & raw_audio,int T_audio,int sample_rate) {
+    const float * enc_audio = raw_audio.data();
+    int enc_T  = T_audio;
+    int enc_sr = sample_rate;
+    std::vector<float> resampled;
+
+    // resample to 44100 if sr is not a valid MPEG1 rate
+    if (sample_rate != 32000 && sample_rate != 44100 && sample_rate != 48000) {
+        resampled = resample_wav(2,raw_audio,sample_rate,44100);
+        enc_audio = resampled.data();
+        enc_sr    = 44100;
+    }
+
+    const int kbps = 128;
+    mp3enc_t * enc = mp3enc_init(enc_sr, 2, kbps);
+    if (!enc) {
+        fprintf(stderr, "[Audio] mp3enc_init failed\n");
+        return "";
+    }
+
+    std::string mp3_data;
+    mp3_data.reserve(enc_T); // rough preallocation
+
+    int chunk = enc_sr;
+
+    // reusable buffer (replaces malloc inside loop)
+    std::vector<float> buf((size_t)chunk * 2);
+
+    for (int pos = 0; pos < enc_T; pos += chunk) {
+        int n = (pos + chunk <= enc_T) ? chunk : (enc_T - pos);
+        // build planar chunk
+        memcpy(buf.data(),     enc_audio + pos,          (size_t)n * sizeof(float));
+        memcpy(buf.data() + n, enc_audio + enc_T + pos,  (size_t)n * sizeof(float));
+        int out_size = 0;
+        const uint8_t * mp3 = mp3enc_encode(enc, buf.data(), n, &out_size);
+        if (out_size > 0) {
+            mp3_data.append((const char *) mp3, out_size);
+        }
+    }
+    int flush_size = 0;
+    const uint8_t * flush_data = mp3enc_flush(enc, &flush_size);
+    if (flush_size > 0) {
+        mp3_data.append((const char *) flush_data, flush_size);
+    }
+    mp3enc_free(enc);
+    return kcpp_base64_encode(mp3_data);
 }
 
 //a very rudimentary all in one sampling function which has no dependencies
@@ -849,6 +991,51 @@ bool kcpp_decode_audio_from_buf(const unsigned char * buf_in, size_t len, int ta
     }
 
     ma_decoder_uninit(&decoder);
+    return true;
+}
+
+//this version is specifically required for ace-step
+bool kcpp_decode_audio_to_f32_stereo_48k(const uint8_t * data, size_t data_size, std::vector<float> & pcm, int & T_audio) {
+    ma_result result;
+
+    // Force the exact format expected by the VAE
+    ma_decoder_config config =
+        ma_decoder_config_init(ma_format_f32, 2, 48000);
+
+    ma_decoder decoder;
+
+    result = ma_decoder_init_memory(data, data_size, &config, &decoder);
+    if (result != MA_SUCCESS)
+        return false;
+
+    ma_uint64 frame_count = 0;
+
+    result = ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count);
+    if (result != MA_SUCCESS) {
+        ma_decoder_uninit(&decoder);
+        return false;
+    }
+
+    // allocate stereo
+    pcm.resize(frame_count * 2);
+
+    ma_uint64 frames_read = 0;
+
+    result = ma_decoder_read_pcm_frames(
+        &decoder,
+        pcm.data(),
+        frame_count,
+        &frames_read
+    );
+
+    ma_decoder_uninit(&decoder);
+
+    if (result != MA_SUCCESS)
+        return false;
+
+    pcm.resize(frames_read * 2);
+    T_audio = (int)frames_read;
+
     return true;
 }
 

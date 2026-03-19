@@ -4,6 +4,12 @@
 #include <cstring>
 #include <fstream>
 
+#ifdef _WIN32
+#    define ttsfseek _fseeki64
+#else
+#    define ttsfseek fseeko
+#endif
+
 namespace qwen3_tts {
 
 namespace {
@@ -161,12 +167,10 @@ bool load_tensor_data_from_file(
     const std::map<std::string, struct ggml_tensor *> & tensors,
     ggml_backend_buffer_t & buffer,
     std::string & error_msg,
-    enum ggml_backend_dev_type preferred_backend_type
+    bool allowgpu
 ) {
-    ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
-    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    }
+    ggml_backend_t backend = init_preferred_backend("TensorLoader", &error_msg, allowgpu);
+
     if (!backend) {
         error_msg = "Failed to initialize backend for GGUF tensor loader";
         return false;
@@ -176,7 +180,7 @@ bool load_tensor_data_from_file(
     buffer = ggml_backend_alloc_ctx_tensors(model_ctx, backend);
     if (!buffer) {
         error_msg = "Failed to allocate tensor buffer";
-        ggml_backend_free(backend);
+        release_preferred_backend(backend);
         return false;
     }
 
@@ -184,7 +188,7 @@ bool load_tensor_data_from_file(
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
         error_msg = "Failed to open file for reading: " + path;
-        ggml_backend_free(backend);
+        release_preferred_backend(backend);
         return false;
     }
 
@@ -206,17 +210,17 @@ bool load_tensor_data_from_file(
 
         read_buf.resize(nbytes);
 
-        if (fseek(f, data_offset + offset, SEEK_SET) != 0) {
+        if (ttsfseek(f, data_offset + offset, SEEK_SET) != 0) {
             error_msg = "Failed to seek to tensor data: " + std::string(name);
             fclose(f);
-            ggml_backend_free(backend);
+            release_preferred_backend(backend);
             return false;
         }
 
         if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
             error_msg = "Failed to read tensor data: " + std::string(name);
             fclose(f);
-            ggml_backend_free(backend);
+            release_preferred_backend(backend);
             return false;
         }
 
@@ -224,7 +228,7 @@ bool load_tensor_data_from_file(
     }
 
     fclose(f);
-    ggml_backend_free(backend);
+    release_preferred_backend(backend);
 
     return true;
 }
