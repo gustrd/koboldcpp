@@ -185,3 +185,24 @@ Upon stabilizing the 4-Phase implementation against Qwen3-30B-A3B locally via Lu
 
 **Future Path Requirements:** 
 Scale limits dictate that Phase 3 and Phase 4 optimizations (Speculative Prefetching and true overlapping) are deeply mandatory for models > 100B params. Synchronous I/O at ~5GB/s latency ceilings out at ~1 to 2 tok/s unconditionally unless compute logic actively pipelines inference during VRAM SSD pulls.
+
+---
+
+## 8. Build and Test Instructions
+
+To build the project for testing, use the `w64devkit` environment:
+- **Build Toolpath**: `C:\Users\gustr\_git\w64devkit\w64devkit.exe`
+- **Recommended Command (Headless/CI)**: `$env:PATH = "C:\Users\gustr\_git\w64devkit\bin;" + $env:PATH; make LLAMA_VULKAN=1 -j8`
+
+---
+
+## 9. Development and Build Notes (Learnings)
+
+### Environmental Setup
+* **w64devkit Shell Hooks**: While `w64devkit.exe` is the preferred interactive shell for users, automated builds (like this one) require explicitly setting the `PATH` to `w64devkit/bin` within PowerShell to ensure `make`, `gcc`, and `sh` are correctly resolved.
+* **Vulkan Dependency**: Building with `LLAMA_VULKAN=1` requires `lib/vulkan-1.lib` to be present in the repository root or specified via `LDFLAGS`.
+* **Corrupted Output Logs**: High parallelism (`-j8`) can lead to interleaved/corrupted-looking terminal output when `make` calls sub-shells. This is generally cosmetic and does not impact build integrity, but `-j1` can be used for cleaner debugging if an error occurs.
+
+### Implementation Constraints
+* **Alignment Enforcement**: Windows `FILE_FLAG_NO_BUFFERING` strictly requires that memory buffers and disk offsets are 4096-byte aligned. The expert extraction tool (`extract_experts.py`) must guarantee this alignment during preprocessing, or the C++ engine will face `ERROR_INVALID_PARAMETER` at runtime.
+* **Direct I/O Limitations**: Direct I/O completely bypasses the OS page cache. If multiple threads/processes try to read the same file, they will not benefit from shared memory; the expert cache must be internal to the main process to be efficient.
