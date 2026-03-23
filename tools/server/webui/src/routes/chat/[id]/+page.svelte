@@ -99,10 +99,12 @@
 			(option) => option.model === lastMessageWithModel.model
 		);
 
-		if (matchingModel) {
+		if (matchingModel && modelsStore.isModelLoaded(matchingModel.model)) {
 			try {
 				await modelsStore.selectModelById(matchingModel.id);
-				console.log(`Automatically loaded model: ${lastMessageWithModel.model} from last message`);
+				console.log(
+					`Automatically selected model: ${lastMessageWithModel.model} from last message`
+				);
 			} catch (error) {
 				console.warn('Failed to automatically select model from last message:', error);
 			}
@@ -164,7 +166,7 @@
 </script>
 
 <svelte:head>
-	<title>{activeConversation()?.name || 'Chat'} - llama.cpp</title>
+	<title>{activeConversation()?.name || 'Chat'} - llama.cpp UI (KoboldCpp Backend)</title>
 </svelte:head>
 
 <ChatScreen />

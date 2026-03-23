@@ -2,17 +2,42 @@
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
-#include "llama-sampling.h"
+#include "llama-sampler.h"
 
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
+#include <iostream>
+#include <string_view>
+#include <unordered_set>
+
 #define MAX_REPETITION_THRESHOLD 2000
+
 //
 // helpers
 //
+
+using bytes = std::pair<const char*, size_t>;
+using hash_entry_size = std::pair<size_t, size_t>;
+
+template <>
+struct std::hash<bytes>
+{
+    std::size_t operator()(const bytes& x) const noexcept
+    {
+        return std::hash<std::string_view>{}({x.first, x.second});
+    }
+};
+
+using candidates_memos = std::unordered_map<size_t, llama_grammar_candidates>;
+using stack_memos = std::unordered_map<size_t, candidates_memos>;
+static stack_memos memo_cache;
+
+static void llama_grammar_reset_memos() {
+    memo_cache.clear();
+}
 
 // NOTE: assumes valid utf8 (but checks for overrun)
 static std::pair<uint32_t, const char *> decode_utf8(const char * src) {
@@ -370,6 +395,44 @@ static void print_rule(
 }
 
 //
+// Regex utilities
+//
+
+size_t llama_grammar_trigger_pattern::find(const std::string & input) const {
+    auto find_start_pos = [](const std::smatch & match) {
+        // get from the first matched capturing group to the end of the string
+        size_t start = std::string::npos;
+        for (auto i = 1u; i < match.size(); i++) {
+            if (match.length(i) > 0) {
+                start = match.position(i);
+                break;
+            }
+        }
+        if (start == std::string::npos) {
+            start = match.position(0);
+        }
+        return start;
+    };
+
+    if (!pattern.empty() && pattern.front() == '^' && pattern.back() == '$') {
+        // match against the entire input
+        std::smatch match;
+        if (std::regex_match(input, match, regex)) {
+            return find_start_pos(match);
+        }
+    }
+
+    // search anywhere
+    std::smatch match;
+    if (std::regex_search(input, match, regex)) {
+        return find_start_pos(match);
+    }
+
+    return std::string::npos;
+}
+
+
+//
 // implementation
 //
 
@@ -563,7 +626,7 @@ const char * llama_grammar_parser::parse_sequence(
                 throw std::runtime_error(std::string("expecting an int at ") + pos);
             }
             const char * int_end = parse_int(pos);
-            uint64_t min_times = std::stoul(std::string(pos, int_end - pos));
+            uint64_t min_times = std::stoull(std::string(pos, int_end - pos));
             pos = parse_space(int_end, is_nested);
 
             uint64_t max_times = UINT64_MAX; // default: no max limit
@@ -576,7 +639,7 @@ const char * llama_grammar_parser::parse_sequence(
 
                 if (is_digit_char(*pos)) {
                     const char * int_end = parse_int(pos);
-                    max_times = std::stoul(std::string(pos, int_end - pos));
+                    max_times = std::stoull(std::string(pos, int_end - pos));
                     pos = parse_space(int_end, is_nested);
                 }
 
@@ -982,6 +1045,38 @@ llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
         }
         return rejects;
     }
+    
+    auto stack_hash_start = reinterpret_cast<const char *>(stack.data());
+    auto stack_hash_size  = sizeof(stack[0]) * stack.size();
+    auto stack_hash       = std::hash<bytes>{}({ stack_hash_start, stack_hash_size });
+
+    llama_grammar_candidates * cache_target = nullptr;
+
+    // Tests show that >75% of candidate lists are under 1280 and 50% are under 640b.
+    // Most 'problem' loops are under 24b. However, candidate lists can be over 72k,
+    // so we need to limit our checks.
+
+    // We'll only attempt to memoize candidate lists under 80b
+    // Doing an over-aggressive size cutoff first befor any other processing 'saves' easy cases
+    // extra processing but still rescues 'hard' cases from slow down or hangs.
+    // This leads to a speed up of both easy and hard cases.
+    const size_t hash_cutoff          = 80;
+    auto         candidates_hash_size = sizeof(candidates[0]) * candidates.size();
+    if (candidates_hash_size < hash_cutoff) {
+        // Only check stash hash first - these are usually ~24b, and almost always under 64b
+        if (auto cache_hit = memo_cache.find(stack_hash); cache_hit != memo_cache.end()) {
+            auto & candidates_memos      = cache_hit->second;
+            auto   candidates_hash_start = reinterpret_cast<const char *>(candidates.data());
+            auto   candidates_hash       = std::hash<bytes>{}({ candidates_hash_start, candidates_hash_size });
+            if (auto cache_hit2 = candidates_memos.find(candidates_hash); cache_hit2 != candidates_memos.end()) {
+                return cache_hit2->second;
+            } else {
+                cache_target = &(candidates_memos[candidates_hash]);
+            }
+        } else {
+            memo_cache[stack_hash];
+        }
+    }
 
     const llama_grammar_element * stack_pos = stack.back();
 
@@ -1034,6 +1129,9 @@ llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
         rejects.push_back({ tok.index, tok.code_points - 1, tok.partial_utf8, tok.id });
     }
 
+    if (cache_target) {
+        *cache_target = rejects;
+    }
     return rejects;
 }
 
@@ -1122,13 +1220,13 @@ struct llama_grammar * llama_grammar_init_impl(
     // if there is a grammar, parse it
     // rules will be empty (default) if there are parse errors
     if (!parser.parse(grammar_str) || parser.rules.empty()) {
-        fprintf(stderr, "%s: failed to parse grammar\n", __func__);
+        LLAMA_LOG_ERROR("failed to parse grammar\n");
         return nullptr;
     }
 
-    // Ensure that there is a "root" node.
-    if (parser.symbol_ids.find("root") == parser.symbol_ids.end()) {
-        fprintf(stderr, "%s: grammar does not contain a 'root' symbol\n", __func__);
+    // Ensure that the grammar contains the start symbol
+    if (parser.symbol_ids.find(grammar_root) == parser.symbol_ids.end()) {
+        LLAMA_LOG_ERROR("grammar does not contain a '%s' symbol\n", grammar_root);
         return nullptr;
     }
 
@@ -1157,7 +1255,7 @@ struct llama_grammar * llama_grammar_init_impl(
             continue;
         }
         if (llama_grammar_detect_left_recursion(vec_rules, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
-            LLAMA_LOG_ERROR("unsupported grammar, left recursion detected for nonterminal at index %zu", i);
+            LLAMA_LOG_ERROR("unsupported grammar, left recursion detected for nonterminal at index %zu\n", i);
             return nullptr;
         }
     }
@@ -1312,21 +1410,10 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
             grammar.trigger_buffer_positions.push_back(std::make_pair(token, position));
             grammar.trigger_buffer += piece;
 
-            std::smatch match;
             for (const auto & trigger_pattern : grammar.trigger_patterns) {
-                if (std::regex_match(grammar.trigger_buffer, match, trigger_pattern.regex)) {
+                auto start = trigger_pattern.find(grammar.trigger_buffer);
+                if (start != std::string::npos) {
                     grammar.awaiting_trigger = false;
-                    // get from the first matched capturing group to the end of the string
-                    size_t start = std::string::npos;
-                    for (auto i = 1u; i < match.size(); i++) {
-                        if (match.length(i) > 0) {
-                            start = match.position(i);
-                            break;
-                        }
-                    }
-                    if (start == std::string::npos) {
-                        start = match.position(0);
-                    }
 
                     // replay tokens that overlap with [start, end)
                     for (const auto & [tok, tok_pos] : grammar.trigger_buffer_positions) {

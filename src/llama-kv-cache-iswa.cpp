@@ -49,6 +49,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     //       https://github.com/ggml-org/llama.cpp/issues/17037
     uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
+    //kcpp: pad the swa kv cache as well, similar to extra_context_handle_fragmentation
+    size_swa += 128;
+    size_swa = GGML_PAD(size_swa, n_pad);
+
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
         LLAMA_LOG_WARN("%s: using full-size SWA cache (ref: %s)\n",
@@ -218,7 +222,9 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {
-    return kv_base->get_size() == kv_swa->get_size();
+    return kv_base->get_can_shift() &&
+           kv_swa->get_can_shift() &&
+           kv_base->get_size() == kv_swa->get_size();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

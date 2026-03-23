@@ -5,7 +5,6 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
-#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -14,6 +13,8 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "common.h"
+#include "gguf.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -74,6 +75,9 @@
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
+
+// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
+float ggml_table_f32_e8m0_half[1 << 8];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -264,6 +268,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_MXFP4] = {
         .from_float               = quantize_row_mxfp4,
         .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NVFP4] = {
+        .from_float               = quantize_row_nvfp4,
+        .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -590,7 +600,7 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
     return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
-#if defined(__gnu_linux__)
+#if defined(__gnu_linux__) && !defined(__BIONIC__)
 static cpu_set_t ggml_get_numa_affinity(void) {
     cpu_set_t cpuset;
     pthread_t thread;
@@ -612,7 +622,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         return;
     }
 
-#if defined(__gnu_linux__)
+#if defined(__gnu_linux__) && !defined(__BIONIC__)
     struct stat st;
     char path[256];
     int rv;
@@ -645,15 +655,16 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     // figure out which node we're on
     uint current_cpu;
     int getcpu_ret = 0;
-#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
-    getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
-#else
-    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
-#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
-#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
-#   endif
-    getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
-#endif
+//#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
+//    getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
+//#else
+//    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
+//#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
+//#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
+//#   endif
+//    getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
+//#endif
+// koboldcpp fix: we don't use numa and this thing breaks runpod
 
     if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
         g_state.numa.n_nodes = 0;
@@ -1673,6 +1684,776 @@ static void ggml_compute_forward_mul_mat_id(
 }
 
 /////////////////////////////////
+/////   kcpp: dirtypatch for tts cpp ////////////
+inline static void ggml_vec_reci_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = 1.0f/x[i];   }
+inline static void ggml_vec_ttsround_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = (float)((int) (x[i] + 0.5f)); }
+inline static void ggml_vec_mod_f32(const int n, float * y, const float * x, const float mod_val) { for (int i = 0; i < n; ++i) y[i] = fmod(x[i], mod_val); }
+void ggml_compute_forward_sin_f32_ffast_math(struct ggml_tensor * dst);
+static void ggml_compute_forward_reciprocal_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    GGML_ASSERT( dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    for (int i = 0; i < n; i++) {
+        ggml_vec_reci_f32(nc,
+                (float *) ((char *) dst->data  + i*( dst->nb[1])),
+                (float *) ((char *) src0->data + i*(src0->nb[1])));
+    }
+}
+static void ggml_compute_forward_reciprocal(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_reciprocal_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_cumsum_f32_tts(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    if (ith > ne1) {
+        return;
+    }
+
+    const int rpt = (ne1 + nth - 1)/nth;
+    // row range for this thread
+    const int ir0 = rpt * ith;
+    const int ir1 = MIN(ir0 + rpt, ne1);
+
+    if (ir0 > ne1) {
+        return;
+    }
+
+    for (int b = 0; b < ne2; b++) {
+        for (int i1 = ir0; i1 < ir1; i1++) {
+            float running = 0.0f;
+            float * tgt_data = (float *)((char *) src0->data + i1*nb01 + b*nb02);
+            float * dst_data = (float *)((char *) dst->data + i1*nb1 + b*nb2);
+            for (int ii = 0; ii < ne0; ii++) {
+                running += tgt_data[ii];
+                dst_data[ii] = running;
+            }
+        }
+    }
+}
+static void ggml_compute_forward_cumsum_tts(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_cumsum_f32_tts(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_mod_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int ith = params->ith;
+
+    if (ith != 0) {
+        return;
+    }
+    const float mod_val = ((float *) dst->op_params)[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    GGML_ASSERT( dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    for (int i = 0; i < n; i++) {
+        ggml_vec_mod_f32(nc,
+                (float *) ((char *) dst->data  + i*( dst->nb[1])),
+                (float *) ((char *) src0->data + i*(src0->nb[1])),
+                mod_val);
+    }
+}
+static void ggml_compute_forward_mod(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mod_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_ttsround_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    const int n  = ggml_nrows(src0);
+    const int nc = src0->ne[0];
+
+    GGML_ASSERT( dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    for (int i = 0; i < n; i++) {
+        ggml_vec_ttsround_f32(nc,
+                (float *) ((char *) dst->data  + i*( dst->nb[1])),
+                (float *) ((char *) src0->data + i*(src0->nb[1])));
+    }
+}
+static void ggml_compute_forward_ttsround(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ttsround_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void simple_dft(
+        float * mdst,
+        float * phdst,
+        float * buffer,
+        size_t n_fft,
+        size_t step) {
+    float base_k = M_PI * -2.0f / (float) n_fft;
+    for (int i = 0; i < n_fft; i++) {
+        float tm = 0.0f;
+        float tph = 0.0f;
+        for (int ii = 0; ii < n_fft; ii++) {
+            float k = base_k * (float)ii * (float)i;
+            float m = cosf(k);
+            float expk = sinf(k);
+            tm += mdst[ii*step] * m - phdst[ii*step] * expk;
+            tph += mdst[ii*step] * expk + phdst[ii*step] * m;
+        }
+        buffer[i*2] = tm;
+        buffer[i*2+1] = tph;
+    }
+    // assign magnitude and phase values from the accumulated buffer;
+    for (int i = 0; i < n_fft; i++) {
+        mdst[i*step] = buffer[i*2];
+        phdst[i*step] = buffer[i*2+1]; //-1.0e-15 < buffer[i*2+1] < 1.0e-15 ? 0.0f : buffer[i*2+1];
+    }
+}
+static void radix2_fft(
+        float * mdst,
+        float * phdst,
+        float * buffer,
+        size_t n_fft,
+        size_t step) {
+    if (n_fft == 1) {
+        return;
+    } else if (n_fft % 2 != 0) {
+        // rather than using chirp padding just fall back to dft when we have a size that isn't factorable by 2.
+        simple_dft(mdst, phdst, buffer, n_fft, step);
+        return;
+    }
+
+    radix2_fft(mdst, phdst, buffer, (size_t)n_fft/2, step*2);
+    radix2_fft(
+        (float*)((char*) mdst + step * sizeof(float)),
+        (float*)((char*) phdst + step * sizeof(float)),
+        buffer,
+        (size_t)n_fft/2,
+        step*2);
+
+    float km = M_PI * -2.0f / (float) n_fft;
+
+    for (int i = 0; 2 * i < n_fft; i++) {
+        float k = km * (float) i;
+        float k1 = cosf(k);
+        float k2 = sinf(k);
+
+        float mp = mdst[i*2*step];
+        float php = phdst[i*2*step];
+        float mq = mdst[(i*2+1)*step] * k1 - k2 * phdst[(i*2+1)*step];
+        float phq = mdst[(i*2+1)*step] * k2 + k1 * phdst[(i*2+1)*step];
+
+        buffer[i + n_fft] = php + phq;
+        buffer[i] = mp + mq;
+        buffer[(i + (n_fft / 2)) + n_fft] = php - phq;
+        buffer[(i + (n_fft / 2))] = mp - mq;
+    }
+    for (int i = 0; i < n_fft; i++) {
+        mdst[i*step] = buffer[i];
+        phdst[i*step] = buffer[i+n_fft];
+    }
+}
+static void ggml_compute_forward_stft_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        bool compute_abs_and_angle) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const float * w = (float*) src1->data;
+
+    // view src0 and dst with these strides and data offset inbytes during set
+    // nb0 is implicitly element_size because src0 and dst are contiguous
+    size_t n_fft = ((int32_t *) dst->op_params)[0];
+    size_t hop   = ((int32_t *) dst->op_params)[1];
+
+    const int half = n_fft / 2;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_ASSERT(n_fft == ne10); // only currently supporting stft while n_fft is equal to the window size
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (ith == 0) {
+        // need to zero dst since we are accumulating into it
+        memset(dst->data, 0.0f, ggml_nbytes(dst));
+        memset(params->wdata, 0.0f, (n_fft * 2 + CACHE_LINE_SIZE_F32)*nth);
+    }
+    ggml_barrier(params->threadpool);
+
+    // it is faster to just use the max possible memory for the buffer rather than calculating the largest uneven half of the window.
+    float * buffer = ((float *) params->wdata) + (n_fft * 2 + CACHE_LINE_SIZE_F32) * ith;
+
+    // hops per thread
+    const int hpt = (ne1 + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = hpt * ith;
+    const int ir1 = MIN(ir0 + hpt, ne1);
+
+    for (int b = 0; b < ne01; b++) {
+        for (int i1 = ir0; i1 < ir1; i1++) {
+            const int ch = i1*hop;
+            float * mdst_data = (float *)((char *) dst->data + i1*nb1 + b*nb2);
+            float * phdst_data = (float *)((char *) dst->data + i1*nb1 + nb3 + b*nb2);
+            float * tgt_data = (float *)((char *) src0->data + b*nb01);
+            // preinitialize the magnitude data with the window applied;
+            for (int i = 0; i < n_fft; i++) {
+                int ai = (ch - half + i); // for handling reflective padding to support center view;
+                if (ai < 0) {
+                    mdst_data[i] = tgt_data[-1 * ai] * w[i];
+                } else if (ai >= ne00) {
+                    mdst_data[i] = tgt_data[ne00 - (ai - ne00 + 1)] * w[i];
+                } else {
+                    mdst_data[i] = tgt_data[ai] * w[i];
+                }
+            }
+            radix2_fft(mdst_data, phdst_data, buffer, n_fft, 1);
+            if (compute_abs_and_angle) {
+                for (int i = 0; i < n_fft; i++) {
+                    float abs = sqrtf(mdst_data[i]*mdst_data[i] + phdst_data[i]*phdst_data[i]);
+                    float agl = atan2f(phdst_data[i], mdst_data[i]);
+                    mdst_data[i] = abs;
+                    phdst_data[i] = agl;
+                }
+            }
+        }
+    }
+}
+static void ggml_compute_forward_stft(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_stft_f32(params, dst, false);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_abs_angle_stft(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_stft_f32(params, dst, true);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void radix2_ifft(
+        float * mdst,
+        float * phdst,
+        float * buffer,
+        float * tgt,
+        float * window,
+        size_t n_fft,
+        size_t step,
+        int min_length,
+        int max_length,
+        int index,
+        int offset) {
+    radix2_fft(mdst, phdst, buffer, n_fft, step);
+    for (int i = 0; i < n_fft; i++) {
+        int base_index = (n_fft - i) % n_fft;
+        float w = window[base_index];
+        int tgt_index = base_index - offset;
+        int location = index + tgt_index;
+        if (location < min_length || location >= max_length) {
+            continue; // ignore reflective padding
+        }
+        tgt[location] += mdst[i] / n_fft * w;
+    }
+}
+static void ggml_compute_forward_istft_f32(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst,
+        bool from_abs_and_angle) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * window = dst->src[1];
+
+    // view src0 and dst with these strides and data offset inbytes during set
+    // nb0 is implicitly element_size because src0 and dst are contiguous
+    size_t n_fft = ((int32_t *) dst->op_params)[0];
+    size_t hop   = ((int32_t *) dst->op_params)[1];
+
+    const int half = n_fft / 2;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (ith == 0) {
+        // need to zero dst since we are accumulating into it
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    // it is faster to just use the max possible memory for the buffer rather than calculating the largest uneven half of the window.
+    float * buffer = ((float *) params->wdata) + (n_fft * 2 + CACHE_LINE_SIZE_F32) * ith;
+
+    // this buffer is used to rebuild the two sided fft from a one sided intput as well compute the complex values from the magnitude and phase.
+    float * phm_buffer = ((float *) params->wdata) + (n_fft * 2 + CACHE_LINE_SIZE_F32) * nth + (n_fft * 2 + CACHE_LINE_SIZE_F32) * ith;
+
+    // frames per thread
+    const int spt = (ne0 + nth - 1)/nth;
+
+    // each thread effectively owns a portion of the output series, but distinct frames can overlap over series so we need to recompute overlapping ifft values
+    // around the edges.
+    const int poa = half / hop - 1;
+    const int pob = half / hop + 1;
+    // row range for this thread
+    const int min_spt = ith * spt;
+    const int max_spt = MIN(min_spt+spt, ne0);
+    const int ir0 = ith == 0 ? 0 : (min_spt / hop) - poa;
+    const int ir1 = MIN((max_spt / hop) + pob, ne01);
+
+    bool onesided = ne00 == half + 1;
+    for (int b = 0; b < ne02; b++) {
+        for (int i1 = ir0; i1 < ir1; i1++) {
+            float * mdst_data = (float *)((char *) src0->data + i1*nb01 + b*nb02);
+            float * phdst_data = (float *)((char *) src0->data + i1*nb01 + nb03 + b*nb02);
+            float * tgt_data = (float *)((char *) dst->data + b*nb1);
+            if (from_abs_and_angle || onesided) {
+                for (int i = 0; i < n_fft; i++) {
+                    int index = i;
+                    float multiplier = 1.0f;
+                    if (onesided && i >= half + 1) {
+                        index = n_fft - i;
+                        multiplier = -1.0f;
+                    }
+                    float k = phdst_data[index];
+                    float m = mdst_data[index];
+                    float ph = m;
+                    if (from_abs_and_angle) {
+                        m *= cosf(k);
+                        ph *= multiplier * sinf(k);
+                    }
+                    phm_buffer[i] = m;
+                    phm_buffer[i+n_fft] = ph;
+                }
+                radix2_ifft(phm_buffer, phm_buffer + n_fft, buffer, tgt_data, (float*) window->data, n_fft, 1, min_spt, max_spt, i1*hop, half);
+            } else {
+                radix2_ifft(mdst_data, phdst_data, buffer, tgt_data, (float*) window->data, n_fft, 1, min_spt, max_spt, i1*hop, half);
+            }
+            // it should be noted that we don't remove any window applied via stft as that is better performed by a tensor multiplication op
+        }
+    }
+}
+static void ggml_compute_forward_abs_angle_istft(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_istft_f32(params, dst, true);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_istft(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_istft_f32(params, dst, false);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_conv_transpose_1d_f16_f32_tts(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nk = ne00*ne01*ne02;
+
+    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
+    GGML_ASSERT(nb10 == sizeof(float));
+
+    if (ith == 0) {
+        memset(params->wdata, 0, params->wsize);
+
+        // permute kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
+        {
+            ggml_fp16_t * const wdata = (ggml_fp16_t *) params->wdata + 0;
+
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = 0; i01 < ne01; i01++) {
+                    const ggml_fp16_t * const src = (ggml_fp16_t *)((char *) src0->data + i02*nb02 + i01*nb01);
+                    ggml_fp16_t * dst_data = wdata + i01*ne00*ne02;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dst_data[i00*ne02 + i02] = src[i00];
+                    }
+                }
+            }
+        }
+
+        // permute source data (src1) from (L x Cin) to (Cin x L)
+        {
+            ggml_fp16_t * const wdata = (ggml_fp16_t *) params->wdata + nk;
+            ggml_fp16_t * dst_data = wdata;
+
+            for (int64_t i11 = 0; i11 < ne11; i11++) {
+                const float * const src = (float *)((char *) src1->data + i11*nb11);
+                for (int64_t i10 = 0; i10 < ne10; i10++) {
+                    dst_data[i10*ne11 + i11] = GGML_FP32_TO_FP16(src[i10]);
+                }
+            }
+        }
+
+        // need to zero dst since we are accumulating into it
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
+    const int32_t p0 = ((const int32_t*)(dst->op_params))[1];
+    const int32_t g0 = ((const int32_t*)(dst->op_params))[3];
+
+    // total rows in dst
+    const int nr = ne1;
+    const int gne02 = ne02 / g0;
+    const int kernel_m = gne02 == 1 ? 1 : ne02*ne00; // strictly speaking ne02*ne00 is wrong for other groupings but the grouping argument should be rarely used.
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    ggml_fp16_t * const wdata     = (ggml_fp16_t *) params->wdata + 0;
+    ggml_fp16_t * const wdata_src = wdata + nk;
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * dst_data = (float *)((char *) dst->data + i1*nb1);
+        ggml_fp16_t * wdata_kernel = wdata + i1*kernel_m;
+        for (int i10 = 0; i10 < ne10; i10++) {
+            const int i1n = i10*ne11 + (int)(i1 / gne02);
+            for (int i00 = 0; i00 < ne00; i00++) {
+                float v = 0;
+                if ((i10 * s0 < p0 && i00 >= p0) || (i10 * s0 >= p0 && i10 * s0 + i00 - p0 < ne0)) {
+                    ggml_vec_dot_f16(gne02, &v, 0,
+                            (ggml_fp16_t *)    wdata_src + i1n, 0,
+                            (ggml_fp16_t *) wdata_kernel + i00*ne02, 0, 1);
+                    dst_data[i10*s0 + i00] += v;
+                }
+            }
+        }
+    }
+}
+static void ggml_compute_forward_conv_transpose_1d_f32_tts(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nk = ne00*ne01*ne02;
+
+    GGML_ASSERT(nb00 == sizeof(float));
+    GGML_ASSERT(nb10 == sizeof(float));
+
+    if (ith == 0) {
+        memset(params->wdata, 0, params->wsize);
+
+        // prepare kernel data (src0) from (K x Cout x Cin) to (Cin x K x Cout)
+        {
+            float * const wdata = (float *) params->wdata + 0;
+
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = 0; i01 < ne01; i01++) {
+                    const float * const src = (float *)((char *) src0->data + i02*nb02 + i01*nb01);
+                    float * dst_data = wdata + i01*ne00*ne02;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        dst_data[i00*ne02 + i02] = src[i00];
+                    }
+                }
+            }
+        }
+
+        // prepare source data (src1)
+        {
+            float * const wdata = (float *) params->wdata + nk;
+            float * dst_data = wdata;
+
+            for (int64_t i11 = 0; i11 < ne11; i11++) {
+                const float * const src = (float *)((char *) src1->data + i11*nb11);
+                for (int64_t i10 = 0; i10 < ne10; i10++) {
+                    dst_data[i10*ne11 + i11] = src[i10];
+                }
+            }
+        }
+
+        // need to zero dst since we are accumulating into it
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
+    const int32_t p0 = ((const int32_t*)(dst->op_params))[1];
+    const int32_t g0 = ((const int32_t*)(dst->op_params))[3];
+
+    // total rows in dst
+    const int nr = ne1;
+    const int gne02 = ne02 / g0;
+
+    const int kernel_m = gne02 == 1 ? 1 : ne02*ne00; // strictly speaking ne02*ne00 is wrong for other groupings but the grouping argument should be rarely used.
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    float * const wdata     = (float *) params->wdata + 0;
+    float * const wdata_src = wdata + nk;
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * dst_data = (float *)((char *) dst->data + i1*nb1);
+        float * wdata_kernel = wdata + i1*kernel_m;
+        for (int i10 = 0; i10 < ne10; i10++) {
+            const int i1n = i10*ne11 + (int)(i1 / gne02);
+            for (int i00 = 0; i00 < ne00; i00++) {
+                float v = 0.0f;
+                if ((i10 * s0 < p0 && i00 >= p0) || (i10 * s0 >= p0 && i10 * s0 + i00 - p0 < ne0)) {
+                    ggml_vec_dot_f32(gne02, &v, 0,
+                            wdata_src + i1n, 0,
+                            wdata_kernel + i00 * ne02, 0, 1);
+                    dst_data[i10 * s0 + i00 - p0] += v;
+                }
+            }
+        }
+    }
+}
+static void ggml_compute_forward_conv_transpose_1d_tts(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_conv_transpose_1d_f16_f32_tts(params, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_conv_transpose_1d_f32_tts(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+static void ggml_compute_forward_upscale_linear_f32(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    // rows per thread
+    const int dr = (ne0 + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, ne0);
+
+    // the scale factor computed by dividing the output size by the input size
+    // this method currently doesn't support downscale interpolation (i.e. a scale factor between 0.0 and 1.0)
+    const float sf0 = (float) ne0 / src0->ne[0];
+    // in the PyTorch implementation of linear interpolation when performing linear upscaling, each side is padded by the half the scale factor of
+    // the first and last values respectively. Below we calculate half the scale factor.
+    const float hsf0 = sf0 / 2.0f;
+    const int64_t sf = (int64_t) sf0;
+    const int64_t hsf = (int64_t) hsf0;
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2 += nth) {
+            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                float * y = (float *)((char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+                for (int64_t i0 = ir0; i0 < ir1; i0++) {
+                    if (i0 < hsf) {
+                        y[i0] = ((float *)((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03))[0];
+                        continue;
+                    } else if (i0 >= ne0 - hsf) {
+                        y[i0] = ((float *)((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03))[src0->ne[0]-1];
+                        continue;
+                    }
+                    const int64_t i00 = (i0 - hsf0) / sf0;
+                    const float * x = (float *)((char *) src0->data + i00*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+                    float base = x[0];
+                    float top = x[1];
+                    float diff_adj = (top - base) / sf0;
+                    float adj = ((i0 - hsf) % sf) * diff_adj + (diff_adj / 2.0f);
+                    y[i0] = base + adj;
+                }
+            }
+        }
+    }
+}
+static void ggml_compute_forward_upscale_linear(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_upscale_linear_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+//////    end kcpp dirtypatch    /////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
@@ -2018,6 +2799,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_solve_tri(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                ggml_compute_forward_gated_delta_net(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2082,6 +2867,47 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("fatal error");
             }
+        //KCPP: dirtypatch for TTS cpp
+        case GGML_OP_RECIPROCAL:
+            {
+                ggml_compute_forward_reciprocal(params, tensor);
+            } break;
+        case GGML_OP_TTSROUND:
+            {
+                ggml_compute_forward_ttsround(params, tensor);
+            } break;
+        case GGML_OP_CUMSUM_TTS:
+            {
+                ggml_compute_forward_cumsum_tts(params, tensor);
+            } break;
+        case GGML_OP_MOD:
+            {
+                ggml_compute_forward_mod(params, tensor);
+            } break;
+        case GGML_OP_STFT:
+            {
+                ggml_compute_forward_stft(params, tensor);
+            } break;
+        case GGML_OP_AA_STFT:
+            {
+                ggml_compute_forward_abs_angle_stft(params, tensor);
+            } break;
+        case GGML_OP_ISTFT:
+            {
+                ggml_compute_forward_istft(params, tensor);
+            } break;
+        case GGML_OP_AA_ISTFT:
+            {
+                ggml_compute_forward_abs_angle_istft(params, tensor);
+            } break;
+        case GGML_OP_UPSCALE_LINEAR:
+            {
+                ggml_compute_forward_upscale_linear(params, tensor);
+            } break;
+        case GGML_OP_CONV_TRANSPOSE_1D_TTS:
+            {
+                ggml_compute_forward_conv_transpose_1d_tts(params, tensor);
+            } break;
     }
 }
 
@@ -2197,6 +3023,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_GATED_DELTA_NET:
             {
                 n_tasks = n_threads;
             } break;
@@ -2403,6 +3230,19 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 GGML_ABORT("fatal error");
             }
+        case GGML_OP_RECIPROCAL: //kcpp: dirtypatch tts cpp
+        case GGML_OP_MOD:
+        case GGML_OP_TTSROUND:
+        case GGML_OP_CUMSUM_TTS:
+        case GGML_OP_STFT:
+        case GGML_OP_AA_STFT:
+        case GGML_OP_ISTFT:
+        case GGML_OP_AA_ISTFT:
+        case GGML_OP_UPSCALE_LINEAR:
+        case GGML_OP_CONV_TRANSPOSE_1D_TTS:
+            {
+                n_tasks = n_threads;
+            } break;
         default:
             {
                 fprintf(stderr, "%s: op not implemented: ", __func__);
@@ -2460,6 +3300,7 @@ static bool ggml_thread_apply_affinity(bool * mask) {
     return m != 0;
 }
 
+static bool powethrottlemsgshown = false;
 static bool ggml_thread_apply_priority(int32_t prio) {
     // Note that on Windows the Process Priority Class must be updated in order to set Thread priority.
     // This is up to the applications.
@@ -2472,24 +3313,32 @@ static bool ggml_thread_apply_priority(int32_t prio) {
         case GGML_SCHED_PRIO_REALTIME: p = THREAD_PRIORITY_TIME_CRITICAL; break;
     }
 
+#ifndef USE_FAILSAFE
     if (prio != GGML_SCHED_PRIO_LOW) {
         // Tell Windows that this thread should not be throttled (needs its own CPU core).
-        // Newer Windows 11 versions aggresively park (offline) CPU cores and often place
+        // Newer Windows 11 versions aggressively park (offline) CPU cores and often place
         // all our threads onto the first 4 cores which results in terrible performance with
         // n_threads > 4
-        #if _WIN32_WINNT >= 0x0602
-        THREAD_POWER_THROTTLING_STATE t;
+        #if _WIN32_WINNT >= 0x602
+        PROCESS_POWER_THROTTLING_STATE t;
         ZeroMemory(&t, sizeof(t));
-        t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-        t.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        t.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        t.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
         t.StateMask   = 0;
 
-        if (!SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t))) {
-            GGML_LOG_DEBUG("failed to disable thread power throttling %d : (%d)\n", prio, (int) GetLastError());
+        if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &t, sizeof(t))) {
+            GGML_LOG_DEBUG("failed to disable process power throttling %d : (%d)\n", prio, (int) GetLastError());
             return false;
         }
         #endif
     }
+#else
+    if(!powethrottlemsgshown)
+    {
+        powethrottlemsgshown = true;
+        printf("\nPower Throttling skipped in compatibility mode.\n");
+    }
+#endif
 
     if (prio == GGML_SCHED_PRIO_NORMAL) {
         // Keep inherited policy/priority
@@ -2782,7 +3631,8 @@ struct ggml_cplan ggml_graph_plan(
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            size_t cur2 = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            cur = MAX(cur, cur2);
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
@@ -2817,6 +3667,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
+                case GGML_OP_CONV_TRANSPOSE_1D_TTS: //kcpp: dirtypatch for tts
                     {
                         GGML_ASSERT(node->src[0]->ne[3] == 1);
                         GGML_ASSERT(node->src[1]->ne[2] == 1);
@@ -2866,10 +3717,20 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
-                        const int64_t ne10 = node->src[1]->ne[0]; // DK
-                        const int64_t ne20 = node->src[2]->ne[0]; // DV
+                        const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
 
-                        cur = sizeof(float)*(1*ne10 + 2*ne20)*n_tasks; // 1x head size K + 2x head size V (per thread)
+                        // Tiled flash attention scratch (tile sizes defined in common.h)
+                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
+                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+
+                        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
+                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        size_t n_chunks = n_tasks;
+                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+
+                        cur += MAX(prefill, decode);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
@@ -2892,10 +3753,27 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
+                case GGML_OP_GATED_DELTA_NET:
+                    {
+                        const int64_t S_v = node->src[2]->ne[0];
+                        cur = S_v * sizeof(float) * n_tasks;
+                    } break;
                 case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");
                     }
+                case GGML_OP_STFT:
+                case GGML_OP_AA_STFT: //kcpp: dirtypatch for tts cpp
+                    {
+                        cur = ggml_type_size(node->type)*(n_threads + node->ne[0] * n_threads * 2);
+                    } break;
+                case GGML_OP_ISTFT:
+                case GGML_OP_AA_ISTFT:
+                    {
+                        // In order to support one sided reflective padding and complex conversions we need two extra n_fft sized buffers
+                        // to prepare magnitude and phase for inverted FFTs.
+                        cur = ggml_type_size(node->type)*(n_tasks + node->ne[0] * n_tasks * 4);
+                    } break;
                 default:
                     break;
             }
@@ -2926,20 +3804,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
 
     struct ggml_compute_params params = {
-        /*.ith       =*/ state->ith,
-        /*.nth       =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
-        /*.wsize     =*/ cplan->work_size,
-        /*.wdata     =*/ cplan->work_data,
-        /*.threadpool=*/ tp,
+        /*.ith        =*/ state->ith,
+        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
+        /*.wsize      =*/ cplan->work_size,
+        /*.wdata      =*/ cplan->work_data,
+        /*.threadpool =*/ tp,
+        /*.use_ref    =*/ cplan->use_ref,
     };
 
-    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
+#ifdef GGML_USE_OPENMP
+    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
+#else
+    GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+#endif
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
+            continue;
+        }
+
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
 
@@ -2956,7 +3843,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
     }
 
-    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
+#ifdef GGML_USE_OPENMP
+    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
+#else
+    GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+#endif
 
     ggml_barrier(state->threadpool);
 
@@ -3320,13 +4211,33 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         __m128 y_vec = _mm_cvtph_ps(x_vec);
         _mm_storeu_ps(y + i, y_vec);
     }
-#elif defined(__riscv_zvfh)
-    for (int vl; i < n; i += vl) {
-        vl = __riscv_vsetvl_e16m1(n - i);
-        vfloat16m1_t vx = __riscv_vle16_v_f16m1((_Float16 *)&x[i], vl);
-        vfloat32m2_t vy = __riscv_vfwcvt_f_f_v_f32m2(vx, vl);
-        __riscv_vse32_v_f32m2(&y[i], vy, vl);
+
+#elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
+    // calculate step size
+    const int epr = __riscv_vsetvlmax_e16m2();
+    const int step = epr * 2;
+    const int np = (n & ~(step - 1));
+
+    // unroll by 2
+    for (; i < np; i += step) {
+        vfloat16m2_t ax0 = __riscv_vle16_v_f16m2((const _Float16*)x + i, epr);
+        vfloat32m4_t ay0 = __riscv_vfwcvt_f_f_v_f32m4(ax0, epr);
+        __riscv_vse32_v_f32m4(y + i, ay0, epr);
+
+        vfloat16m2_t ax1 = __riscv_vle16_v_f16m2((const _Float16*)x + i + epr, epr);
+        vfloat32m4_t ay1 = __riscv_vfwcvt_f_f_v_f32m4(ax1, epr);
+        __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
     }
+
+    // leftovers
+    int vl;
+    for (i = np; i < n; i += vl) {
+        vl = __riscv_vsetvl_e16m2(n - i);
+        vfloat16m2_t ax0 = __riscv_vle16_v_f16m2((const _Float16*)x + i, vl);
+        vfloat32m4_t ay0 = __riscv_vfwcvt_f_f_v_f32m4(ax0, vl);
+        __riscv_vse32_v_f32m4(y + i, ay0, vl);
+    }
+
 #endif
 
     for (; i < n; ++i) {
@@ -3370,6 +4281,31 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
                                     _mm_loadu_si128(
                                         (const __m128i *)(x + i))),
                                 16)));
+    }
+#elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfmin)
+    // calculate step size
+    const int epr = __riscv_vsetvlmax_e16m2();
+    const int step = epr * 2;
+    const int np = (n & ~(step - 1));
+
+    // unroll by 2
+    for (; i < np; i += step) {
+        vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16*)x + i, epr);
+        vfloat32m4_t ay0 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax0, epr);
+        __riscv_vse32_v_f32m4(y + i, ay0, epr);
+
+        vbfloat16m2_t ax1 = __riscv_vle16_v_bf16m2((const __bf16*)x + i + epr, epr);
+        vfloat32m4_t ay1 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax1, epr);
+        __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
+    }
+
+    // leftovers
+    int vl;
+    for (i = np; i < n; i += vl) {
+        vl = __riscv_vsetvl_e16m2(n - i);
+        vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16*)x + i, vl);
+        vfloat32m4_t ay0 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax0, vl);
+        __riscv_vse32_v_f32m4(y + i, ay0, vl);
     }
 #endif
     for (; i < n; i++) {
@@ -3619,6 +4555,11 @@ void ggml_cpu_init(void) {
                 ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
+            }
+
+            // initialize E8M0 half table (256 entries)
+            for (int i = 0; i < (1 << 8); ++i) {
+                ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

@@ -17,7 +17,7 @@
 
 //#define MTMD_AUDIO_DEBUG
 
-#define MINIAUDIO_IMPLEMENTATION
+// #define MINIAUDIO_IMPLEMENTATION
 #ifndef MTMD_AUDIO_DEBUG
 #   define MA_NO_ENCODING
 #endif
@@ -26,10 +26,10 @@
 #define MA_NO_NODE_GRAPH
 #define MA_NO_ENGINE
 #define MA_NO_GENERATION
-#define MA_API static
+// #define MA_API static
 #include "miniaudio/miniaudio.h"
 
-#define STB_IMAGE_IMPLEMENTATION
+// #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
 #ifdef MTMD_INTERNAL_HEADER
@@ -248,7 +248,7 @@ int32_t mtmd_helper_decode_image_chunk(
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
-    int32_t n_img_batches = GGML_PAD(n_tokens, n_batch) / n_batch;
+    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
@@ -470,12 +470,12 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
-        int bitrate = mtmd_get_audio_bitrate(ctx);
-        if (bitrate < 0) {
+        const int sample_rate = mtmd_get_audio_sample_rate(ctx);
+        if (sample_rate < 0) {
             LOG_ERR("This model does not support audio input\n");
             return nullptr;
         }
-        if (!audio_helpers::decode_audio_from_buf(buf, len, bitrate, pcmf32)) {
+        if (!audio_helpers::decode_audio_from_buf(buf, len, sample_rate, pcmf32)) {
             LOG_ERR("Unable to read WAV audio file from buffer\n");
             return nullptr;
         }

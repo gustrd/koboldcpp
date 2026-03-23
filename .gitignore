@@ -1,138 +1,147 @@
-# Extensions
-
-*.a
-*.bat
-*.bin
-*.d
-*.dll
-*.dot
-*.etag
-*.exe
-*.gcda
-*.gcno
-*.gcov
-*.gguf
-*.gguf.json
-*.lastModified
-*.log
-*.metallib
 *.o
-*.so
-*.swp
-*.tmp
-*.DS_Store
+*.a
+*.bin
+*.tmp.yaml
+*.Identifier
 
-# IDE / OS
+.DS_Store
+.build/
+.cache/
+.ccls-cache/
+.direnv/
+.envrc
+.swiftpm
+.venv
+.clang-tidy
+.vs/
+.vscode/
 
-/.cache/
-/.ccls-cache/
-/.direnv/
-/.envrc
-/.idea/
-/.swiftpm
-/.vs/
-/.vscode/
-/nppBackup
+ggml-metal-embed.metal
+ggml/src/ggml-vulkan-shaders.cpp
+ggml/src/ggml-vulkan-shaders.hpp
+vulkan-shaders-gen.exe
+vulkan-shaders-gen
+ggml/src/ggml-vulkan-shaders-noext.cpp
+ggml/src/ggml-vulkan-shaders-noext.hpp
+vulkan-shaders-gen-noext.exe
+vulkan-shaders-gen-noext
+vulkan-spv-tmp/*
+vulkan-spv-noext-tmp/*
 
+lcov-report/
+gcovr-report/
 
-# Coverage
+build*/
+out/
+tmp/
+autogen-*.md
 
-/gcovr-report/
-/lcov-report/
+models/*
+models-mnt
 
-# Build Artifacts
-
-/tags
-/.build/
-/build*
-/release
-/debug
+/Pipfile
+/baby-llama
+/beam-search
+/benchmark-matmult
+/convert-llama2c-to-ggml
+/embd-input-test
+/embedding
+/eval-callback
+/gguf
+/gguf-llama-simple
+/gritlm
+/imatrix
+/infill
 /libllama.so
-/llama-*
-/vulkan-shaders-gen
-/rpc-server
-/out/
-/tmp/
-/autogen-*.md
-
-# Deprecated
-
+/llama-bench
+/lookahead
+/lookup
 /main
+/metal
+/passkey
+/perplexity
+/q8dot
+/quantize
+/quantize-stats
+/result
+/save-load-state
 /server
+/simple
+/batched
+/batched-bench
+/export-lora
+/finetune
+/speculative
+/parallel
+/train-text-from-scratch
+/tokenize
+/vdot
+/common/build-info.cpp
+arm_neon.h
+compile_commands.json
+CMakeSettings.json
 
-# CI
+__pycache__
+dist
 
-!/.github/workflows/*.yml
+dist/
+*.spec
 
-# Models
+zig-out/
+zig-cache/
 
-/models/*
-/models-mnt
-!/models/.editorconfig
-!/models/ggml-vocab-*.gguf*
-!/models/templates
+ppl-*.txt
+qnt-*.txt
+perf-*.txt
 
-# Zig
-/zig-out/
-/zig-cache/
-
-# Examples
-
-/examples/jeopardy/results.txt
-/tools/server/*.css.hpp
-/tools/server/*.html.hpp
-/tools/server/*.js.hpp
-/tools/server/*.mjs.hpp
-/tools/server/*.gz.hpp
-!/build_64.sh
-!/examples/*.bat
-!/examples/*/*.kts
-!/examples/*/*/*.kts
-!/examples/sycl/*.bat
-!/examples/sycl/*.sh
-
-# Server Web UI temporary files
-/tools/server/webui/node_modules
-/tools/server/webui/dist
-
-# Python
-
-/.venv
-__pycache__/
-*/poetry.lock
+poetry.lock
 poetry.toml
 
-# Nix
-/result
+ggml-metal-merged.metal
 
 # Test binaries
-/tests/test-backend-ops
-/tests/test-double-float
-/tests/test-grad0
-/tests/test-grammar-parser
 /tests/test-llama-grammar
-/tests/test-opt
-/tests/test-quantize-fns
-/tests/test-quantize-perf
+tests/test-double-float
+tests/test-grad0
+tests/test-opt
+tests/test-quantize-fns
+tests/test-quantize-perf
+tests/test-sampling
+tests/test-tokenizer-0
+tests/test-tokenizer-0-llama
+tests/test-tokenizer-0-falcon
+tests/test-tokenizer-1-llama
+tests/test-tokenizer-1-bpe
 /tests/test-rope
-/tests/test-sampling
-/tests/test-tokenizer-0
-/tests/test-tokenizer-1-bpe
-/tests/test-tokenizer-1-spm
+/tests/test-backend-ops
 
-# Scripts
-!/scripts/install-oneapi.bat
+/koboldcpp_default.so
+/koboldcpp_failsafe.so
+/koboldcpp_noavx2.so
+/koboldcpp_vulkan_failsafe.so
+/koboldcpp_cublas.so
+/koboldcpp_vulkan.so
+/koboldcpp_vulkan_noavx2.so
+/koboldcpp_default.dll
+/koboldcpp_failsafe.dll
+/koboldcpp_noavx2.dll
+/koboldcpp_vulkan_noavx2.dll
+/koboldcpp_vulkan_failsafe.dll
+/koboldcpp_cublas.dll
+/koboldcpp_vulkan.dll
+/cublas64_11.dll
+/cublasLt64_11.dll
+/cublas64_12.dll
+/cublasLt64_12.dll
+/rocblas/
+rocblas.dll
+hipblas.dll
+koboldcpp_hipblas.so
+koboldcpp_hipblas.dll
+.tokenizer_configs
 
-# Test models for lora adapters
-/lora-tests
+bin/
+conda/
 
-# Local scripts
-/run-vim.sh
-/run-chat.sh
-/.ccache/
-
-# IDE
-/*.code-workspace
-/.windsurf/
-# emscripten
-a.out.*
+# Jetbrains idea folder
+.idea/

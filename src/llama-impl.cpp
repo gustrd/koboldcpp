@@ -25,6 +25,10 @@ time_meas::~time_meas() {
     }
 }
 
+void llama_log_get(ggml_log_callback * log_callback, void ** user_data) {
+    ggml_log_get(log_callback, user_data);
+}
+
 void llama_log_set(ggml_log_callback log_callback, void * user_data) {
     ggml_log_set(log_callback, user_data);
     g_logger_state.log_callback = log_callback ? log_callback : llama_log_callback_default;
@@ -34,9 +38,9 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
     va_list args_copy;
     va_copy(args_copy, args);
-    char buffer[128];
-    int len = vsnprintf(buffer, 128, format, args);
-    if (len < 128) {
+    char buffer[512];
+    int len = vsnprintf(buffer, 512, format, args);
+    if (len < 512) {
         g_logger_state.log_callback(level, buffer, g_logger_state.log_callback_user_data);
     } else {
         char * buffer2 = new char[len + 1];
@@ -96,18 +100,18 @@ std::string format(const char * fmt, ...) {
 
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
     char buf[256];
-    snprintf(buf, sizeof(buf), "%5" PRId64, ne.at(0));
+    snprintf(buf, sizeof(buf), "%6" PRId64, ne.at(0));
     for (size_t i = 1; i < ne.size(); i++) {
-        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %5" PRId64, ne.at(i));
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %6" PRId64, ne.at(i));
     }
     return buf;
 }
 
 std::string llama_format_tensor_shape(const struct ggml_tensor * t) {
     char buf[256];
-    snprintf(buf, sizeof(buf), "%5" PRId64, t->ne[0]);
+    snprintf(buf, sizeof(buf), "%6" PRId64, t->ne[0]);
     for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %5" PRId64, t->ne[i]);
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ", %6" PRId64, t->ne[i]);
     }
     return buf;
 }

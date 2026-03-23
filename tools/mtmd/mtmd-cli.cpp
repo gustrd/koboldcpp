@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "debug.h"
 #include "log.h"
 #include "common.h"
 #include "sampling.h"
@@ -12,6 +13,7 @@
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
+#include <clocale>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -65,7 +67,7 @@ static void sigint_handler(int signo) {
 
 struct mtmd_cli_context {
     mtmd::context_ptr ctx_vision;
-    common_init_result llama_init;
+    common_init_result_ptr llama_init;
 
     llama_model       * model;
     llama_context     * lctx;
@@ -88,9 +90,11 @@ struct mtmd_cli_context {
     int n_threads    = 1;
     llama_pos n_past = 0;
 
+    base_callback_data cb_data;
+
     mtmd_cli_context(common_params & params) : llama_init(common_init_from_params(params)) {
-        model = llama_init.model.get();
-        lctx = llama_init.context.get();
+        model = llama_init->model();
+        lctx = llama_init->context();
         vocab = llama_model_get_vocab(model);
         smpl = common_sampler_init(model, params.sampling);
         n_threads = params.cpuparams.n_threads;
@@ -139,6 +143,10 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {
+            mparams.cb_eval_user_data = &cb_data;
+            mparams.cb_eval = common_debug_cb_eval<false>;
+        }
         ctx_vision.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_vision.get()) {
             LOG_ERR("Failed to load vision model from %s\n", clip_path);
@@ -267,11 +275,11 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 }
 
 int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
     ggml_time_init();
 
     common_params params;
-    params.use_jinja = false;   // disable jinja by default
-    params.sampling.temp = 0.2; // lower temp by default for better quality
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
         return 1;
@@ -311,8 +319,23 @@ int main(int argc, char ** argv) {
 
     if (g_is_interrupted) return 130;
 
+    auto eval_system_prompt_if_present = [&] {
+        if (params.system_prompt.empty()) {
+            return 0;
+        }
+
+        common_chat_msg msg;
+        msg.role = "system";
+        msg.content = params.system_prompt;
+        return eval_message(ctx, msg);
+    };
+
     LOG_WRN("WARN: This is an experimental CLI for testing multimodal capability.\n");
     LOG_WRN("      For normal use cases, please use the standard llama-cli\n");
+
+    if (eval_system_prompt_if_present()) {
+        return 1;
+    }
 
     if (is_single_turn) {
         g_is_generating = true;
@@ -323,6 +346,7 @@ int main(int argc, char ** argv) {
                 params.prompt = mtmd_default_marker() + params.prompt;
             }
         }
+
         common_chat_msg msg;
         msg.role = "user";
         msg.content = params.prompt;
@@ -371,6 +395,9 @@ int main(int argc, char ** argv) {
                 ctx.n_past = 0;
                 ctx.chat_history.clear();
                 llama_memory_clear(llama_get_memory(ctx.lctx), true);
+                if (eval_system_prompt_if_present()) {
+                    return 1;
+                }
                 LOG("Chat history cleared\n\n");
                 continue;
             }

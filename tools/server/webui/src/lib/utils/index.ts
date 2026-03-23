@@ -9,13 +9,11 @@
 
 // API utilities
 export { getAuthHeaders, getJsonHeaders } from './api-headers';
+export { apiFetch, apiFetchWithParams, apiPost, type ApiFetchOptions } from './api-fetch';
 export { validateApiKey } from './api-key-validation';
 
 // Attachment utilities
-export {
-	getAttachmentDisplayItems,
-	type AttachmentDisplayItemsOptions
-} from './attachment-display';
+export { getAttachmentDisplayItems } from './attachment-display';
 export { isTextFile, isImageFile, isPdfFile, isAudioFile } from './attachment-type';
 
 // Textarea utilities
@@ -33,17 +31,30 @@ export {
 	getPreviousSibling
 } from './branching';
 
+// Code
+export { highlightCode, detectIncompleteCodeBlock, type IncompleteCodeBlock } from './code';
+
 // Config helpers
 export { setConfigValue, getConfigValue, configToParameterRecord } from './config-helpers';
+
+// CORS Proxy
+export { buildProxiedUrl, getProxiedUrlString } from './cors-proxy';
 
 // Conversation utilities
 export { createMessageCountMap, getMessageCount } from './conversation-utils';
 
 // Clipboard utilities
-export { copyToClipboard, copyCodeToClipboard } from './copy';
+export {
+	copyToClipboard,
+	copyCodeToClipboard,
+	formatMessageForClipboard,
+	parseClipboardContent,
+	hasClipboardAttachments
+} from './clipboard';
 
 // File preview utilities
-export { getFileTypeLabel, getPreviewText } from './file-preview';
+export { getFileTypeLabel } from './file-preview';
+export { getPreviewText } from './text';
 
 // File type utilities
 export {
@@ -54,7 +65,15 @@ export {
 } from './file-type';
 
 // Formatting utilities
-export { formatFileSize, formatParameters, formatNumber } from './formatters';
+export {
+	formatFileSize,
+	formatParameters,
+	formatNumber,
+	formatJsonPretty,
+	formatTime,
+	formatPerformanceTime,
+	formatAttachmentText
+} from './formatters';
 
 // IME utilities
 export { isIMEComposing } from './is-ime-composing';
@@ -66,9 +85,7 @@ export { maskInlineLaTeX, preprocessLaTeX } from './latex-protection';
 export {
 	isFileTypeSupportedByModel,
 	filterFilesByModalities,
-	generateModalityErrorMessage,
-	generateModalityAwareAcceptString,
-	type ModalityCapabilities
+	generateModalityErrorMessage
 } from './modality-file-validation';
 
 // Model name utilities
@@ -85,3 +102,67 @@ export { getLanguageFromFilename } from './syntax-highlight-language';
 
 // Text file utilities
 export { isTextFileByName, readFileAsText, isLikelyTextFile } from './text-files';
+
+// Debounce utilities
+export { debounce } from './debounce';
+
+// Sanitization utilities
+export { sanitizeKeyValuePairKey, sanitizeKeyValuePairValue } from './sanitize';
+
+// Image error fallback utilities
+export { getImageErrorFallbackHtml } from './image-error-fallback';
+
+// MCP utilities
+export {
+	detectMcpTransportFromUrl,
+	parseMcpServerSettings,
+	getMcpLogLevelIcon,
+	getMcpLogLevelClass,
+	isImageMimeType,
+	parseResourcePath,
+	getDisplayName,
+	getResourceDisplayName,
+	isCodeResource,
+	isImageResource,
+	getResourceIcon,
+	getResourceTextContent,
+	getResourceBlobContent,
+	downloadResourceContent
+} from './mcp';
+
+// URI Template utilities
+export {
+	extractTemplateVariables,
+	expandTemplate,
+	isTemplateComplete,
+	normalizeResourceUri,
+	type UriTemplateVariable
+} from './uri-template';
+
+// Data URL utilities
+export { createBase64DataUrl } from './data-url';
+
+// Header utilities
+export { parseHeadersToArray, serializeHeaders } from './headers';
+
+// Favicon utilities
+export { getFaviconUrl } from './favicon';
+
+// Agentic content parsing utilities
+export { parseAgenticContent, type AgenticSection } from './agentic';
+
+// Cache utilities
+export { TTLCache, ReactiveTTLMap, type TTLCacheOptions } from './cache-ttl';
+
+// Abort signal utilities
+export {
+	throwIfAborted,
+	isAbortError,
+	createLinkedController,
+	createTimeoutSignal,
+	withAbortSignal
+} from './abort';
+
+// Cryptography utilities
+
+export { uuid } from './uuid';

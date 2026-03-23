@@ -6,7 +6,7 @@
 // This documentation is still a work in progress.
 // If you wish some specific topics to be covered, feel free to drop a comment:
 //
-//   https://github.com/ggerganov/whisper.cpp/issues/40
+//   https://github.com/ggml-org/whisper.cpp/issues/40
 //
 // ## Overview
 //
@@ -226,7 +226,7 @@
 #define GGML_MAX_OP_PARAMS      64
 
 #ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        64
+#   define GGML_MAX_NAME        128
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4
@@ -234,6 +234,11 @@
 
 #if UINTPTR_MAX == 0xFFFFFFFF
     #define GGML_MEM_ALIGN 4
+#elif defined(__EMSCRIPTEN__)
+// emscripten uses max_align_t == 8, so we need GGML_MEM_ALIGN == 8 for 64-bit wasm.
+// (for 32-bit wasm, the first conditional is true and GGML_MEM_ALIGN stays 4.)
+// ref: https://github.com/ggml-org/llama.cpp/pull/18628
+    #define GGML_MEM_ALIGN 8
 #else
     #define GGML_MEM_ALIGN 16
 #endif
@@ -261,6 +266,12 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args&&...) noexc
 
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 
+#define GGML_ASSERT_CONTINUE(x) \
+    do { \
+        if (!(x)) { \
+            fprintf(stderr, "GGML_ASSERT_CONTINUE: %s:%d: %s\n", __FILE__, __LINE__, #x); \
+        } \
+    } while (0)
 #ifndef NDEBUG
 #   define GGML_UNREACHABLE() do { fprintf(stderr, "statement should be unreachable\n"); abort(); } while(0)
 #elif defined(__GNUC__)
@@ -413,16 +424,17 @@ extern "C" {
         GGML_TYPE_F64     = 28,
         GGML_TYPE_IQ1_M   = 29,
         GGML_TYPE_BF16    = 30,
-        // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
-        // GGML_TYPE_Q4_0_4_8 = 32,
-        // GGML_TYPE_Q4_0_8_8 = 33,
+        GGML_TYPE_Q4_0_4_4 = 31, //deprecated upstream
+        GGML_TYPE_Q4_0_4_8 = 32, //deprecated upstream
+        GGML_TYPE_Q4_0_8_8 = 33, //deprecated upstream
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
-        // GGML_TYPE_IQ4_NL_4_4 = 36,
+        GGML_TYPE_IQ4_NL_4_4 = 36, //deprecated upstream
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_COUNT   = 40,
+        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_COUNT   = 41,
     };
 
     // precision
@@ -458,6 +470,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
+        GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
     };
 
     // available tensor operations:
@@ -551,6 +564,7 @@ extern "C" {
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
+        GGML_OP_GATED_DELTA_NET,
 
         GGML_OP_UNARY,
 
@@ -568,6 +582,18 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_COUNT,
+
+        //kcpp: dirtypatch of unofficial ops for ttscpp
+        GGML_OP_UPSCALE_LINEAR, // linear interpolate
+        GGML_OP_RECIPROCAL,
+        GGML_OP_TTSROUND,
+        GGML_OP_MOD,
+        GGML_OP_CUMSUM_TTS,
+        GGML_OP_STFT,
+        GGML_OP_AA_STFT,
+        GGML_OP_ISTFT,
+        GGML_OP_AA_ISTFT,
+        GGML_OP_CONV_TRANSPOSE_1D_TTS,
     };
 
     enum ggml_unary_op {
@@ -625,10 +651,11 @@ extern "C" {
 
     // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT  =  1, // ...is an input for the GGML compute graph
-        GGML_TENSOR_FLAG_OUTPUT =  2, // ...is an output for the GGML compute graph
-        GGML_TENSOR_FLAG_PARAM  =  4, // ...contains trainable parameters
-        GGML_TENSOR_FLAG_LOSS   =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_INPUT   =  1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT  =  2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
     };
 
     enum ggml_tri_type {
@@ -746,6 +773,7 @@ extern "C" {
     GGML_API bool ggml_is_transposed(const struct ggml_tensor * tensor);
     GGML_API bool ggml_is_permuted  (const struct ggml_tensor * tensor);
     GGML_API bool ggml_is_empty     (const struct ggml_tensor * tensor);
+    GGML_API bool ggml_is_view      (const struct ggml_tensor * tensor);
     GGML_API bool ggml_is_scalar    (const struct ggml_tensor * tensor);
     GGML_API bool ggml_is_vector    (const struct ggml_tensor * tensor);
     GGML_API bool ggml_is_matrix    (const struct ggml_tensor * tensor);
@@ -2460,6 +2488,17 @@ extern "C" {
         bool                  lower,
         bool                  uni);
 
+    // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
+    // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
+    GGML_API struct ggml_tensor * ggml_gated_delta_net(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
@@ -2572,11 +2611,42 @@ extern "C" {
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
 
+    // build forward multiple tensors and select one of them for computing
+    // this is useful for creating graphs that have constant topology but compute different things based on the input
+    // ref: https://github.com/ggml-org/llama.cpp/pull/18550
     //
-    // automatic differentiation
+    // nodes:
+    //   | - build forward into the graph but do not compute
+    //   c - build forward into the graph and compute
     //
+    //    |  |  ...  c  ...  |
+    //    |  |  ...  c  ...  |
+    //    |  |  ...  c  ...  |
+    //   [0  1  ... idx ...  n-1]        <-- ggml_build_forward_select(..., n, idx)
+    //               c
+    //               c
+    //
+    // example:
+    //   struct ggml_tensor * curs[3];
+    //
+    //   curs[0]  = compute0(...);
+    //   curs[1]  = compute1(...);
+    //   curs[2]  = compute2(...);
+    //
+    //   int idx = select_branch(some_input);
+    //
+    //   struct ggml_tensor * out = ggml_build_forward_select(cgraph, curs, 3, idx);
+    //
+    GGML_API struct ggml_tensor * ggml_build_forward_select(
+            struct ggml_cgraph  * cgraph,
+            struct ggml_tensor ** tensors,
+            int                   n_tensors,
+            int                   idx);
 
-    GGML_API void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
+    GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
@@ -2608,14 +2678,15 @@ extern "C" {
     GGML_API void ggml_graph_print(const struct ggml_cgraph * cgraph);
 
     // dump the graph into a file using the dot format
-    GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
+    GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * cgraph, const char * filename);
 
     // TODO these functions were sandwiched in the old optimization interface, is there a better place for them?
     typedef void (*ggml_log_callback)(enum ggml_log_level level, const char * text, void * user_data);
 
     // Set callback for all future logging events.
     // If this is not called, or NULL is supplied, everything is output on stderr.
-    GGML_API void ggml_log_set(ggml_log_callback log_callback, void * user_data);
+    GGML_API void ggml_log_get(ggml_log_callback * log_callback, void ** user_data);
+    GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 
@@ -2712,6 +2783,76 @@ extern "C" {
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+    //kcpp: dirtypatch of ttscpp additions
+    GGML_API struct ggml_tensor * ggml_ttsround(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a);
+    GGML_API struct ggml_tensor * ggml_ttsround_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a);
+    // This is a floating point mod by the mod_val parameter
+    GGML_API struct ggml_tensor * ggml_mod(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a,
+            float mod_val);
+    GGML_API struct ggml_tensor * ggml_mod_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a,
+            float mod_val);
+    // reciprocal of each value in tensor a
+    GGML_API struct ggml_tensor * ggml_reciprocal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+    GGML_API struct ggml_tensor * ggml_reciprocal_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+        // cumulative sums along first axis (ne0)
+    GGML_API struct ggml_tensor * ggml_cumsum_tts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+    GGML_API struct ggml_tensor * ggml_conv_1d_dw_tts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel
+            struct ggml_tensor  * b,   // data
+            int                   s0,  // stride
+            int                   p0,  // padding
+            int                   d0); // dilation
+    GGML_API struct ggml_tensor * ggml_conv_transpose_1d_tts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel
+            struct ggml_tensor  * b,   // data
+            int                   s0,  // stride
+            int                   p0,  // padding
+            int                   d0,  // dilation
+            int                   op0, // output padding
+            int                   g0); // groups
+    GGML_API struct ggml_tensor * ggml_conv_1d_tts(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel
+            struct ggml_tensor  * b,   // data
+            int                   s0,  // stride
+            int                   p0,  // padding
+            int                   d0); // dilation
+    GGML_API struct ggml_tensor * ggml_stft(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a,
+            struct ggml_tensor * w, // the window
+            int filter_length,
+            int hop_length,
+            bool compute_abs_and_angle);
+    GGML_API struct ggml_tensor * ggml_istft(
+            struct ggml_context * ctx,
+            struct ggml_tensor * a, // magnitude + phase
+            struct ggml_tensor * w,
+            int filter_length,
+            int hop_length,
+            bool from_abs_and_angle);
+    GGML_API struct ggml_tensor * ggml_upscale_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   scale_factor);
+    //end kcpp dirtypatch
 
 #ifdef  __cplusplus
 }

@@ -1,0 +1,22 @@
+name: koboldcpp
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - cxx-compiler
+  - gxx=10
+  - pip
+  - git
+  - ninja
+  - make
+  - packaging
+  - pyinstaller
+  - libcblas
+  - ocl-icd-system
+  - libvulkan-loader
+  - tk=*=xft_*
+  - psutil
+  - jinja2
+  - pip:
+    - customtkinter

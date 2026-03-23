@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "mtmd.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +38,8 @@ struct clip_context_params {
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
 };
 
 struct clip_init_result {
@@ -94,6 +97,11 @@ struct clip_image_f32 * clip_image_f32_get_img(const struct clip_image_f32_batch
  */
 void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny, struct clip_image_u8 * img);
 
+bool clip_image_load_from_file(const char * fname, struct clip_image_u8 * img);
+
+/** interpret bytes as an image file with length bytes_length, and use the result to populate img */
+bool clip_image_load_from_bytes(const unsigned char * bytes, size_t bytes_length, struct clip_image_u8 * img, const int maxdims);
+
 /** preprocess img and store the result in res_imgs, pad_to_square may be overridden to false depending on model configuration */
 bool clip_image_preprocess(struct clip_ctx * ctx, const struct clip_image_u8 * img, struct clip_image_f32_batch * res_imgs );
 
@@ -104,9 +112,12 @@ bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct 
 
 int clip_is_minicpmv(const struct clip_ctx * ctx);
 bool clip_is_glm(const struct clip_ctx * ctx);
-bool clip_is_qwen2vl(const struct clip_ctx * ctx);
+bool clip_is_mrope(const struct clip_ctx * ctx);
 bool clip_is_llava(const struct clip_ctx * ctx);
 bool clip_is_gemma3(const struct clip_ctx * ctx);
+bool clip_is_pixtral(const struct clip_ctx * ctx);
+void set_clip_uses_gpu(bool usegpu);
+int clip_get_projector_type_ext(clip_ctx * ctx);
 
 bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec);
 
@@ -116,3 +127,5 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
+
+bool clip_model_quantize(const char * fname_inp, const char * fname_out, const int itype) ;
