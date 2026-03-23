@@ -836,6 +836,12 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
 
+    if (name.find("ffn_gate_exps") != std::string::npos ||
+        name.find("ffn_up_exps") != std::string::npos ||
+        name.find("ffn_down_exps") != std::string::npos) {
+        return cur;
+    }
+
     {
         bool is_ok = true;
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
