@@ -1,5 +1,5 @@
 // tests/flash_moe/test_flash_moe_integration_wiring.cpp
-#include "flash_moe/flash_moe_manager.h"
+#include "../../src/flash_moe/flash_moe_manager.h"
 #include <iostream>
 #include <cassert>
 #include <fstream>
