@@ -17,8 +17,8 @@ using json = nlohmann::json;
 namespace FlashMoE {
 
     struct LayerState {
-        void* virtual_base = nullptr;
-        size_t reserved_size = 0;
+        void* virtual_base = nullptr;   // reserved for Phase 2 (unused)
+        size_t reserved_size = 0;       // reserved for Phase 2 (unused)
         size_t padded_expert_size = 0;
         int n_experts = 0;
         std::unordered_set<int> loaded_expert_ids; // experts whose data is in GPU buffer
@@ -83,16 +83,30 @@ namespace FlashMoE {
                 ls.projs["up"]   = { e0["up_offset"],   e0["up_bytes"]   };
                 ls.projs["down"] = { e0["down_offset"], e0["down_bytes"] };
             }
+        }
 
-            // Reserve virtual address space for the whole layer.
-            // Kept for potential Phase 2 use (direct tensor mapping).
-            // Not used for data loading in Phase 1.5c.
-            size_t total_layer_virtual = fmoe_page_align(
-                (size_t)ls.padded_expert_size * n_experts);
-            ls.reserved_size = total_layer_virtual;
-            ls.virtual_base  = fmoe_vmem_reserve(total_layer_virtual);
-            if (!ls.virtual_base) {
-                std::cerr << "FlashMoE Error: Failed to reserve virtual memory for layer " << l << std::endl;
+        // Create the unified LRU cache pool.
+        // All experts are assumed to have the same padded_expert_size.
+        // Use the first layer with a non-zero size as the canonical slot size.
+        {
+            size_t expert_bytes = 0;
+            for (int l = 0; l < n_layers; ++l) {
+                if (g_layers[l].padded_expert_size > 0) {
+                    expert_bytes = g_layers[l].padded_expert_size;
+                    break;
+                }
+            }
+            if (expert_bytes > 0) {
+                delete g_cache;
+                size_t total_bytes = cache_size_mib * 1024ULL * 1024ULL;
+                size_t n_slots = total_bytes / expert_bytes;
+                if (n_slots < 1) n_slots = 1;
+                g_cache = new SlotBufferAllocator(n_slots, expert_bytes);
+                std::cout << "FlashMoE: LRU cache: " << n_slots << " slots × "
+                          << expert_bytes << " bytes/slot ("
+                          << cache_size_mib << " MiB)" << std::endl;
+            } else {
+                std::cerr << "FlashMoE Warning: expert_bytes=0, cache not created." << std::endl;
             }
         }
 
@@ -129,15 +143,17 @@ namespace FlashMoE {
                   << " (layer=" << layer << ", proj=" << proj << ")" << std::endl;
     }
 
-    // Direct I/O helper is defined in flash_moe_cache.cpp
-    extern bool read_direct_io_low_level(const std::string& path, void* dest, size_t size);
-
     void ExpertManager::ensure_expert_loaded(int layer, int expert_id) {
         // NOTE: caller must hold manager_mutex
         LayerState& ls = g_layers[layer];
 
         if (ls.loaded_expert_ids.count(expert_id)) {
             return; // Already in GPU buffer
+        }
+
+        if (!g_cache) {
+            std::cerr << "FlashMoE Error: LRU cache not initialized (was init() called?)" << std::endl;
+            return;
         }
 
         // Build file path: zero-padded layer (2 digits) and expert (3 digits)
@@ -147,27 +163,18 @@ namespace FlashMoE {
             + (expert_id < 10 ? "00" : (expert_id < 100 ? "0" : ""))
             + std::to_string(expert_id) + ".bin";
 
-        // Allocate a page-aligned CPU buffer for the expert file.
-        // Page alignment is required for:
-        //   - macOS F_NOCACHE to bypass the buffer cache (advisory but helps)
-        //   - Metal's newBufferWithBytesNoCopy (16KB on Apple Silicon)
-        //   - Windows FILE_FLAG_NO_BUFFERING (sector-aligned reads)
-        size_t buf_size = fmoe_page_align(ls.padded_expert_size);
-        void* cpu_buf = fmoe_vmem_reserve(buf_size);
+        // Get expert data from the unified LRU cache.
+        // On miss: loads from disk into a page-aligned CPU slot.
+        // On hit: returns the cached slot pointer (no I/O).
+        // LRU eviction is handled internally when all slots are in use.
+        //
+        // NOTE: manager_mutex is held here; get_expert_sync acquires its own
+        // internal cache_mutex. This is safe (no inversion) because cache_mutex
+        // is never acquired before manager_mutex anywhere.
+        const void* cpu_buf = g_cache->get_expert_sync(layer, expert_id, fname);
         if (!cpu_buf) {
-            std::cerr << "FlashMoE Error: Failed to reserve temp buffer for expert loading" << std::endl;
-            return;
-        }
-        if (!fmoe_vmem_commit(cpu_buf, buf_size)) {
-            std::cerr << "FlashMoE Error: Failed to commit temp buffer for expert loading" << std::endl;
-            fmoe_vmem_release(cpu_buf, buf_size);
-            return;
-        }
-
-        // Load from disk
-        if (!read_direct_io_low_level(fname, cpu_buf, ls.padded_expert_size)) {
-            std::cerr << "FlashMoE Error: Failed to load expert " << fname << std::endl;
-            fmoe_vmem_release(cpu_buf, buf_size);
+            std::cerr << "FlashMoE Error: LRU cache returned null for layer="
+                      << layer << " expert=" << expert_id << std::endl;
             return;
         }
 
@@ -208,7 +215,6 @@ namespace FlashMoE {
             }
         }
 
-        fmoe_vmem_release(cpu_buf, buf_size);
         ls.loaded_expert_ids.insert(expert_id);
     }
 
