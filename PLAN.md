@@ -277,16 +277,7 @@ make test_flash_moe -j8        # runs all Flash-MoE tests
 
 ---
 
-## 5. Retrospective Learnings
-
-* **Step 1.4:** Expert tensor name patterns (`ffn_*_exps`) identified during GGUF parsing. Zero-length stubs coexist with full `ggml_tensor` metadata. `n_created` increment logic must be preserved for model loader integrity checks.
-* **Step 1.3:** `FILE_FLAG_NO_BUFFERING` requires all three of: buffer alignment, file offset alignment, read size alignment — all to sector size (4096). `CreateFileW` requires UTF-8 → wide char conversion via `MultiByteToWideChar`.
-* **Step 1.2:** `VirtualAlloc` (Windows) and `posix_memalign` (POSIX) both guarantee page-alignment. Single-pool allocation with offset-based slot indexing preserves alignment across all slots.
-* **Step 1.1:** `std::list` + `std::unordered_map<Key, iterator>` gives O(1) LRU operations. `free_slots` deque simplifies cold-start.
-
----
-
-## 6. Cross-Platform Reference
+## 5. Cross-Platform Reference
 
 | Concern | Windows | macOS | Linux (future) |
 |---------|---------|-------|-----------------|
