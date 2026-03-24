@@ -125,22 +125,73 @@ Built the foundational components:
         2.  Removed redundant explicit `$(FMOE_OBJS)` from `main` and `koboldcpp_default` as they are now in `$(OBJS_FULL)`.
     *   **Verification:** `make LLAMA_METAL=1` builds successfully. `koboldcpp_default.so` linked.
 
-### Step 2.5d: Build, Smoke Test, and First Inference — DONE (pre-inference)
+### Step 2.5d: Build, Smoke Test, and First Inference — IN PROGRESS
 
 *   [x] **Task:** Build with `make LLAMA_METAL=1 -j8`. Run all tests. Validate manager init + expert I/O against real expert files.
-    *   **Changes implemented:**
+    *   **Changes implemented (pre-inference):**
         1.  Fixed linker error in `test_flash_moe_integration_wiring` — added `tests/flash_moe/ggml_stubs.cpp` providing stub implementations of `ggml_backend_tensor_set/get` and `ggml_nelements` so the test can link `flash_moe_manager.o` without pulling in full ggml.
         2.  Added `n_layers` and `n_experts` as public fields to `ExpertManager` (set during `init()`). Previously local-only.
         3.  Added `test_flash_moe_real_init` binary — 3 tests against real extracted expert files: init parse (48 layers, 128 experts), file readability (non-zero bytes), and `get_expert_sync` hit/miss counting.
-        4.  All 9 test binaries pass. Flash-MoE symbols confirmed present in `koboldcpp_default.so`. `--flashmoedir` flag confirmed in `koboldcpp.py --help`.
-    *   **Remaining for full inference validation:**
-        1.  Run: `python koboldcpp.py --model ~/_models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --flashmoedir ~/flash_moe_experts --usemetal --gpulayers 99`
-        2.  Send "What is 2+2?" and verify: FlashMoE init log, tensor registration messages, cache hit/miss during generation, coherent output.
-    *   **⚠️ Pitfalls:**
-        1.  **`loaded_expert_ids` is never cleared.** Once an expert is marked as GPU-resident, it's never removed even if the LRU cache evicts the CPU staging buffer. This is correct IF the GPU tensor data is never overwritten. But when a different expert is loaded into the same slot and `ggml_backend_tensor_set` writes it to the tensor, the old expert's data IS overwritten at its tensor offset. `loaded_expert_ids` must be cleared when the GPU tensor slice is overwritten. Currently, `ensure_expert_loaded` only *adds* to this set. **This is a bug** — after cache eviction + reload of a different expert into the same tensor offset position, the old expert_id is still in `loaded_expert_ids` but its GPU data is gone. However, this only matters if two experts map to the same tensor offset, which they don't — each expert has a unique offset `expert_id * proj_bytes`. The issue is different: if expert X is in GPU memory, its CPU cache slot gets evicted, then expert X is needed again — `loaded_expert_ids` says "already loaded" and skips the re-load. But the GPU data IS still valid (it was written there and never overwritten). So `loaded_expert_ids` is actually correct — it tracks "has this expert's data ever been written to the GPU tensor", which persists across CPU cache evictions.
-        2.  **First-token latency spike.** The first token triggers loading ALL active experts from disk (cold cache). For Qwen3-30B with top-2 routing × 48 layers = 96 synchronous disk reads. At ~1ms each = ~100ms latency spike. Acceptable for MVP; async I/O (Phase 3) fixes this.
-        3.  **GPU memory.** Expert tensors are allocated at full size by `ggml_backend_alloc_ctx_tensors` (the allocator doesn't know they're disk-backed stubs). For Qwen3-30B at Q4_K_M, each `ffn_gate_exps` tensor is `n_experts × proj_size`. With all expert slots pre-allocated in GPU memory, the model needs the same GPU memory as the fully-loaded version. Flash-MoE saves *CPU RAM* (via LRU cache), not GPU VRAM. This is fine — the GPU has the memory budget, we just don't want the OS page cache thrashing for the CPU-side reads.
-        4.  **Metal shared vs private buffers.** On Apple Silicon with unified memory, Metal buffers are typically shared (CPU+GPU accessible). `ggml_backend_tensor_set` is just a `memcpy` for shared buffers (~1μs). If tensors end up in private buffers, each set triggers a GPU blit + semaphore wait (~100μs). Check with `GGML_DEBUG=1` or Metal GPU profiler.
+        4.  All 10 test binaries pass. Flash-MoE symbols confirmed present in `koboldcpp_default.so`. `--flashmoedir` flag confirmed in `koboldcpp.py --help`.
+
+    *   **Inference bugs found and fixed:**
+
+        **Bug 1: CPU_REPACK buffer rejects partial writes (FIXED)**
+        - **Symptom:** `GGML_ASSERT(size == ggml_nbytes(tensor)) failed` in `ggml_backend_cpu_repack_buffer_set_tensor` during model warmup.
+        - **Root cause:** With `--gpulayers 0`, expert tensors land in CPU_REPACK buffers. CPU_REPACK's `set_tensor` asserts `offset == 0 && size == full_tensor` because it repacks data for optimized matmul. Flash-MoE writes per-expert slices (partial writes) which violates this assert.
+        - **Fix:** Force expert tensors to plain CPU buffer in `llama-model-loader.cpp:1155-1165`. After `select_weight_buft` picks the buffer type, detect expert tensor names (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`) and override to `ggml_backend_dev_buffer_type(cpu_dev)`.
+        - **Trade-off:** Expert tensors lose CPU_REPACK matmul optimization. Acceptable for MVP. The proper fix (Phase 2.6) is slot-based GPU allocation.
+
+        **Bug 2: Variable expert sizes across layers (FIXED)**
+        - **Symptom:** `FlashMoE Error: pread failed for blk06_exp000.bin` — layers 6,7,9,10,12,13,... all fail.
+        - **Root cause:** Qwen3-30B-A3B has different expert file sizes per layer. Layer 0: `down_bytes=1,290,240` → total 3,059,712. Layer 6: `down_bytes=884,736` → total 2,654,208. The LRU cache used layer 0's size (first non-zero) as global slot size. `pread` tried to read 3,059,712 bytes from a 2,654,208 byte file → EOF error.
+        - **Fix 1:** `flash_moe_manager.cpp:init()`: slot size = `max(all layers)` instead of first layer.
+        - **Fix 2:** `flash_moe_cache.h/cpp`: Added `read_size` parameter to `get_expert_sync()` (defaults to `bytes_per_slot` for backward compat). Manager passes actual `ls.padded_expert_size`.
+        - **Test:** `test_flash_moe_variable_sizes.cpp` (3 tests: big slot, small-file-in-big-slot, mixed integrity).
+
+        **Bug 3: Backend copy tensors lose DISK_BACKED flag (PARTIALLY FIXED)**
+        - **Symptom:** `prepare_nodes` finds MoE ops but `weights->flags & DISK_BACKED` is false — expert loading never triggers. Output is garbage ("VMware" repeated).
+        - **Root cause:** The ggml backend scheduler creates copy tensors when expert tensors (plain CPU buffer) need to be transferred to the Metal compute backend. Copy tensor names look like `MTL0#blk.0.ffn_gate_exps.weight#0` — they don't carry the `GGML_TENSOR_FLAG_DISK_BACKED` flag.
+        - **Partial fix:** Changed `prepare_nodes` to detect expert tensors by name pattern (strstr for `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`) instead of relying solely on the flag. Fixed layer extraction with `strstr(name, "blk.")` + `sscanf` to handle prefixed names.
+        - **Also:** Changed `ensure_expert_loaded` to accept a `target` tensor parameter, so it can write directly to the Metal copy tensor (which supports partial writes) instead of only to the original registered tensor.
+
+        **Bug 4: Scheduler copies stale data before prepare_nodes runs (CURRENT BLOCKER)**
+        - **Symptom:** Even after Bug 3 fix, output is still garbage. `prepare_nodes` IS called and finds MoE ops, but the IDs tensor read via `ggml_backend_tensor_get(ids, ...)` likely returns zeros/garbage because the IDs tensor is a backend copy that hasn't been populated yet.
+        - **Root cause:** In `ggml-backend.cpp:ggml_backend_sched_compute_splits()`, the execution order is:
+            1. **Copy inputs** (lines 1470-1586) — copies expert weights AND IDs from source backend to split's compute backend
+            2. **`prepare_nodes`** (line 1593) — reads IDs, loads expert data, writes to copy tensor
+            3. **Compute** (line 1596) — runs the MUL_MAT_ID op
+          The problem: at step 2, the IDs tensor (`node->src[2]`) is the copy tensor on the split's Metal backend. Its data was copied from the original IDs tensor (on a different backend) during step 1. However, if the IDs are all zeros (initial warmup) or if the copy happened before the previous split finished computing them, the read returns garbage.
+        - **Deeper issue:** The IDs tensor is an OUTPUT of the router computation (in a previous split). By the time we reach the MoE split, the router has finished and the original IDs tensor has valid data. But `prepare_nodes` reads from `node->src[2]`, which is the COPY tensor on the current split's backend. If the copy succeeded, this data should be valid. **Need to verify** by adding logging of actual ID values read and the number of unique valid experts found.
+        - **Possible alternative issue:** The IDs might be valid but `ensure_expert_loaded(layer, id, weights)` is silently failing because the target copy tensor (`weights`) has a buffer type that rejects partial writes, or the projection detection from the copy tensor's name (`MTL0#blk.0.ffn_gate_exps.weight#0`) doesn't match the expected patterns.
+        - **Next debugging steps:**
+            1. Log the actual ID values read from `ggml_backend_tensor_get(ids, ...)` to confirm they are valid expert indices (0-127) and not all zeros.
+            2. Log the `unique_ids` set size and contents for the first few calls.
+            3. Inside `ensure_expert_loaded` (target path), log whether the projection key match succeeds and whether `ggml_backend_tensor_set` is actually called.
+            4. Verify the Metal copy tensor's buffer supports partial `set_tensor` writes (Metal shared buffers should — check with a direct test).
+
+    *   **Architecture insight for Phase 2.6 (from debugging):**
+
+        On a MacBook Air M2 16GB, `--gpulayers 99` OOMs because expert tensors are allocated at full size (128 experts × per-expert-size per layer × 48 layers ≈ 18 GB). Even `--gpulayers 0` triggers Metal as a compute backend (not just an offload target), causing expert weights to be copied to Metal buffers. The proper architecture should:
+
+        1. **Slot-based GPU allocation:** Create expert tensors with shape `[hidden, expert_hidden, n_expert_used]` (e.g., 2 slots) instead of `[hidden, expert_hidden, n_expert]` (128). Memory: 2/128 × 18 GB ≈ 280 MB total.
+        2. **Router ID remapping:** After `prepare_nodes` loads experts into slots 0..k-1, rewrite the router IDs tensor: `[42, 97]` → `[0, 1]`. The MUL_MAT_ID op then indexes into the k-slot tensor.
+        3. **Eliminates all backend-copy issues:** Expert tensors stay on the same backend as computation. No copies, no flag loss, no stale data timing issues.
+
+    *   **Test Coverage (37 tests across 10 binaries — all pass):**
+
+        | Binary | Tests | Coverage |
+        |--------|-------|----------|
+        | `test_flash_moe_lru` | LRU eviction, promotion | Cache data structures |
+        | `test_flash_moe_alloc` | Page alignment (16KB) | Slot allocation |
+        | `test_flash_moe_io` | Direct I/O read + verify | Disk I/O path |
+        | `test_flash_moe_vmem` | Reserve/commit/decommit/release | Platform abstraction |
+        | `test_flash_moe_metal_sync` | Alignment, offset layout, idempotent set | GPU transfer prerequisites |
+        | `test_flash_moe_unified` | Hit/miss, eviction+reload, data integrity, multi-layer, alignment | End-to-end cache pipeline |
+        | `test_flash_moe_prepare_nodes` | ID range filter, dedup, boundary, filename, zero-experts | prepare_nodes logic |
+        | `test_flash_moe_integration_wiring` | Init valid path, init invalid path | Manager lifecycle |
+        | `test_flash_moe_real_init` | Real index parse (48L×128E), file readability, get_expert_sync hit/miss | Real expert files |
+        | `test_flash_moe_variable_sizes` | Big slot, small-file-in-big-slot, mixed data integrity | Variable expert sizes |
 
 ---
 

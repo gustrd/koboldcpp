@@ -1159,6 +1159,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // Flash-MoE: expert tensors need partial writes via ggml_backend_tensor_set().
+        // CPU_REPACK buffer asserts offset==0 && size==full_tensor, so force plain CPU buffer.
+        if (t_meta && t_meta->name[0] != '\0' &&
+            (strstr(t_meta->name, "ffn_gate_exps") || strstr(t_meta->name, "ffn_up_exps") || strstr(t_meta->name, "ffn_down_exps"))) {
+            auto * cpu_dev_ptr = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev_ptr) {
+                buft = ggml_backend_dev_buffer_type(cpu_dev_ptr);
+            }
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {

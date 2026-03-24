@@ -43,9 +43,11 @@ namespace FlashMoE {
         SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes);
         ~SlotBufferAllocator();
 
-        // Get an expert into memory synchronously. 
+        // Get an expert into memory synchronously.
         // Returns the data pointer (page-aligned).
-        void* get_expert_sync(int layer, int expert_idx, const std::string& file_path);
+        // read_size: actual bytes to read from file (may be < bytes_per_slot).
+        //            If 0, reads bytes_per_slot (legacy behavior).
+        void* get_expert_sync(int layer, int expert_idx, const std::string& file_path, size_t read_size = 0);
 
         size_t get_hit_count() const { return hits; }
         size_t get_miss_count() const { return misses; }

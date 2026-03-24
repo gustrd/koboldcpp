@@ -54,7 +54,8 @@ namespace FlashMoE {
         }
     }
 
-    void* SlotBufferAllocator::get_expert_sync(int layer, int expert_idx, const std::string& file_path) {
+    void* SlotBufferAllocator::get_expert_sync(int layer, int expert_idx, const std::string& file_path, size_t read_size) {
+        if (read_size == 0) read_size = bytes_per_slot;
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         ExpertKey key = {layer, expert_idx};
@@ -90,9 +91,7 @@ namespace FlashMoE {
         lru_list.push_front(key);
         cache_map[key] = { lru_list.begin(), selected_slot_id };
 
-        // Perform I/O (Dummy for Step 1.1)
-        // Step 1.3 will implement this properly.
-        read_direct_io(file_path, slots[selected_slot_id].data, bytes_per_slot);
+        read_direct_io(file_path, slots[selected_slot_id].data, read_size);
 
         return slots[selected_slot_id].data;
     }

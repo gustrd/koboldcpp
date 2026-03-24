@@ -86,14 +86,13 @@ namespace FlashMoE {
         }
 
         // Create the unified LRU cache pool.
-        // All experts are assumed to have the same padded_expert_size.
-        // Use the first layer with a non-zero size as the canonical slot size.
+        // Expert sizes vary across layers (e.g., different down_proj sizes).
+        // Use the MAX size so any layer's expert fits in a single slot.
         {
             size_t expert_bytes = 0;
             for (int l = 0; l < n_layers; ++l) {
-                if (g_layers[l].padded_expert_size > 0) {
+                if (g_layers[l].padded_expert_size > expert_bytes) {
                     expert_bytes = g_layers[l].padded_expert_size;
-                    break;
                 }
             }
             if (expert_bytes > 0) {
@@ -143,13 +142,9 @@ namespace FlashMoE {
                   << " (layer=" << layer << ", proj=" << proj << ")" << std::endl;
     }
 
-    void ExpertManager::ensure_expert_loaded(int layer, int expert_id) {
+    void ExpertManager::ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target) {
         // NOTE: caller must hold manager_mutex
         LayerState& ls = g_layers[layer];
-
-        if (ls.loaded_expert_ids.count(expert_id)) {
-            return; // Already in GPU buffer
-        }
 
         if (!g_cache) {
             std::cerr << "FlashMoE Error: LRU cache not initialized (was init() called?)" << std::endl;
@@ -163,59 +158,56 @@ namespace FlashMoE {
             + (expert_id < 10 ? "00" : (expert_id < 100 ? "0" : ""))
             + std::to_string(expert_id) + ".bin";
 
-        // Get expert data from the unified LRU cache.
-        // On miss: loads from disk into a page-aligned CPU slot.
-        // On hit: returns the cached slot pointer (no I/O).
-        // LRU eviction is handled internally when all slots are in use.
-        //
-        // NOTE: manager_mutex is held here; get_expert_sync acquires its own
-        // internal cache_mutex. This is safe (no inversion) because cache_mutex
-        // is never acquired before manager_mutex anywhere.
-        const void* cpu_buf = g_cache->get_expert_sync(layer, expert_id, fname);
+        const void* cpu_buf = g_cache->get_expert_sync(layer, expert_id, fname, ls.padded_expert_size);
         if (!cpu_buf) {
             std::cerr << "FlashMoE Error: LRU cache returned null for layer="
                       << layer << " expert=" << expert_id << std::endl;
             return;
         }
 
-        // Copy each projection into the correct slice of its ggml tensor.
-        //
-        // Layout: tensor blk.N.ffn_gate_exps.weight holds ALL experts' gate
-        // projections. Expert i's gate data sits at byte offset i*gate_bytes.
-        // We write only the slice for this specific expert_id.
-        //
-        // ggml_backend_tensor_set dispatches to the backend's set_tensor:
-        //   Metal shared buffers (Apple Silicon) → memcpy (fast)
-        //   Metal private buffers                → MTLBlitCommandEncoder (slow)
-        //   CPU backend                          → memcpy
-        auto layer_it = g_layer_tensors.find(layer);
-        if (layer_it != g_layer_tensors.end()) {
-            for (const auto& [proj, proj_info] : ls.projs) {
-                auto tensor_it = layer_it->second.find(proj);
-                if (tensor_it == layer_it->second.end()) continue;
+        if (target) {
+            // Write to the specific copy tensor provided by prepare_nodes.
+            // Determine which projection this tensor is from its name.
+            const char* name = target->name;
+            std::string proj_key;
+            if (strstr(name, "ffn_gate_exps")) proj_key = "gate";
+            else if (strstr(name, "ffn_up_exps")) proj_key = "up";
+            else if (strstr(name, "ffn_down_exps")) proj_key = "down";
+            else return;
 
-                ggml_tensor* tensor = tensor_it->second;
-                if (!tensor) continue;
+            auto proj_it = ls.projs.find(proj_key);
+            if (proj_it == ls.projs.end()) return;
+            const auto& proj_info = proj_it->second;
 
-                // Guard: tensor must have a backend buffer (allocated by
-                // ggml_backend_alloc_ctx_tensors). If buffer is NULL the tensor
-                // was never given to a backend — skip silently.
-                ggml_backend_buffer_t buf =
-                    tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-                if (!buf) {
-                    // Buffer not yet allocated — this can happen if prepare_nodes
-                    // is called before the model finishes loading. Skip.
-                    continue;
+            ggml_backend_buffer_t buf =
+                target->view_src ? target->view_src->buffer : target->buffer;
+            if (!buf) return;
+
+            size_t tensor_offset = (size_t)expert_id * proj_info.bytes;
+            const void* src = (const char*)cpu_buf + proj_info.offset;
+            ggml_backend_tensor_set(target, src, tensor_offset, proj_info.bytes);
+        } else {
+            // Legacy path: write all projections to registered original tensors
+            auto layer_it = g_layer_tensors.find(layer);
+            if (layer_it != g_layer_tensors.end()) {
+                for (const auto& [proj, proj_info] : ls.projs) {
+                    auto tensor_it = layer_it->second.find(proj);
+                    if (tensor_it == layer_it->second.end()) continue;
+
+                    ggml_tensor* tensor = tensor_it->second;
+                    if (!tensor) continue;
+
+                    ggml_backend_buffer_t buf =
+                        tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                    if (!buf) continue;
+
+                    size_t tensor_offset = (size_t)expert_id * proj_info.bytes;
+                    const void* src = (const char*)cpu_buf + proj_info.offset;
+                    ggml_backend_tensor_set(tensor, src, tensor_offset, proj_info.bytes);
                 }
-
-                size_t tensor_offset = (size_t)expert_id * proj_info.bytes;
-                const void* src = (const char*)cpu_buf + proj_info.offset;
-
-                ggml_backend_tensor_set(tensor, src, tensor_offset, proj_info.bytes);
             }
+            ls.loaded_expert_ids.insert(expert_id);
         }
-
-        ls.loaded_expert_ids.insert(expert_id);
     }
 
     void ExpertManager::prepare_nodes(ggml_tensor** nodes, int n_nodes) {
@@ -229,12 +221,21 @@ namespace FlashMoE {
             // We only care about MOE ops: MUL_MAT_ID or ADD_ID
             if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_ADD_ID) {
                 ggml_tensor* weights = node->src[0];
-                if (weights->flags & GGML_TENSOR_FLAG_DISK_BACKED) {
+                // Check DISK_BACKED flag OR name pattern (backend copies like
+                // "MTL0#blk.0.ffn_gate_exps.weight#0" lose the original flags)
+                bool is_expert = (weights->flags & GGML_TENSOR_FLAG_DISK_BACKED) ||
+                    strstr(weights->name, "ffn_gate_exps") ||
+                    strstr(weights->name, "ffn_up_exps") ||
+                    strstr(weights->name, "ffn_down_exps");
+                if (is_expert) {
                     ggml_tensor* ids = node->src[2];
 
-                    // Identify layer from weights name (Pattern: blk.N.ffn_...)
+                    // Identify layer from weights name.
+                    // Original: "blk.N.ffn_..."
+                    // Backend copy: "MTL0#blk.N.ffn_...#0"
                     int layer = -1;
-                    if (sscanf(weights->name, "blk.%d.", &layer) != 1) continue;
+                    const char* blk_pos = strstr(weights->name, "blk.");
+                    if (!blk_pos || sscanf(blk_pos, "blk.%d.", &layer) != 1) continue;
 
                     // Read expert IDs safely via the backend API.
                     // ggml_backend_tensor_get works for both CPU-accessible and
@@ -254,7 +255,7 @@ namespace FlashMoE {
                         if (id >= 0 && id < n_exp) unique_ids.insert(id);
                     }
                     for (auto id : unique_ids) {
-                        ensure_expert_loaded(layer, id);
+                        ensure_expert_loaded(layer, id, weights);
                     }
                 }
             }

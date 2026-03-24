@@ -44,9 +44,9 @@ namespace FlashMoE {
             bool is_resident;
         };
 
-        // LRU or bitmask for residency? 
-        // For Phase 1 (Synchronous MVP), we just ensure what's needed is loaded.
-        void ensure_expert_loaded(int layer, int expert_id);
+        // Load expert data from disk cache and write to target tensor.
+        // If target is nullptr, writes to the registered original tensor.
+        void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target = nullptr);
     };
 
     // Global singleton for the manager
