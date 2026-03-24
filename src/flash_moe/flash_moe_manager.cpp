@@ -67,8 +67,8 @@ namespace FlashMoE {
             return;
         }
 
-        int n_layers  = index["n_layers"];
-        int n_experts = index["n_experts"];
+        n_layers  = index["n_layers"];
+        n_experts = index["n_experts"];
 
         for (int l = 0; l < n_layers; ++l) {
             LayerState& ls = g_layers[l];

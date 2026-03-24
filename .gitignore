@@ -152,3 +152,5 @@ test_flash_moe_metal_sync
 test_flash_moe_prepare_nodes
 test_flash_moe_unified
 test_flash_moe_vmem
+test_flash_moe_integration_wiring
+test_flash_moe_real_init

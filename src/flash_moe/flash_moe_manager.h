@@ -20,6 +20,8 @@ namespace FlashMoE {
         std::string experts_dir;
         size_t cache_size_mib;
         bool enabled = false;
+        int n_layers  = 0;
+        int n_experts = 0;
 
         std::unordered_map<ggml_tensor*, TensorState> tensor_map;
         std::mutex manager_mutex;
