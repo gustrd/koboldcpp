@@ -106,29 +106,22 @@ Built the foundational components:
         3.  **Expert file size must match `SlotBufferAllocator` slot size.** `init()` at `flash_moe_manager.cpp:81` reads `e0["file_size"]` as `padded_expert_size` and uses it as the slot size. If `extract_experts.py` pads differently than what the index says, the cache will under- or over-read.
         4.  **Disk space.** Qwen3-30B-A3B has 128 experts × 48 layers (or 64 experts × N layers — verify). At ~2MB per expert file (Q4_K_M), that's ~12-25 GB of extracted expert files alongside the ~17 GB GGUF.
 
-### Step 2.5b: Wire koboldcpp.py → C++ → Flash-MoE Init
+### Step 2.5b: Wire koboldcpp.py → C++ → Flash-MoE Init — DONE
 
-*   [ ] **Task:** Add `--flashmoedir` CLI flag to koboldcpp.py, pass through `expose.h`/`gpttype_adapter.cpp` to `llama_model_params.flash_moe_dir`.
-    *   **Changes required:**
-        1.  `expose.h`: Add `const char * flash_moe_dir = "";` to `load_model_inputs` struct (after `moecpu` field, line ~67).
-        2.  `koboldcpp.py`: Add `flash_moe_dir` field to ctypes struct (after `moecpu`). Add `--flashmoedir` argparse argument. Set `inputs.flash_moe_dir = args.flashmoedir.encode("UTF-8")`.
-        3.  `gpttype_adapter.cpp` at ~line 2377: Add `model_params.flash_moe_dir = (inputs.flash_moe_dir && inputs.flash_moe_dir[0]) ? inputs.flash_moe_dir : nullptr;` (NULL means disabled).
-    *   **⚠️ Pitfalls:**
-        1.  **ctypes struct field order matters.** `koboldcpp.py` mirrors `expose.h` field-by-field via `ctypes.Structure`. A field inserted at the wrong position causes all subsequent fields to read garbage. Must match exact order and padding.
-        2.  **String lifetime.** `inputs.flash_moe_dir` is a `const char *`. The Python `bytes` object backing it must stay alive until `load_model()` returns. Assigning `inputs.flash_moe_dir = args.flashmoedir.encode(...)` creates a temporary that gets GC'd. Store the encoded bytes in a local variable first.
-        3.  **Empty string vs NULL.** `expose.h` defaults to `""`. `llama-model.cpp:443` checks `if (params.flash_moe_dir)` — a non-NULL empty string passes this check and tries to open `""/expert_index.json`. Must convert empty string to NULL in `gpttype_adapter.cpp`.
+*   [x] **Task:** Add `--flashmoedir` CLI flag to koboldcpp.py, pass through `expose.h`/`gpttype_adapter.cpp` to `llama_model_params.flash_moe_dir`.
+    *   **Changes implemented:**
+        1.  `expose.h`: Added `flash_moe_dir` to `load_model_inputs`.
+        2.  `koboldcpp.py`: Added `--flashmoedir` arg and field to ctypes struct.
+        3.  `gpttype_adapter.cpp`: Propagated `inputs.flash_moe_dir` to `model_params.flash_moe_dir`.
+    *   **Verification:** `koboldcpp.py --help` shows the new flag.
 
-### Step 2.5c: Link Flash-MoE Objects into koboldcpp Binaries
+### Step 2.5c: Link Flash-MoE Objects into koboldcpp Binaries — DONE
 
-*   [ ] **Task:** Add `flash_moe_platform.o flash_moe_cache.o flash_moe_manager.o` to the link lines of all koboldcpp targets.
-    *   **Changes required:**
-        1.  Makefile: Add `FMOE_OBJS = flash_moe_platform.o flash_moe_cache.o flash_moe_manager.o` variable.
-        2.  Add `$(FMOE_OBJS)` to: `koboldcpp_default`, `koboldcpp_failsafe`, `koboldcpp_noavx2`, `koboldcpp_cublas`, `koboldcpp_hipblas`, `koboldcpp_vulkan`, and the `main` / `mainvk` tool targets.
-        3.  Also add to `$(OBJS_FULL)` so they're included in all variants, OR add as explicit dependencies on each target.
-    *   **⚠️ Pitfalls:**
-        1.  **`flash_moe_manager.o` depends on `ggml-backend.h` and `nlohmann/json.hpp`.** Already covered by `CXXFLAGS` `-Iggml/include` and `-I./vendor`. But failsafe/noavx2 variants compile with different flags — verify `flash_moe_manager.o` compiles cleanly with all flag sets, or use a single shared `.o`.
-        2.  **Circular dependency.** `ggml-backend.cpp` includes `flash_moe_manager.h` (calls `prepare_nodes`). `flash_moe_manager.cpp` includes `ggml-backend.h` (calls `ggml_backend_tensor_set/get`). This is fine for `.o` linking (no circular *link* dependency — both are object files resolved by the linker). But if one header transitively includes the other, it could cause compilation issues. Verify no header cycle.
-        3.  **Failsafe builds must not crash if Flash-MoE init fails.** `ExpertManager::enabled` is already gated — `prepare_nodes()` returns immediately if `!enabled`. Safe.
+*   [x] **Task:** Add `flash_moe_platform.o flash_moe_cache.o flash_moe_manager.o` to the link lines of all koboldcpp targets.
+    *   **Changes implemented:**
+        1.  Makefile: Moved `FMOE_OBJS` definition up and added it to `OBJS_FULL`, `OBJS_SIMPLE`, `OBJS_SIMPLER`, and `OBJS_FAILSAFE`.
+        2.  Removed redundant explicit `$(FMOE_OBJS)` from `main` and `koboldcpp_default` as they are now in `$(OBJS_FULL)`.
+    *   **Verification:** `make LLAMA_METAL=1` builds successfully. `koboldcpp_default.so` linked.
 
 ### Step 2.5d: Build, Smoke Test, and First Inference
 

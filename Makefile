@@ -110,10 +110,15 @@ endif
 CUBLASLD_FLAGS =
 CUBLAS_OBJS =
 
-OBJS_FULL += ggml-alloc.o ggml-cpu-traits.o ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o
-OBJS_SIMPLE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx2.o ggml-cpu-quants.o kcpp-quantmapper_noavx2.o kcpp-repackmapper_noavx2.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx2.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o
-OBJS_SIMPLER += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx1.o ggml-cpu-quants.o kcpp-quantmapper_noavx1.o kcpp-repackmapper_noavx1.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx1.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o
-OBJS_FAILSAFE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_failsafe.o ggml-cpu-quants.o kcpp-quantmapper_failsafe.o kcpp-repackmapper_failsafe.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_failsafe.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o
+# Flash-MoE configuration
+FMOE_SRC = src/flash_moe
+FMOE_TEST_SRC = tests/flash_moe
+FMOE_OBJS = flash_moe_platform.o flash_moe_cache.o flash_moe_manager.o
+
+OBJS_FULL += ggml-alloc.o ggml-cpu-traits.o ggml-quants.o ggml-cpu-quants.o kcpp-quantmapper.o kcpp-repackmapper.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o $(FMOE_OBJS)
+OBJS_SIMPLE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx2.o ggml-cpu-quants.o kcpp-quantmapper_noavx2.o kcpp-repackmapper_noavx2.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx2.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o $(FMOE_OBJS)
+OBJS_SIMPLER += ggml-alloc.o ggml-cpu-traits.o ggml-quants_noavx1.o ggml-cpu-quants.o kcpp-quantmapper_noavx1.o kcpp-repackmapper_noavx1.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_noavx1.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o $(FMOE_OBJS)
+OBJS_FAILSAFE += ggml-alloc.o ggml-cpu-traits.o ggml-quants_failsafe.o ggml-cpu-quants.o kcpp-quantmapper_failsafe.o kcpp-repackmapper_failsafe.o unicode.o unicode-common.o unicode-data.o ggml-threading.o ggml-cpu-cpp.o gguf.o sgemm_failsafe.o common.o llama-impl.o sampling.o budget.o kcpputils.o mtmdaudio.o $(FMOE_OBJS)
 
 # OS specific
 ifeq ($(UNAME_S),Linux)
@@ -927,9 +932,7 @@ quantize_ace: otherarch/acestep/quantize-acestep.cpp tools/mtmd/clip.cpp ggml_v3
 simplecpuinfo: simplecpuinfo.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-# ─── Flash-MoE objects ────────────────────────────────────────────────────────
-FMOE_SRC = src/flash_moe
-FMOE_TEST_SRC = tests/flash_moe
+# Flash-MoE objects
 
 flash_moe_platform.o: $(FMOE_SRC)/flash_moe_platform.cpp $(FMOE_SRC)/flash_moe_platform.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -962,8 +965,11 @@ test_flash_moe_unified: $(FMOE_TEST_SRC)/test_flash_moe_unified.cpp flash_moe_ca
 test_flash_moe_prepare_nodes: $(FMOE_TEST_SRC)/test_flash_moe_prepare_nodes.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
+test_flash_moe_integration_wiring: $(FMOE_TEST_SRC)/test_flash_moe_integration_wiring.cpp flash_moe_manager.o flash_moe_cache.o flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
 # ─── Umbrella: build and run all Flash-MoE tests ─────────────────────────────
-FMOE_TEST_BINS = test_flash_moe_vmem test_flash_moe_metal_sync test_flash_moe_alloc test_flash_moe_lru test_flash_moe_io test_flash_moe_unified test_flash_moe_prepare_nodes
+FMOE_TEST_BINS = test_flash_moe_vmem test_flash_moe_metal_sync test_flash_moe_alloc test_flash_moe_lru test_flash_moe_io test_flash_moe_unified test_flash_moe_prepare_nodes test_flash_moe_integration_wiring
 
 test_flash_moe: $(FMOE_TEST_BINS)
 	@echo "=== Running Flash-MoE tests ==="; \

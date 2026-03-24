@@ -83,6 +83,7 @@ struct load_model_inputs
     const char * devices_override = nullptr;
     const bool quiet = false;
     const int debugmode = 0;
+    const char * flash_moe_dir = nullptr;
 };
 struct generation_inputs
 {
