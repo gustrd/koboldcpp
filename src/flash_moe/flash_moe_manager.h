@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml.h"
+#include "ggml-backend.h"
 #include <string>
 #include <vector>
 #include <unordered_map>

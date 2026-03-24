@@ -1,10 +1,16 @@
 #include "flash_moe_manager.h"
 #include "flash_moe_cache.h"
 #include "flash_moe_platform.h"
+#include "ggml-backend.h"
 #include "nlohmann/json.hpp"
 #include <fstream>
 #include <iostream>
 #include <unordered_set>
+#include <cstdlib>
+
+#ifdef _WIN32
+#include <malloc.h>  // _aligned_malloc / _aligned_free
+#endif
 
 using json = nlohmann::json;
 
@@ -15,15 +21,21 @@ namespace FlashMoE {
         size_t reserved_size = 0;
         size_t padded_expert_size = 0;
         int n_experts = 0;
+        std::unordered_set<int> loaded_expert_ids; // experts whose data is in GPU buffer
 
         struct Projection {
-            size_t offset;
-            size_t bytes;
+            size_t offset; // byte offset of this projection within one expert file
+            size_t bytes;  // bytes for one expert's projection
         };
         std::unordered_map<std::string, Projection> projs;
     };
 
     static std::unordered_map<int, LayerState> g_layers;
+
+    // Maps (layer, proj_type) → tensor* so ensure_expert_loaded can call
+    // ggml_backend_tensor_set on the right tensor for each projection.
+    static std::unordered_map<int, std::unordered_map<std::string, ggml_tensor*>> g_layer_tensors;
+
     static ExpertManager g_instance;
     static SlotBufferAllocator* g_cache = nullptr;
 
@@ -73,7 +85,8 @@ namespace FlashMoE {
             }
 
             // Reserve virtual address space for the whole layer.
-            // Size must be a multiple of the OS page size.
+            // Kept for potential Phase 2 use (direct tensor mapping).
+            // Not used for data loading in Phase 1.5c.
             size_t total_layer_virtual = fmoe_page_align(
                 (size_t)ls.padded_expert_size * n_experts);
             ls.reserved_size = total_layer_virtual;
@@ -103,17 +116,17 @@ namespace FlashMoE {
         else return;
 
         std::lock_guard<std::mutex> lock(manager_mutex);
-        LayerState& ls = g_layers[layer];
-        if (!ls.virtual_base) return;
 
-        // Map tensor data to the virtual base + projection offset
-        tensor->data = (char*)ls.virtual_base + ls.projs[proj].offset;
-
-        // Update stride (nb[1]) to jump between experts in the fused layout
-        tensor->nb[1] = ls.padded_expert_size;
+        // Record the tensor pointer so ensure_expert_loaded can call
+        // ggml_backend_tensor_set on it later.
+        // IMPORTANT: We do NOT set tensor->data here. If we did, the ggml backend
+        // allocator (ggml_backend_alloc_ctx_tensors) would see a non-NULL data
+        // pointer, skip allocation, and leave tensor->buffer == NULL. That would
+        // crash ggml_backend_tensor_set at runtime (assert: buf != NULL).
+        g_layer_tensors[layer][proj] = tensor;
 
         std::cout << "FlashMoE: Registered tensor " << name
-                  << " to virtual address " << tensor->data << std::endl;
+                  << " (layer=" << layer << ", proj=" << proj << ")" << std::endl;
     }
 
     // Direct I/O helper is defined in flash_moe_cache.cpp
@@ -122,27 +135,81 @@ namespace FlashMoE {
     void ExpertManager::ensure_expert_loaded(int layer, int expert_id) {
         // NOTE: caller must hold manager_mutex
         LayerState& ls = g_layers[layer];
-        void* expert_ptr = (char*)ls.virtual_base +
-                           (size_t)expert_id * ls.padded_expert_size;
 
-        if (fmoe_vmem_is_committed(expert_ptr)) {
-            return; // Already loaded
+        if (ls.loaded_expert_ids.count(expert_id)) {
+            return; // Already in GPU buffer
         }
 
-        // Commit and load
-        size_t commit_size = fmoe_page_align(ls.padded_expert_size);
-        fmoe_vmem_commit(expert_ptr, commit_size);
-
-        // Build file path: avoid stack-buffer overflow with std::string
+        // Build file path: zero-padded layer (2 digits) and expert (3 digits)
         std::string fname = experts_dir + "/blk"
-            + (layer  < 10 ? "0" : "") + std::to_string(layer)
+            + (layer     < 10 ? "0" : "") + std::to_string(layer)
             + "_exp"
             + (expert_id < 10 ? "00" : (expert_id < 100 ? "0" : ""))
             + std::to_string(expert_id) + ".bin";
 
-        if (!read_direct_io_low_level(fname, expert_ptr, ls.padded_expert_size)) {
-            std::cerr << "FlashMoE Error: Failed to load expert " << fname << std::endl;
+        // Allocate a page-aligned CPU buffer for the expert file.
+        // Page alignment is required for:
+        //   - macOS F_NOCACHE to bypass the buffer cache (advisory but helps)
+        //   - Metal's newBufferWithBytesNoCopy (16KB on Apple Silicon)
+        //   - Windows FILE_FLAG_NO_BUFFERING (sector-aligned reads)
+        size_t buf_size = fmoe_page_align(ls.padded_expert_size);
+        void* cpu_buf = fmoe_vmem_reserve(buf_size);
+        if (!cpu_buf) {
+            std::cerr << "FlashMoE Error: Failed to reserve temp buffer for expert loading" << std::endl;
+            return;
         }
+        if (!fmoe_vmem_commit(cpu_buf, buf_size)) {
+            std::cerr << "FlashMoE Error: Failed to commit temp buffer for expert loading" << std::endl;
+            fmoe_vmem_release(cpu_buf, buf_size);
+            return;
+        }
+
+        // Load from disk
+        if (!read_direct_io_low_level(fname, cpu_buf, ls.padded_expert_size)) {
+            std::cerr << "FlashMoE Error: Failed to load expert " << fname << std::endl;
+            fmoe_vmem_release(cpu_buf, buf_size);
+            return;
+        }
+
+        // Copy each projection into the correct slice of its ggml tensor.
+        //
+        // Layout: tensor blk.N.ffn_gate_exps.weight holds ALL experts' gate
+        // projections. Expert i's gate data sits at byte offset i*gate_bytes.
+        // We write only the slice for this specific expert_id.
+        //
+        // ggml_backend_tensor_set dispatches to the backend's set_tensor:
+        //   Metal shared buffers (Apple Silicon) → memcpy (fast)
+        //   Metal private buffers                → MTLBlitCommandEncoder (slow)
+        //   CPU backend                          → memcpy
+        auto layer_it = g_layer_tensors.find(layer);
+        if (layer_it != g_layer_tensors.end()) {
+            for (const auto& [proj, proj_info] : ls.projs) {
+                auto tensor_it = layer_it->second.find(proj);
+                if (tensor_it == layer_it->second.end()) continue;
+
+                ggml_tensor* tensor = tensor_it->second;
+                if (!tensor) continue;
+
+                // Guard: tensor must have a backend buffer (allocated by
+                // ggml_backend_alloc_ctx_tensors). If buffer is NULL the tensor
+                // was never given to a backend — skip silently.
+                ggml_backend_buffer_t buf =
+                    tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+                if (!buf) {
+                    // Buffer not yet allocated — this can happen if prepare_nodes
+                    // is called before the model finishes loading. Skip.
+                    continue;
+                }
+
+                size_t tensor_offset = (size_t)expert_id * proj_info.bytes;
+                const void* src = (const char*)cpu_buf + proj_info.offset;
+
+                ggml_backend_tensor_set(tensor, src, tensor_offset, proj_info.bytes);
+            }
+        }
+
+        fmoe_vmem_release(cpu_buf, buf_size);
+        ls.loaded_expert_ids.insert(expert_id);
     }
 
     void ExpertManager::prepare_nodes(ggml_tensor** nodes, int n_nodes) {
