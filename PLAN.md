@@ -127,12 +127,22 @@ Built the foundational components:
 
 ### Step 2.5d: Build, Smoke Test, and First Inference — IN PROGRESS
 
-*   [x] **Task:** Build with `make LLAMA_METAL=1 -j8`. Run all tests. Validate manager init + expert I/O against real expert files.
+*   [x] **Task:** Build with `make LLAMA_METAL=1 -j8` (macOS) / `make LLAMA_VULKAN=1 -j8` (Windows via w64devkit). Run all tests. Validate manager init + expert I/O against real expert files.
+
+    **Build command for Windows (w64devkit):**
+    ```
+    "c:/Users/gustr/_git/w64devkit/bin/bash.exe" -c \
+      'export PATH=/Users/gustr/_git/w64devkit/bin:$PATH && \
+       cd /Users/gustr/_git/koboldcpp-flash-moe && \
+       make LLAMA_VULKAN=1 -j8'
+    ```
+
     *   **Changes implemented (pre-inference):**
         1.  Fixed linker error in `test_flash_moe_integration_wiring` — added `tests/flash_moe/ggml_stubs.cpp` providing stub implementations of `ggml_backend_tensor_set/get` and `ggml_nelements` so the test can link `flash_moe_manager.o` without pulling in full ggml.
         2.  Added `n_layers` and `n_experts` as public fields to `ExpertManager` (set during `init()`). Previously local-only.
         3.  Added `test_flash_moe_real_init` binary — 3 tests against real extracted expert files: init parse (48 layers, 128 experts), file readability (non-zero bytes), and `get_expert_sync` hit/miss counting.
-        4.  All 10 test binaries pass. Flash-MoE symbols confirmed present in `koboldcpp_default.so`. `--flashmoedir` flag confirmed in `koboldcpp.py --help`.
+        4.  All 10 test binaries pass. Flash-MoE symbols confirmed present in `koboldcpp_default.so`/`.dll`. `--flashmoedir` flag confirmed in `koboldcpp.py --help`.
+        5.  Fixed `test_flash_moe_variable_sizes.cpp`: replaced `system("rm -rf ... && mkdir -p ...")` with `std::filesystem::remove_all` + `create_directories` — cross-platform, no Windows cmd.exe noise.
 
     *   **Inference bugs found and fixed:**
 
@@ -155,20 +165,150 @@ Built the foundational components:
         - **Partial fix:** Changed `prepare_nodes` to detect expert tensors by name pattern (strstr for `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`) instead of relying solely on the flag. Fixed layer extraction with `strstr(name, "blk.")` + `sscanf` to handle prefixed names.
         - **Also:** Changed `ensure_expert_loaded` to accept a `target` tensor parameter, so it can write directly to the Metal copy tensor (which supports partial writes) instead of only to the original registered tensor.
 
-        **Bug 4: Scheduler copies stale data before prepare_nodes runs (CURRENT BLOCKER)**
-        - **Symptom:** Even after Bug 3 fix, output is still garbage. `prepare_nodes` IS called and finds MoE ops, but the IDs tensor read via `ggml_backend_tensor_get(ids, ...)` likely returns zeros/garbage because the IDs tensor is a backend copy that hasn't been populated yet.
-        - **Root cause:** In `ggml-backend.cpp:ggml_backend_sched_compute_splits()`, the execution order is:
-            1. **Copy inputs** (lines 1470-1586) — copies expert weights AND IDs from source backend to split's compute backend
-            2. **`prepare_nodes`** (line 1593) — reads IDs, loads expert data, writes to copy tensor
-            3. **Compute** (line 1596) — runs the MUL_MAT_ID op
-          The problem: at step 2, the IDs tensor (`node->src[2]`) is the copy tensor on the split's Metal backend. Its data was copied from the original IDs tensor (on a different backend) during step 1. However, if the IDs are all zeros (initial warmup) or if the copy happened before the previous split finished computing them, the read returns garbage.
-        - **Deeper issue:** The IDs tensor is an OUTPUT of the router computation (in a previous split). By the time we reach the MoE split, the router has finished and the original IDs tensor has valid data. But `prepare_nodes` reads from `node->src[2]`, which is the COPY tensor on the current split's backend. If the copy succeeded, this data should be valid. **Need to verify** by adding logging of actual ID values read and the number of unique valid experts found.
-        - **Possible alternative issue:** The IDs might be valid but `ensure_expert_loaded(layer, id, weights)` is silently failing because the target copy tensor (`weights`) has a buffer type that rejects partial writes, or the projection detection from the copy tensor's name (`MTL0#blk.0.ffn_gate_exps.weight#0`) doesn't match the expected patterns.
-        - **Next debugging steps:**
-            1. Log the actual ID values read from `ggml_backend_tensor_get(ids, ...)` to confirm they are valid expert indices (0-127) and not all zeros.
-            2. Log the `unique_ids` set size and contents for the first few calls.
-            3. Inside `ensure_expert_loaded` (target path), log whether the projection key match succeeds and whether `ggml_backend_tensor_set` is actually called.
-            4. Verify the Metal copy tensor's buffer supports partial `set_tensor` writes (Metal shared buffers should — check with a direct test).
+        **Bug 4: Optimized MoE copy reads from empty CPU buffer (FIXED)**
+
+        - **Symptom:** Even after Bug 3 fix, output is still garbage.
+
+        - **Root cause (REVISED — deeper analysis):**
+
+          The scheduler's **optimized MoE copy** at `ggml-backend.cpp:1488-1572` is the real culprit. This is an upstream llama.cpp optimization that copies only the *used* experts (based on router IDs) instead of the full tensor. Here is the exact conflict:
+
+          **Execution order in `ggml_backend_sched_compute_splits()`:**
+          ```
+          1. Copy inputs loop (lines 1471-1587):
+             For each input tensor of the split:
+               a. If expert weight tensor (MUL_MAT_ID src[0]):
+                  → OPTIMIZED MoE copy path (lines 1488-1572):
+                    - Reads IDs tensor to find used experts
+                    - Copies those experts from input->data (CPU) to input_cpy (GPU)
+                    - Uses ggml_backend_tensor_set_async()
+                  → BUT input->data is EMPTY for DISK_BACKED tensors!
+                    (upload was skipped at llama-model-loader.cpp:1521)
+               b. Else: generic async/sync copy
+
+          2. prepare_nodes (line 1593):
+             - Reads IDs from node->src[2] (the copy tensor)
+             - Loads expert data from disk via LRU cache
+             - Writes to node->src[0] (the copy tensor) via ggml_backend_tensor_set()
+
+          3. Compute (line 1596):
+             - MUL_MAT_ID uses the copy tensor data
+          ```
+
+          **The conflict:** Step 1a writes **garbage** (uninitialized CPU buffer) to the GPU copy tensor. Step 2 writes **correct data** from disk to the same GPU copy tensor. If both target the same byte ranges, step 2 should win because it runs later. **However:**
+
+          1. **Async ordering risk:** Step 1a uses `ggml_backend_tensor_set_async()`. On Vulkan, this submits a staging-buffer → device-buffer DMA. If the DMA is in-flight when step 2's synchronous `ggml_backend_tensor_set()` runs, both writes race for the same GPU memory region. The last-completed DMA wins, which may be the garbage write.
+
+          2. **Partial coverage mismatch:** The optimized copy copies `expert_size` bytes per expert (the full per-expert stride of the tensor, `input->nb[2]`). `prepare_nodes` → `ensure_expert_loaded` writes `proj_info.bytes` per expert. These *should* be the same for a given projection tensor, but if there's padding between the projection data and the expert stride, the optimized copy covers more bytes.
+
+          3. **The optimized copy also reads IDs** (lines 1502-1533). It handles the case where the IDs copy tensor hasn't been copied yet (falls back to the original, lines 1506-1514). It synchronizes the IDs backend (line 1519). So the IDs read in the optimized copy should be valid. But the data it copies from `input->data` is still empty.
+
+        - **Proposed fix: Skip the copy for DISK_BACKED inputs**
+
+          In the input copy loop at `ggml-backend.cpp:1471`, add an early `continue` for DISK_BACKED tensors:
+          ```cpp
+          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+              struct ggml_tensor * input = split->inputs[input_id];
+              // Flash-MoE: expert data lives on disk, not in input->data.
+              // prepare_nodes() will load used experts directly to the copy tensor.
+              if (input->flags & GGML_TENSOR_FLAG_DISK_BACKED) {
+                  continue;
+              }
+              // ... rest of copy logic
+          ```
+
+          **Why this works:**
+          - Skips the entire copy (both optimized and generic paths) for expert weight tensors
+          - `prepare_nodes` (line 1593) still runs after ALL copies (including IDs) complete
+          - `prepare_nodes` loads experts from disk and writes directly to the GPU copy tensor
+          - The GPU copy tensor is properly allocated by the scheduler — it just has undefined initial data, which is fine because MUL_MAT_ID only reads the expert rows selected by the IDs tensor
+          - IDs tensor IS still copied normally (it's not DISK_BACKED), so `prepare_nodes` can read valid IDs from `node->src[2]`
+
+        - **Why the flag propagation is sufficient:**
+
+          The `GGML_TENSOR_FLAG_DISK_BACKED` flag IS present on the *original* input tensor (`split->inputs[input_id]`), which is the tensor registered during model load. The copy tensor (on the GPU backend) does NOT have the flag, but we check the flag on `input`, not `input_cpy`. The flag was set at `llama-model-loader.cpp:1268` and persists on the original tensor.
+
+        - **Fix applied** (`ggml-backend.cpp:1474`):
+          ```cpp
+          // Flash-MoE: expert tensors are disk-backed — input->data was never populated
+          // (upload skipped in llama-model-loader.cpp). prepare_nodes() below will load
+          // the used experts directly from disk into input_cpy. Copying empty CPU data
+          // to the GPU copy tensor here would race with (and potentially overwrite) that.
+          if (input->flags & GGML_TENSOR_FLAG_DISK_BACKED) {
+              continue;
+          }
+          ```
+          Placed immediately after `input_cpy` is assigned, before the `GGML_TENSOR_FLAG_INPUT` branch. All 10 test binaries still pass. `ggml-backend_vulkan.o` compiles cleanly.
+
+        - **Fallback if the flag is stripped before reaching the copy loop:**
+
+          The flag could theoretically be lost if the scheduler recreates tensors. In that case, detect by name pattern in the copy loop:
+          ```cpp
+          if ((input->flags & GGML_TENSOR_FLAG_DISK_BACKED) ||
+              (strstr(input->name, "ffn_gate_exps") || strstr(input->name, "ffn_up_exps") || strstr(input->name, "ffn_down_exps"))) {
+              continue;
+          }
+          ```
+
+    *   **Windows / Vulkan / Lunar Lake — Platform-Specific Analysis:**
+
+        The project is now pivoting to **Windows + Vulkan + Intel Lunar Lake** (Intel Core Ultra iGPU). macOS/Metal work is on hold. Key differences from the macOS/Metal environment:
+
+        **A. Intel Lunar Lake GPU Architecture**
+
+        Lunar Lake has an **integrated GPU with shared system memory** — similar to Apple Silicon's unified memory, but accessed through Vulkan (not Metal). This means:
+        - **No PCIe bus.** GPU "device memory" is physically the same LPDDR5X as CPU memory. `ggml_vk_buffer_write` (staging buffer → device copy) may be a memcpy under the hood, or a GPU-side copy within the same physical memory.
+        - **Shared memory pressure.** Unlike discrete GPUs, expert tensor GPU buffers and the LRU CPU cache both consume the same 16/32 GB physical RAM pool. Cache sizing must account for this: `cache_mib = 4096` (default) + expert GPU tensors + model non-expert weights + OS overhead.
+        - **Vulkan host-visible device memory.** Intel iGPUs often allocate device-local + host-visible buffers (resizable BAR equivalent). `ggml_backend_tensor_set` might bypass staging entirely if the Vulkan buffer is host-mapped. Verify with `VK_LOG_DEBUG` output at `ggml-vulkan.cpp:13445`.
+
+        **B. Windows Direct I/O (`FILE_FLAG_NO_BUFFERING`) Specifics**
+
+        The Windows Direct I/O path at `flash_moe_cache.cpp:107-143` has these constraints:
+
+        1.  **Buffer alignment (4KB).** `VirtualAlloc` at `flash_moe_cache.cpp:24` guarantees page alignment. Windows page size is 4KB (`GetSystemInfo().dwPageSize`). ✓ Already correct.
+
+        2.  **Read size must be sector-aligned.** `ReadFile` with `FILE_FLAG_NO_BUFFERING` requires the read size to be a multiple of the volume sector size (typically 512 bytes, sometimes 4KB for NVMe). `extract_experts.py` pads to `_ALIGN = 4096`, which satisfies both. ✓ But verify: if the *actual* expert file size after extraction is not 4KB-aligned, `ReadFile` will return error 87 (`ERROR_INVALID_PARAMETER`).
+
+        3.  **DWORD truncation risk.** `ReadFile` takes `DWORD nNumberOfBytesToRead` (32-bit). Expert files are ~2-3 MB, well within 4 GB. ✓ Safe for now, but if Qwen3.5-397B has larger experts, this could silently truncate.
+
+        4.  **File handle per read.** The current implementation opens/closes a `HANDLE` for every `read_direct_io` call (`CreateFileW` + `CloseHandle`). On NVMe SSDs this adds ~50-100μs per open. With 2-8 experts per layer × 48 layers = up to 384 file opens per token. At ~0.1ms each, that's ~38ms overhead — significant. **Future optimization:** keep a pool of open handles keyed by `(layer, expert_id)`.
+
+        5.  **Wide string conversion.** `MultiByteToWideChar` at line 109 is called every read. Negligible cost but could be cached for hot paths.
+
+        **C. Vulkan Backend Tensor Operations**
+
+        1.  **`ggml_backend_vk_buffer_set_tensor`** (ggml-vulkan.cpp:13445): Calls `ggml_vk_buffer_write(buf, offset, data, size)`. This uses a staging buffer + `vkCmdCopyBuffer` for device-local memory, or a direct `memcpy` for host-visible memory. **Supports partial writes** — offset and size are passed through. ✓ Compatible with `ensure_expert_loaded`.
+
+        2.  **`ggml_backend_vk_buffer_get_tensor`** (ggml-vulkan.cpp:13457): Used by `prepare_nodes` to read IDs. Calls `ggml_vk_buffer_read`. This may submit a GPU→CPU copy command and synchronize. **On Lunar Lake iGPU:** likely a fast memcpy since memory is shared.
+
+        3.  **Vulkan synchronization.** The `ggml_backend_synchronize(split_backend)` at line 1590 (before `prepare_nodes`) ensures all prior async copies have completed. This is critical — without it, `prepare_nodes` might read IDs that haven't been fully transferred. The sync is already in the code. ✓
+
+        4.  **Copy tensor naming.** Vulkan copy tensors are named like `"Vulkan0#blk.0.ffn_gate_exps.weight#0"` (or `"VLK0#..."` depending on the backend name). The `strstr(name, "ffn_gate_exps")` pattern in `prepare_nodes` matches regardless of prefix. ✓ Verify with logging.
+
+        **D. Windows Build Specifics**
+
+        1.  **Build command:** `make LLAMA_VULKAN=1 -j8` inside `w64devkit.exe`.
+        2.  **Vulkan library:** Requires `lib/vulkan-1.lib` in the build directory. The Makefile at line 434 links with `lib/vulkan-1.lib` on Windows.
+        3.  **nlohmann/json.hpp dependency:** `flash_moe_manager.cpp:5` includes `nlohmann/json.hpp`. Verify this header exists in the include path. It's a single-header library — should be vendored in the repo or include path.
+        4.  **Windows.h conflicts.** `flash_moe_cache.cpp` and `flash_moe_platform.cpp` include `<windows.h>`. Watch for `min`/`max` macro conflicts with `<algorithm>`. Use `#define NOMINMAX` before including `<windows.h>` if issues arise.
+
+        **E. ⚠️ Windows/Vulkan Pitfalls (NEW)**
+
+        1.  **`FILE_FLAG_NO_BUFFERING` + short file = error 87.** If an expert file is smaller than a 4KB sector (unlikely but check edge-case layers), `ReadFile` fails because the size isn't sector-aligned. Fix: round up `read_size` to sector boundary in `read_direct_io_low_level`. The LRU slot is already oversized (max of all layers), so the extra bytes are harmless.
+
+        2.  **`VirtualAlloc` slot pool vs. Vulkan staging buffers.** Both compete for commit charge (Windows virtual memory). The LRU cache commits `n_slots × slot_size` bytes via `VirtualAlloc(MEM_COMMIT)`. Vulkan staging buffers also use committed memory. On a 16GB Lunar Lake system: model weights (~5-10 GB) + LRU cache (4 GB default) + Vulkan buffers + OS = possible commit limit exhaustion. Consider reducing default `cache_mib` for iGPU systems.
+
+        3.  **Vulkan buffer write synchronization.** `ggml_vk_buffer_write` submits a command buffer. If `prepare_nodes` calls `ggml_backend_tensor_set` while a previous Vulkan command buffer is in-flight (from the optimized copy), Vulkan requires explicit synchronization (fence/semaphore). The Vulkan backend likely serializes on a single queue with fences, but verify — a race here causes GPU memory corruption (hard to debug, manifests as NaN/garbage in output tensors).
+
+        4.  **Console output buffering.** On Windows, `std::cerr` might not flush immediately in `w64devkit`. Use `std::cerr << ... << std::flush;` or `fprintf(stderr, ...)` for diagnostic logging. Otherwise, crash logs disappear.
+
+        5.  **Path separators.** `expert_index.json` paths use `/` (POSIX). `flash_moe_manager.cpp:155` builds paths with `/`. `CreateFileW` accepts both `/` and `\\` on Windows. ✓ But if any user-provided path in `--flashmoedir` uses `\\`, `std::string` concatenation works fine. Verify mixed separators don't break `MultiByteToWideChar`.
+
+        6.  **Antivirus / Defender interference.** Windows Defender real-time scanning can intercept `CreateFileW` with `FILE_FLAG_NO_BUFFERING`, adding 1-5ms per file open. For 384 opens/token, that's 0.4-2s overhead. Recommend adding the expert directory to Defender exclusions for benchmarking.
+
+        7.  **Intel Lunar Lake Vulkan driver quirks.** Intel's Vulkan driver (`igc64.dll`) on Lunar Lake may have different buffer alignment requirements than NVIDIA/AMD. The `ggml_vk_buffer_write` function handles alignment internally via staging buffers, but verify with `VK_LAYER_KHRONOS_validation` enabled.
+
+        8.  **`ggml_backend_buffer_is_host()` for DISK_BACKED tensors.** The optimized MoE copy at line 1492 checks `ggml_backend_buffer_is_host(input->buffer)`. DISK_BACKED expert tensors are on plain CPU buffers, which return `true` for `is_host`. This means the optimized copy path IS entered for expert tensors — confirming Bug 4's root cause. The fix (skipping DISK_BACKED inputs) intercepts before this check.
 
     *   **Architecture insight for Phase 2.6 (from debugging):**
 
@@ -177,6 +317,63 @@ Built the foundational components:
         1. **Slot-based GPU allocation:** Create expert tensors with shape `[hidden, expert_hidden, n_expert_used]` (e.g., 2 slots) instead of `[hidden, expert_hidden, n_expert]` (128). Memory: 2/128 × 18 GB ≈ 280 MB total.
         2. **Router ID remapping:** After `prepare_nodes` loads experts into slots 0..k-1, rewrite the router IDs tensor: `[42, 97]` → `[0, 1]`. The MUL_MAT_ID op then indexes into the k-slot tensor.
         3. **Eliminates all backend-copy issues:** Expert tensors stay on the same backend as computation. No copies, no flag loss, no stale data timing issues.
+
+    *   **Step 2.5d-win: Windows/Vulkan First Inference Action Plan:**
+
+        This is the concrete sequence for getting Flash-MoE working on Windows/Vulkan/Lunar Lake.
+
+        **Phase A: Build & Unit Tests (no model needed) — DONE**
+
+        1.  [x] Build with `make LLAMA_VULKAN=1 -j8` in w64devkit. All three Flash-MoE objects compile cleanly (GCC 15.2.0, C++17). `ggml-backend_vulkan.o` compiles with Bug 4 fix applied.
+            - No `nlohmann/json.hpp` issues (vendored in `vendor/` path via `-I./vendor`)
+            - No `windows.h` min/max conflicts
+        2.  [x] All 10 binaries, 37 tests pass (zero failures, zero noise after `system()` fix):
+            - `test_flash_moe_io`: Windows `CreateFileW + FILE_FLAG_NO_BUFFERING` — PASS
+            - `test_flash_moe_vmem`: `VirtualAlloc/VirtualFree/VirtualQuery` — PASS
+            - `test_flash_moe_variable_sizes`: Fixed `system("rm -rf...")` → `std::filesystem` — PASS
+        3.  [ ] Verify `koboldcpp_default.dll` links cleanly with Vulkan: full `make LLAMA_VULKAN=1 -j8`.
+
+        **Phase B: Extract Experts**
+
+        4.  [ ] Run `python extract_experts.py <path-to-Qwen3-30B-A3B.gguf> <output-dir>`.
+            - Verify `expert_index.json` is created with `n_layers`, `n_experts`, per-expert projections.
+            - Verify `.bin` file count: `n_layers × n_experts` (e.g., 48 × 128 = 6144 files).
+            - Spot-check: file sizes should be 4KB-aligned (for `FILE_FLAG_NO_BUFFERING`).
+            - Verify total disk usage: expected ~12-25 GB for Q4_K_M quantization.
+
+        **Phase C: Apply Bug 4 Fix**
+
+        5.  [ ] Apply the DISK_BACKED skip in `ggml-backend.cpp` (the fix described in Bug 4 above).
+        6.  [ ] Add diagnostic logging (gated by `#ifdef FMOE_DEBUG` or env var):
+            - In the skip point: `"FlashMoE: Skipping copy for DISK_BACKED input '%s'\n", input->name`
+            - In `prepare_nodes`: `"FlashMoE: Layer %d, %zu unique experts: [%s]\n", layer, unique_ids.size(), ...`
+            - In `ensure_expert_loaded`: `"FlashMoE: Loading L%d E%d → '%s' offset=%zu size=%zu\n", layer, expert_id, target->name, tensor_offset, proj_info.bytes`
+            - In `ensure_expert_loaded` after `ggml_backend_tensor_set`: `"FlashMoE: ggml_backend_tensor_set OK\n"`
+
+        **Phase D: Smoke Test**
+
+        7.  [ ] Run with `--gpulayers 0` first (CPU-only compute, no Vulkan). This tests:
+            - Expert tensor allocation (plain CPU buffer, not CPU_REPACK)
+            - `prepare_nodes` detects MoE ops by name pattern
+            - `ensure_expert_loaded` reads from disk, writes to CPU tensor
+            - No scheduler copy tensor complications (everything stays on CPU)
+            - If this produces correct output, the Flash-MoE core is sound.
+
+        8.  [ ] Run with `--gpulayers 99` (Vulkan compute). This tests the full path:
+            - Expert tensors on CPU, computation on Vulkan
+            - Scheduler creates Vulkan copy tensors
+            - DISK_BACKED skip prevents garbage copy
+            - `prepare_nodes` writes to Vulkan copy tensor
+            - Vulkan compute reads from the copy tensor
+            - If `--gpulayers 0` works but `--gpulayers 99` doesn't: the issue is in the copy/sync path.
+
+        9.  [ ] Compare output quality: first 50 tokens of a known prompt (e.g., "Hello, my name is"). Compare with baseline KoboldCpp running the same model without Flash-MoE (standard mmap loading).
+
+        **Phase E: Performance Baseline**
+
+        10. [ ] Measure tokens/second with Flash-MoE enabled vs. disabled.
+        11. [ ] Monitor with Process Monitor: filter for `ReadFile` on the expert directory. Verify `FILE_FLAG_NO_BUFFERING` is set on handles. Check for excessive file opens per token.
+        12. [ ] Check LRU cache hit rate: `g_cache->hits` / `(g_cache->hits + g_cache->misses)`. After warmup, hit rate should be high if the same experts are reused across tokens.
 
     *   **Test Coverage (37 tests across 10 binaries — all pass):**
 
@@ -289,16 +486,31 @@ The synchronous pipeline from Phase 2 works but blocks the entire compute graph 
 
 ### Windows
 - **Environment:** `C:\Users\gustr\_git\w64devkit\w64devkit.exe`
-- **Build:** `make LLAMA_VULKAN=1 -j8`
+- **Build (from Windows terminal or Claude Code Bash tool):**
+  ```
+  "c:/Users/gustr/_git/w64devkit/bin/bash.exe" -c \
+    'export PATH=/Users/gustr/_git/w64devkit/bin:$PATH && \
+     cd /Users/gustr/_git/koboldcpp-flash-moe && \
+     make LLAMA_VULKAN=1 -j8'
+  ```
+  Note: inside w64devkit bash, `C:\` is `/` (not `/c/`), so the repo is at `/Users/gustr/_git/koboldcpp-flash-moe`.
+- **Tests:**
+  ```
+  "c:/Users/gustr/_git/w64devkit/bin/bash.exe" -c \
+    'export PATH=/Users/gustr/_git/w64devkit/bin:$PATH && \
+     cd /Users/gustr/_git/koboldcpp-flash-moe && \
+     make LLAMA_VULKAN=1 test_flash_moe'
+  ```
 - **I/O tracing:** Process Monitor filtered on `ReadFile` + `FILE_FLAG_NO_BUFFERING`
 
 ### Tests
 ```bash
-make test_flash_moe -j8        # all Flash-MoE tests (7 binaries, 31 cases)
+# 10 binaries, 37 test cases — all pass on Windows/Vulkan
+make LLAMA_VULKAN=1 test_flash_moe
 ```
 
 ### Debugging
-- Serialized build: `make -j1` for clean error output
+- Serialized build: `make LLAMA_VULKAN=1 -j1` for clean error output
 - Graph debugging: `GGML_DEBUG=1` env var
 - Vulkan linker: `LLAMA_VULKAN=1` requires `lib/vulkan-1.lib`
 

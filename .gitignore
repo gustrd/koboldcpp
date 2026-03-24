@@ -148,6 +148,8 @@ conda/
 
 #Flash MoE helpers
 *.tmp
+*.exe
+
 test_flash_moe_alloc
 test_flash_moe_io
 test_flash_moe_lru
@@ -158,3 +160,5 @@ test_flash_moe_vmem
 test_flash_moe_integration_wiring
 test_flash_moe_real_init
 test_flash_moe_variable_sizes
+
+.claude/

@@ -21,7 +21,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
-#include <sys/stat.h>
+#include <filesystem>
 #include "../../src/flash_moe/flash_moe_cache.h"
 #include "../../src/flash_moe/flash_moe_platform.h"
 
@@ -37,7 +37,9 @@ static void create_test_file(const char* path, size_t size, uint8_t fill_byte) {
 }
 
 static void setup() {
-    system("rm -rf /tmp/test_fmoe_variable_sizes && mkdir -p /tmp/test_fmoe_variable_sizes");
+    namespace fs = std::filesystem;
+    fs::remove_all(TEST_DIR);
+    fs::create_directories(TEST_DIR);
 
     size_t page = fmoe_page_size();
 
@@ -123,7 +125,7 @@ int main() {
     test_small_file_in_big_slot();
     test_mixed_layer_data_integrity();
 
-    system("rm -rf /tmp/test_fmoe_variable_sizes");
+    std::filesystem::remove_all(TEST_DIR);
     std::cout << "=== All variable-size tests passed ===" << std::endl;
     return 0;
 }

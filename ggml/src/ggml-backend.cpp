@@ -1473,6 +1473,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            // Flash-MoE: expert tensors are disk-backed — input->data was never populated
+            // (upload skipped in llama-model-loader.cpp). prepare_nodes() below will load
+            // the used experts directly from disk into input_cpy. Copying empty CPU data
+            // to the GPU copy tensor here would race with (and potentially overwrite) that.
+            if (input->flags & GGML_TENSOR_FLAG_DISK_BACKED) {
+                continue;
+            }
+
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
