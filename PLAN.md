@@ -392,6 +392,99 @@ Built the foundational components:
 
 ---
 
+## 4.5 Phase 2.6: Slot-Based Expert Tensor Allocation — PARTIALLY DONE
+
+**Objective:** Fix Bug 6 (OOM: 17.5 GB expert tensor allocation) by reducing each projection tensor from `[h, d, n_experts=128]` to `[h, d, n_expert_used=K=8]`, and remap router IDs from raw expert IDs to slot indices so `MUL_MAT_ID` indexes into the K-slot tensor correctly.
+
+### What Was Implemented
+
+- **`flash_moe_manager.h`**: Added `int n_expert_used = 0;` field.
+- **`flash_moe_manager.cpp:init()`**: Reads `n_expert_used` from `expert_index.json` (new field, value=8 for Qwen3-30B-A3B). Logs "K=8 slots/tensor".
+- **`flash_moe_manager.cpp:register_tensor()`**: Overrides `tensor->ne[2]` from 128 → 8 and updates `tensor->nb[3]`. Happens BEFORE `ggml_backend_alloc_ctx_tensors`, so the allocator only allocates K-slot memory.
+- **`flash_moe_manager.cpp:ensure_expert_loaded()`**: New signature `(layer, expert_id, target, slot_index)`. Writes expert data to `slot_index * proj_info.bytes` instead of `expert_id * proj_info.bytes`.
+- **`flash_moe_manager.cpp:prepare_nodes()`**: New slot-based logic:
+  1. Build `expert_id → slot_index` map (first-occurrence order) for each layer.
+  2. Load each expert into its assigned slot.
+  3. Remap IDs tensor in-place: `[42, 97, 13, ...]` → `[0, 1, 2, ...]`.
+- **`extract_experts.py`**: Reads `n_expert_used` from GGUF metadata and adds it to `expert_index.json`.
+- **`expert_index.json`**: Patched with `"n_expert_used": 8`.
+- **`test_flash_moe_slot_remap.cpp`**: 7 new tests for slot assignment and ID remapping logic. All pass.
+- **Memory**: CPU model buffer reduced from ~17.5 GB to ~1.0 GB. ✓
+
+### Bug 7: OOB Crash with K-Slot Tensors (OPEN)
+
+**Symptom:** `OSError: exception: access violation reading/writing ...` during model warmup with `--gpulayers 1` and `--gpulayers 48`.
+
+**Root cause (confirmed for `--gpulayers 1`):**
+
+The `prepare_nodes` hook fires ONCE per graph split, BEFORE any computation in that split. For CPU layers (layers 1-47 with `--gpulayers 1`), the router (topk/argmax) and the MoE (MUL_MAT_ID) are in the **same CPU split**. This means:
+
+```
+prepare_nodes fires:
+  1. Reads IDs tensor → all zeros (router not yet computed!)
+  2. Loads expert 0 into slot 0
+  3. Remaps IDs tensor: [0,0,...] → [0,0,...] (no change)
+
+Split computes:
+  4. Router writes [42, 97, ...] to IDs tensor (OVERWRITES our remap!)
+  5. MUL_MAT_ID reads IDs [42, 97, ...] → tries to access slot 42 in K=8 tensor
+  6. OUT-OF-BOUNDS ACCESS → CRASH
+```
+
+**Root cause (for `--gpulayers 48`):**
+
+With all 48 layers on GPU router, each layer should have GPU split → CPU MoE split. However, still crashes with `access violation reading 0xFFFFFFFFFFFFFFFF`. Investigation pending. Hypothesis: some IDs being set to `-1` during remapping are corrupting a pointer, or `node->src[2]` is invalid for some MoE node type.
+
+### Why This Is Hard
+
+The `prepare_nodes` hook is position-anchored: it fires once per split, before all computation. It cannot fire between individual ops within a split. Slot-based allocation requires IDs to be pre-computed — which only works when the router runs in a PREVIOUS split. For any layer where router and MoE are in the same split, the approach is fundamentally broken.
+
+### Required Fix (Next Step)
+
+The ID remapping MUST be done using a ggml graph node (an in-graph op), not a pre-compute hook:
+
+**Option A: Remap IDs via an injected ggml op**
+- After the router output, insert a custom `GGML_OP_REMAP_EXPERT_IDS` node that:
+  1. Reads the router IDs tensor
+  2. Looks up each ID in the slot map (computed by `prepare_nodes` using disk contents)
+  3. Outputs remapped IDs [0..K-1]
+- This op runs AS PART OF the graph, after the router, before MUL_MAT_ID
+- Requires modifying `llama-model.cpp` to insert the op in the MoE block
+- Requires a custom ggml op registration
+
+**Option B: Change tensor shape per-split (dynamic K-slot)**
+- Don't change tensor shape statically in `register_tensor`
+- Instead, just before the split executes, dynamically set `tensor->ne[2] = K` and `tensor->nb[3]` temporarily
+- Remap IDs as part of prepare_nodes
+- RISK: ggml compute kernels may cache ne/nb → undefined behavior
+
+**Option C: Separate router split from MoE split (scheduler hint)**
+- Force the router output IDs to use a special "IPC" backend that forces a split
+- The IPC backend's `set_tensor` / `get_tensor` is a no-op; it just acts as a split boundary
+- After the GPU/CPU split that computed router IDs, the MoE split gets valid IDs
+- Requires modifying the scheduler or tensor assignment logic
+
+**Option D (simplest, correct):**
+- Do NOT remap IDs
+- Do NOT use K-slot tensors
+- Use 128-slot tensors (Bug 6 remains: 17.5 GB)
+- Keep `prepare_nodes` writing to `expert_id * proj_info.bytes` (original approach)
+- For layers with valid IDs (GPU router → CPU MoE split): correct output ✓
+- For CPU-layer MoE: Bug 5 remains (IDs zeros → wrong experts) but NO CRASH
+- LIMITATION: requires 17.5 GB RAM, which OOMs on 16 GB systems
+
+**Option E (recommended for next iteration):**
+Inject a `ggml_add(ids_tensor, mapping_vector)` or similar op into the graph at the point where expert selection happens. The mapping is pre-loaded by `prepare_nodes`. This is the cleanest solution and aligns with how attention mask manipulation works.
+
+### Test Coverage (44 tests, 11 binaries — all pass)
+
+| Binary | Tests |
+|--------|-------|
+| `test_flash_moe_slot_remap` | 7 new slot/remap tests |
+| (all previous binaries) | 37 tests |
+
+---
+
 ## 5. Phase 3: Asynchronous I/O Foundation
 
 **Objective:** Detach disk reads from the blocking main thread to validate data consistency under multithreading.

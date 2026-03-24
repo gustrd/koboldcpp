@@ -60,6 +60,27 @@ from inspect_gguf import inspect_gguf
 _ALIGN = 4096  # FILE_FLAG_NO_BUFFERING sector size
 
 
+def _get_expert_used_count(gguf_path: Path) -> int | None:
+    """Read n_expert_used from GGUF KV metadata (e.g. qwen3moe.expert_used_count)."""
+    reader = gguf.GGUFReader(str(gguf_path))
+    arch: str | None = None
+    if "general.architecture" in reader.fields:
+        f = reader.fields["general.architecture"]
+        arch = bytes(f.parts[f.data[0]]).decode("utf-8")
+    candidates = []
+    if arch:
+        candidates.append(f"{arch}.expert_used_count")
+    candidates.extend(["expert_used_count", "llama.expert_used_count"])
+    for key in candidates:
+        if key in reader.fields:
+            f = reader.fields[key]
+            try:
+                return int(f.parts[f.data[0]][0])
+            except (IndexError, TypeError):
+                pass
+    return None
+
+
 def _get_vocab_size(gguf_path: Path) -> int | None:
     """Read vocab_size from the GGUF KV metadata without a full re-scan."""
     reader = gguf.GGUFReader(str(gguf_path))
@@ -240,13 +261,17 @@ def extract_experts(
     if verbose:
         print(file=sys.stderr)
 
-    expert_index = {
+    n_expert_used = _get_expert_used_count(gguf_path)
+
+    expert_index: dict[str, Any] = {
         "n_layers":       n_layers,
         "n_experts":      n_experts,
         "token_id_base":  _token_id_base,
         "token_id_count": n_layers * n_experts,
         "experts":        index_entries,
     }
+    if n_expert_used is not None:
+        expert_index["n_expert_used"] = n_expert_used
 
     index_path = experts_dir / "expert_index.json"
     index_path.write_text(json.dumps(expert_index, indent=2), encoding="utf-8")

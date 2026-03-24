@@ -20,8 +20,9 @@ namespace FlashMoE {
         std::string experts_dir;
         size_t cache_size_mib;
         bool enabled = false;
-        int n_layers  = 0;
-        int n_experts = 0;
+        int n_layers      = 0;
+        int n_experts     = 0;
+        int n_expert_used = 0;  // K: slots per projection tensor (Phase 2.6)
 
         std::unordered_map<ggml_tensor*, TensorState> tensor_map;
         std::mutex manager_mutex;
@@ -44,9 +45,10 @@ namespace FlashMoE {
             bool is_resident;
         };
 
-        // Load expert data from disk cache and write to target tensor.
+        // Load expert data from disk cache and write to target tensor at slot_index.
+        // slot_index: which slot (0..n_expert_used-1) to write into (Phase 2.6).
         // If target is nullptr, writes to the registered original tensor.
-        void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target = nullptr);
+        void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index);
     };
 
     // Global singleton for the manager
