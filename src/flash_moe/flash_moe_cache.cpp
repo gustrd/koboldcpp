@@ -1,10 +1,15 @@
 #include "flash_moe_cache.h"
+#include "flash_moe_platform.h"
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__) || defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace FlashMoE {
@@ -18,8 +23,9 @@ namespace FlashMoE {
 #ifdef _WIN32
         memory_pool = VirtualAlloc(NULL, max_slots * slot_size_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-        // Fallback for non-Windows (e.g. posix_memalign)
-        if (posix_memalign(&memory_pool, 4096, max_slots * slot_size_bytes) != 0) {
+        // POSIX: align to OS page size (16KB on Apple Silicon, 4KB elsewhere)
+        size_t alignment = fmoe_page_size();
+        if (posix_memalign(&memory_pool, alignment, max_slots * slot_size_bytes) != 0) {
             memory_pool = nullptr;
         }
 #endif
@@ -136,8 +142,29 @@ namespace FlashMoE {
 
         CloseHandle(hFile);
         return true;
+#elif defined(__APPLE__)
+        // macOS: F_NOCACHE advises the kernel to bypass the buffer cache.
+        // Unlike FILE_FLAG_NO_BUFFERING, this is advisory — it silently falls
+        // back to cached I/O on misalignment, so verify alignment in debug.
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        fcntl(fd, F_NOCACHE, 1);
+        size_t total = 0;
+        // Loop to handle short reads (e.g. APFS extent boundaries)
+        while (total < size) {
+            ssize_t r = pread(fd, (char*)dest + total, size - total, (off_t)total);
+            if (r <= 0) {
+                std::cerr << "FlashMoE Error: pread failed for " << path << std::endl;
+                close(fd);
+                return false;
+            }
+            total += (size_t)r;
+        }
+        close(fd);
+        return true;
 #else
-        // POSIX equivalent would use O_DIRECT with open/read
+        // Linux: O_DIRECT requires 512-byte aligned buffer/offset/size.
+        // Fall back to buffered I/O for now (fix in a future step if needed).
         FILE* f = std::fopen(path.c_str(), "rb");
         if (!f) return false;
         size_t r = std::fread(dest, 1, size, f);

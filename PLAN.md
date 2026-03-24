@@ -64,7 +64,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
 
 **Objective:** Make Flash-MoE compile and function correctly on macOS with Metal, in addition to Windows with Vulkan. Fix the incomplete POSIX paths. Resolve the architectural invariant violations before attempting end-to-end integration.
 
-*   [ ] **Step 1.5a: Platform Abstraction Layer for Virtual Memory**
+*   [x] **Step 1.5a: Platform Abstraction Layer for Virtual Memory**
     *   *Test to Write:* `test_flash_moe_vmem.cpp`. Allocate virtual address ranges via the abstraction API. Assert reservation, commit, query, and release work correctly on the host platform. Verify committed pages are writable and uncommitted pages are reported accurately.
     *   *Implementation:* Create `flash_moe_platform.h` / `flash_moe_platform.cpp` with:
         - `fmoe_vmem_reserve(size)` → Win: `VirtualAlloc(MEM_RESERVE)` / macOS: `mmap(PROT_NONE, MAP_PRIVATE|MAP_ANON)`
@@ -73,6 +73,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         - `fmoe_vmem_release(ptr, size)` → Win: `VirtualFree` / macOS: `munmap`
         - `fmoe_page_size()` → runtime query via `sysconf(_SC_PAGESIZE)` or `GetSystemInfo`
     *   Refactor `flash_moe_manager.cpp` to replace all bare Windows calls. Remove unguarded `#include <windows.h>` at line 6.
+    *   **✅ Result:** `flash_moe_platform.h/.cpp` created. `fmoe_vmem_reserve/commit/decommit/is_committed/release/page_size/page_align` implemented. `flash_moe_manager.cpp` fully refactored to use platform API. All 5 vmem tests pass on macOS (page_size=16384). `posix_memalign` alignment updated to `fmoe_page_size()` (16KB on Apple Silicon). `g_layers` access protected by `manager_mutex` in `prepare_nodes`.
     *   **⚠️ Pitfalls:**
         1.  **macOS `mincore` is NOT `VirtualQuery`.** `VirtualQuery` on Windows returns whether you explicitly committed the page. macOS `mincore()` returns whether the page is resident in physical RAM, which is a different thing — the kernel can page out committed memory. You MUST track commit state with your own bitset, not query the OS.
         2.  **Apple Silicon uses 16KB pages.** `mmap`/`mprotect` calls with 4KB granularity will silently round up or fail with `EINVAL`. Query `sysconf(_SC_PAGESIZE)` at init time and use it everywhere. The expert file padding (currently 4KB) must also be a multiple of the page size — either pad to 16KB on macOS or ensure `fmoe_vmem_commit` rounds up internally.
@@ -80,7 +81,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         4.  **`VirtualFree` quirk.** On Windows, `VirtualFree(ptr, 0, MEM_RELEASE)` releases the entire reservation from the base address. You cannot partially release a `VirtualAlloc(MEM_RESERVE)` region — you can only decommit individual pages with `VirtualFree(ptr, size, MEM_DECOMMIT)`. macOS `munmap` can free arbitrary subranges. The API must hide this asymmetry.
         5.  **Static `g_layers` map is not protected.** `flash_moe_manager.cpp:25` declares `static std::unordered_map<int, LayerState> g_layers` at file scope but `ensure_expert_loaded()` accesses it without holding `manager_mutex`. If `prepare_nodes` is called from multiple threads (which `ggml_backend_sched` can do for split graphs), this is a data race.
 
-*   [ ] **Step 1.5b: Real Direct I/O on macOS (`F_NOCACHE`)**
+*   [x] **Step 1.5b: Real Direct I/O on macOS (`F_NOCACHE`)**
     *   *Test to Write:* Extend `test_flash_moe_io.cpp` to pass on macOS. Same padded file, same byte-for-byte integrity check. Also assert via `fcntl(F_GLOBAL_NOCACHE)` that the read did not populate the buffer cache (or use `purge` before test and check `vm_stat` after).
     *   *Implementation:* Replace the POSIX fallback at `flash_moe_cache.cpp:139-146` with:
         ```c
@@ -91,6 +92,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         return r == (ssize_t)size;
         ```
     *   Use a three-way `#ifdef` (`_WIN32` / `__APPLE__` / `__linux__`).
+    *   **✅ Result:** `flash_moe_cache.cpp` updated with three-way `#ifdef`. macOS path uses `open()` + `fcntl(F_NOCACHE,1)` + `pread()` loop for short-read safety. `fd < 0` check used (not `!f`). `close(fd)` on all error paths. `test_direct_io` passes on macOS.
     *   **⚠️ Pitfalls:**
         1.  **`F_NOCACHE` does not fail on misalignment — it silently falls back to cached I/O.** Unlike Windows `FILE_FLAG_NO_BUFFERING` which returns `ERROR_INVALID_PARAMETER` (code 87) on misaligned reads, macOS `F_NOCACHE` quietly reverts to buffered behavior if buffer or offset is not page-aligned. You will see no error, just cache pollution. Always verify alignment before the read in debug builds.
         2.  **`pread` vs `read`.** Use `pread(fd, buf, size, offset)` not `read(fd, buf, size)`. The expert file layout uses offsets (gate/up/down projections at different positions within the file — see `flash_moe_manager.cpp:69-71`). `pread` is atomic and thread-safe; `read` after `lseek` is not.
