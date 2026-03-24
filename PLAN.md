@@ -145,7 +145,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         2.  **Double-caching hazard.** Resolved: virtual memory reservation in `init()` removed. The LRU pool IS the only CPU copy. No double-caching.
         3.  **`get_expert_sync` holds `cache_mutex` during I/O.** `manager_mutex` is held by `prepare_nodes` when calling `ensure_expert_loaded` → `get_expert_sync`. Lock ordering: `manager_mutex` → `cache_mutex`. No inversion. For the synchronous MVP this is acceptable (1ms SSD read = 1ms mutex hold). Must be redesigned in Phase 3.
 
-*   [ ] **Step 2.2: Evaluation Loop Hook (End-to-End)**
+*   [x] **Step 2.2: Evaluation Loop Hook (End-to-End)**
     *   *Test to Write:* Execute inference of 20 tokens using the `main` executable with `--flash-moe-dir`. Compare logits exactly against a fully-mapped baseline run. Must match 100% — any divergence indicates a data copy error or stride miscalculation.
     *   *macOS model path:* `~/_models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`
     *   *Example command:* `./koboldcpp --model ~/_models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf --flash-moe-dir ~/flash_moe_experts --usemetal`
@@ -154,6 +154,7 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         2. For each unique expert, call unified manager to ensure it's in the LRU cache
         3. Call `ggml_backend_tensor_set()` to copy from cache slot into the device buffer
         4. Resume compute
+    *   **✅ Result:** `flash_moe_manager.cpp::prepare_nodes()` updated. `memcpy(ids->data,...)` replaced with `ggml_backend_tensor_get(ids, ..., 0, size)` — safe for Metal/Vulkan GPU tensors. Expert ID upper-bound check added: `id >= 0 && id < n_exp` (was `id >= 0` only, risking out-of-range file access on corrupt/uninitialized tensor data). `test_flash_moe_prepare_nodes.cpp` created: 6 tests covering range filtering, all-invalid, deduplication, boundary values, filename zero-padding (no overflow), and zero-expert edge case. All 7 test binaries, 31 total test cases pass via `make test_flash_moe -j8`. `flash_moe_manager.o` compiles cleanly with the ggml_backend_tensor_get call.
     *   **⚠️ Pitfalls:**
         1.  **`tensor->buffer` is NULL (Invariant #2 reprise).** The disk-backed tensors were skipped during upload. Before the first `ggml_backend_tensor_set`, you must ensure the tensor has a valid buffer. Option: during model load, allocate empty device buffers for expert tensors (zeroed), so they have valid `buffer` pointers. Then `tensor_set` overwrites the contents on demand.
         2.  **`ids` tensor might be on GPU.** `flash_moe_manager.cpp:173` does `memcpy(id_values.data(), ids->data, ...)` which only works if `ids->data` is CPU-accessible. On Vulkan, `ids->data` points to device memory — reading it is UB. Must use `ggml_backend_tensor_get(ids, id_values.data(), 0, size)` to safely copy IDs back to CPU. On Metal with shared buffers, direct access works but is not guaranteed by the API.

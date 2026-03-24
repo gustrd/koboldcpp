@@ -236,18 +236,22 @@ namespace FlashMoE {
                     int layer = -1;
                     if (sscanf(weights->name, "blk.%d.", &layer) != 1) continue;
 
-                    // Read expert IDs — for MVP assume CPU-accessible data
+                    // Read expert IDs safely via the backend API.
+                    // ggml_backend_tensor_get works for both CPU-accessible and
+                    // GPU tensors (Metal shared/private, Vulkan device memory).
+                    // This replaces the unsafe memcpy(ids->data,...) which was
+                    // undefined behaviour for GPU tensors.
                     std::vector<int32_t> id_values(ggml_nelements(ids));
-                    if (ids->data) {
-                        memcpy(id_values.data(), ids->data,
-                               id_values.size() * sizeof(int32_t));
-                    }
-                    // TODO Phase 2: use ggml_backend_tensor_get for GPU tensors
+                    ggml_backend_tensor_get(ids, id_values.data(), 0,
+                        id_values.size() * sizeof(int32_t));
 
-                    // Load unique experts
+                    // Load unique experts — guard both ends of the valid range.
+                    // Lower: id >= 0 (router can emit -1 as "no expert").
+                    // Upper: id < n_experts (corrupt or uninitialized IDs).
+                    int n_exp = g_layers[layer].n_experts;
                     std::unordered_set<int32_t> unique_ids;
                     for (auto id : id_values) {
-                        if (id >= 0) unique_ids.insert(id);
+                        if (id >= 0 && id < n_exp) unique_ids.insert(id);
                     }
                     for (auto id : unique_ids) {
                         ensure_expert_loaded(layer, id);

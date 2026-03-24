@@ -959,8 +959,11 @@ test_flash_moe_io: $(FMOE_TEST_SRC)/test_flash_moe_io.cpp flash_moe_cache.o flas
 test_flash_moe_unified: $(FMOE_TEST_SRC)/test_flash_moe_unified.cpp flash_moe_cache.o flash_moe_platform.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+test_flash_moe_prepare_nodes: $(FMOE_TEST_SRC)/test_flash_moe_prepare_nodes.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
 # ─── Umbrella: build and run all Flash-MoE tests ─────────────────────────────
-FMOE_TEST_BINS = test_flash_moe_vmem test_flash_moe_metal_sync test_flash_moe_alloc test_flash_moe_lru test_flash_moe_io test_flash_moe_unified
+FMOE_TEST_BINS = test_flash_moe_vmem test_flash_moe_metal_sync test_flash_moe_alloc test_flash_moe_lru test_flash_moe_io test_flash_moe_unified test_flash_moe_prepare_nodes
 
 test_flash_moe: $(FMOE_TEST_BINS)
 	@echo "=== Running Flash-MoE tests ==="; \
