@@ -439,42 +439,16 @@ With all 48 layers on GPU router, each layer should have GPU split → CPU MoE s
 
 The `prepare_nodes` hook is position-anchored: it fires once per split, before all computation. It cannot fire between individual ops within a split. Slot-based allocation requires IDs to be pre-computed — which only works when the router runs in a PREVIOUS split. For any layer where router and MoE are in the same split, the approach is fundamentally broken.
 
-### Required Fix (Next Step)
+### Required Fix (Next Step) → RESOLVED: See §4.6 Phase 2.7
 
-The ID remapping MUST be done using a ggml graph node (an in-graph op), not a pre-compute hook:
+The ID remapping MUST happen AFTER the router computes, not before. Options A-E below were analyzed; **Option F (eval callback)** was chosen. See §4.6 for the full design.
 
-**Option A: Remap IDs via an injected ggml op**
-- After the router output, insert a custom `GGML_OP_REMAP_EXPERT_IDS` node that:
-  1. Reads the router IDs tensor
-  2. Looks up each ID in the slot map (computed by `prepare_nodes` using disk contents)
-  3. Outputs remapped IDs [0..K-1]
-- This op runs AS PART OF the graph, after the router, before MUL_MAT_ID
-- Requires modifying `llama-model.cpp` to insert the op in the MoE block
-- Requires a custom ggml op registration
-
-**Option B: Change tensor shape per-split (dynamic K-slot)**
-- Don't change tensor shape statically in `register_tensor`
-- Instead, just before the split executes, dynamically set `tensor->ne[2] = K` and `tensor->nb[3]` temporarily
-- Remap IDs as part of prepare_nodes
-- RISK: ggml compute kernels may cache ne/nb → undefined behavior
-
-**Option C: Separate router split from MoE split (scheduler hint)**
-- Force the router output IDs to use a special "IPC" backend that forces a split
-- The IPC backend's `set_tensor` / `get_tensor` is a no-op; it just acts as a split boundary
-- After the GPU/CPU split that computed router IDs, the MoE split gets valid IDs
-- Requires modifying the scheduler or tensor assignment logic
-
-**Option D (simplest, correct):**
-- Do NOT remap IDs
-- Do NOT use K-slot tensors
-- Use 128-slot tensors (Bug 6 remains: 17.5 GB)
-- Keep `prepare_nodes` writing to `expert_id * proj_info.bytes` (original approach)
-- For layers with valid IDs (GPU router → CPU MoE split): correct output ✓
-- For CPU-layer MoE: Bug 5 remains (IDs zeros → wrong experts) but NO CRASH
-- LIMITATION: requires 17.5 GB RAM, which OOMs on 16 GB systems
-
-**Option E (recommended for next iteration):**
-Inject a `ggml_add(ids_tensor, mapping_vector)` or similar op into the graph at the point where expert selection happens. The mapping is pre-loaded by `prepare_nodes`. This is the cleanest solution and aligns with how attention mask manipulation works.
+**Option A: Custom ggml op** — ✗ `ggml_map_custom1_inplace` is CPU-only; breaks Vulkan splits.
+**Option B: Dynamic tensor shape** — ✗ ggml kernels cache ne/nb; undefined behavior.
+**Option C: Scheduler split hint** — ✗ Invasive scheduler changes; fragile.
+**Option D: 128-slot tensors** — ✗ 17.5 GB RAM; defeats the project's purpose (models larger than RAM).
+**Option E: In-graph ggml_add remap** — ✗ Mapping vector unknown at graph-build time; requires two-pass.
+**Option F: Eval callback (CHOSEN)** — ✓ Uses existing `ggml_backend_sched_eval_callback`. Fires per-node AFTER argsort, BEFORE MUL_MAT_ID. Serial pipeline like [reference impl](https://github.com/danveloper/flash-moe). Works for CPU and GPU layers. No graph modification. See §4.6.
 
 ### Test Coverage (44 tests, 11 binaries — all pass)
 
@@ -482,6 +456,357 @@ Inject a `ggml_add(ids_tensor, mapping_vector)` or similar op into the graph at 
 |--------|-------|
 | `test_flash_moe_slot_remap` | 7 new slot/remap tests |
 | (all previous binaries) | 37 tests |
+
+---
+
+## 4.6 Phase 2.7: Eval-Callback Expert Loading (Bug 5 + Bug 7 Fix)
+
+**Objective:** Fix the fundamental timing problem where `prepare_nodes` fires BEFORE the router computes expert IDs. Replace the pre-compute hook with an **eval callback** that fires AFTER routing, BEFORE MUL_MAT_ID — achieving the same serial pipeline as the [reference Flash-MoE implementation](https://github.com/danveloper/flash-moe).
+
+### Why This Is The Only Viable Path
+
+The project's entire purpose is inference of models **larger than available RAM**. This rules out:
+
+- **Option D (128-slot tensors):** 17.5 GB for expert tensors alone. Defeats the purpose — the model wouldn't fit in RAM, which is the problem we're solving.
+- **Option B/C (scheduler hacks):** Fragile, invasive changes to ggml internals. High maintenance burden.
+- **Option A (custom ggml op):** `ggml_map_custom1_inplace` is CPU-only. If `selected_experts` lives on Vulkan (GPU layers), the scheduler inserts copies back to CPU, potentially breaking the split or doubling memory.
+
+The reference implementation (danveloper/flash-moe) solves this cleanly with a **serial pipeline**: GPU routing → SSD reads → GPU expert compute. Each phase completes before the next starts. They achieve this by controlling the entire execution pipeline directly (custom Metal kernels, no ggml).
+
+We need the same serial ordering within ggml's scheduler. The **eval callback** (`ggml_backend_sched_eval_callback`) provides exactly this: it pauses graph execution after any node we select, gives us a synchronization point, and lets us do I/O before execution continues.
+
+### Architecture: Eval Callback as Expert Loading Hook
+
+**Execution flow with the callback (per layer):**
+
+```
+Graph execution begins for split containing layer L:
+  ...
+  ggml_argsort_top_k executes → selected_experts tensor filled with [42, 97, 13, ...]
+  ↓
+  Backend synchronizes (ggml-backend.cpp:1632)
+  ↓
+  Callback fires (ask=false) for "ffn_moe_topk" node:
+    1. Read selected_experts via ggml_backend_tensor_get → [42, 97, 13, ...]
+    2. Deduplicate: unique experts = {42, 97, 13}
+    3. Assign slots: 42→0, 97→1, 13→2
+    4. Load experts from SSD into K-slot weight tensors:
+       - pread blk_L_exp042.bin → slot 0 of gate/up/down tensors
+       - pread blk_L_exp097.bin → slot 1
+       - pread blk_L_exp013.bin → slot 2
+    5. Remap IDs in-place: [42,97,13,...] → [0,1,2,...]
+    6. Write back via ggml_backend_tensor_set
+  ↓
+  ggml_mul_mat_id executes → reads slot 0,1,2 from K=8 tensor ✓ (no OOB)
+  ...
+```
+
+**Why this works for ALL configurations:**
+
+| Config | Router location | IDs available when callback fires? | Expert loading |
+|--------|----------------|-------------------------------------|----------------|
+| `--gpulayers 0` | CPU split | ✓ (argsort already computed in this split, before MUL_MAT_ID) | ✓ |
+| `--gpulayers 48` | Vulkan split | ✓ (argsort computed, backend synced before callback) | ✓ |
+| `--gpulayers 1` | Mixed | ✓ (callback fires per-node, always after argsort) | ✓ |
+
+The key difference from `prepare_nodes`: the callback fires **between nodes within a split**, not before the entire split. The scheduler's callback path (`ggml-backend.cpp:1608-1640`) computes sub-graphs via `ggml_graph_view` and synchronizes between each callback-flagged node.
+
+### The Existing Callback Mechanism (Already in ggml)
+
+```
+ggml-backend.cpp:1603-1640:
+
+if (!sched->callback_eval) {
+    // Fast path: compute entire split at once
+    ggml_backend_graph_compute_async(split_backend, &split->graph);
+} else {
+    // Callback path: compute node-by-node batches
+    for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+        struct ggml_tensor * t = split->graph.nodes[j0];
+        bool need = sched->callback_eval(t, true, ...);  // ask phase
+
+        // batch consecutive non-needed nodes
+        int j1 = j0;
+        while (!need && j1 < n_nodes - 1) {
+            t = split->graph.nodes[++j1];
+            need = sched->callback_eval(t, true, ...);
+        }
+
+        // compute batch [j0, j1]
+        struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+        ggml_backend_graph_compute_async(split_backend, &gv);
+
+        ggml_backend_synchronize(split_backend);  // ← guarantees data is ready
+
+        if (need && !sched->callback_eval(t, false, ...)) break;  // data phase
+    }
+}
+```
+
+Registration: `ggml_backend_sched_set_eval_callback(sched, callback, userdata)` at `llama-context.cpp:1199`.
+
+### Detailed Implementation Steps
+
+#### Step 2.7a: Implement the Eval Callback Function
+
+**File:** `src/flash_moe/flash_moe_manager.h` and `flash_moe_manager.cpp`
+
+Add a static callback function to `ExpertManager`:
+
+```cpp
+// In flash_moe_manager.h:
+static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
+
+// In flash_moe_manager.cpp:
+bool ExpertManager::eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    // "ask" phase: should we pause after this node?
+    if (ask) {
+        // Pause after ARGSORT nodes that produce expert IDs.
+        // The graph name is "ffn_moe_topk" (set at llama-graph.cpp:1309).
+        // But tensor names in the graph may be truncated or prefixed.
+        // Safest: check for GGML_OP_ARGSORT.
+        //
+        // IMPORTANT: Only intercept the FINAL argsort (the one producing
+        // selected_experts), not intermediate argsorts (e.g., group selection
+        // in DeepSeek-style models, line 1289/1296).
+        // The final argsort is the one whose output feeds MUL_MAT_ID.
+        // We identify it by name containing "ffn_moe_topk".
+        return (strstr(t->name, "ffn_moe_topk") != nullptr);
+    }
+
+    // "data" phase: argsort just computed, backend synchronized.
+    // t is the selected_experts tensor: [n_expert_used, n_tokens], I32.
+    ExpertManager& mgr = get_manager();
+    if (!mgr.enabled) return true;
+
+    std::lock_guard<std::mutex> lock(mgr.manager_mutex);
+
+    // 1. Extract layer number from tensor name ("ffn_moe_topk-blk.N" or similar).
+    int layer = -1;
+    const char* blk_pos = strstr(t->name, "blk.");
+    if (!blk_pos || sscanf(blk_pos, "blk.%d", &layer) != 1) return true;
+
+    // 2. Read computed expert IDs.
+    int n_ids = ggml_nelements(t);
+    std::vector<int32_t> id_values(n_ids);
+    ggml_backend_tensor_get(t, id_values.data(), 0, n_ids * sizeof(int32_t));
+
+    // 3. Build slot mapping (expert_id → slot_index, first-occurrence order).
+    std::unordered_map<int32_t, int32_t> expert_to_slot;
+    int n_exp = mgr.g_layers[layer].n_experts;
+    int max_slots = (mgr.n_expert_used > 0) ? mgr.n_expert_used : n_exp;
+    int32_t slot = 0;
+    for (auto id : id_values) {
+        if (id >= 0 && id < n_exp &&
+            expert_to_slot.find(id) == expert_to_slot.end()) {
+            if (slot >= max_slots) break;
+            expert_to_slot[id] = slot++;
+        }
+    }
+
+    // 4. Load each expert into its assigned slot.
+    //    We need references to the WEIGHT tensors (gate/up/down_exps) for
+    //    this layer. These are stored during register_tensor in a lookup
+    //    table: layer → {gate_tensor, up_tensor, down_tensor}.
+    for (const auto& [eid, slt] : expert_to_slot) {
+        for (auto* wt : mgr.layer_weight_tensors[layer]) {
+            mgr.ensure_expert_loaded(layer, eid, wt, slt);
+        }
+    }
+
+    // 5. Remap IDs in-place: raw → slot indices.
+    for (auto& id : id_values) {
+        if (id >= 0 && id < n_exp) {
+            auto it = expert_to_slot.find(id);
+            id = (it != expert_to_slot.end()) ? it->second : 0;
+        } else {
+            id = 0;  // clamp invalid/padding IDs to slot 0 (safe, slot 0 always loaded)
+        }
+    }
+    ggml_backend_tensor_set(t, id_values.data(), 0, n_ids * sizeof(int32_t));
+
+    return true;  // continue execution
+}
+```
+
+**⚠️ Pitfalls:**
+
+1. **`t->name` format.** The `cb()` call at `llama-graph.cpp:1309` sets the name to `"ffn_moe_topk"` with layer suffix. Verify exact format with logging. The callback receives the node as it appears in the graph — it should have the name set by `cb()`. If graph optimization renames nodes, fall back to `t->op == GGML_OP_ARGSORT` plus checking that a downstream node is MUL_MAT_ID.
+
+2. **Weight tensor references.** The callback fires with the IDs tensor `t`, but needs to write into the weight tensors (gate/up/down_exps). `prepare_nodes` finds these by scanning `node->src[0]` of MUL_MAT_ID nodes. The callback doesn't have access to other nodes — only `t`. **Solution:** During `register_tensor`, store a mapping `layer → [gate_tensor*, up_tensor*, down_tensor*]` in ExpertManager. The callback looks up weight tensors by layer number.
+
+3. **Callback chaining.** `llama-context.cpp:1199` sets `cparams.cb_eval`. If koboldcpp or another component sets its own callback, we must chain. Store the original callback pointer and call it from our callback. If the original returns false (stop), we also stop.
+
+4. **GroveMoE `selected_experts` post-processing.** For `LLM_ARCH_GROVEMOE` (lines 1311-1314), `selected_experts` is cast float→scale→cast back to I32 AFTER the argsort. The node we intercept (`ffn_moe_topk`) is the argsort output, but MUL_MAT_ID uses the post-processed version. Need to verify: does the post-processing create a NEW tensor, or modify in-place? If new tensor, we must intercept the final I32 cast, not the argsort. **For Qwen3 (non-GroveMoE), this is not an issue.**
+
+5. **Thread safety.** The callback runs on the scheduler thread (same thread as `ggml_backend_sched_compute_splits`). No concurrent callbacks for the same split. The `manager_mutex` lock is safe here.
+
+6. **`-1` padding in IDs.** `ggml_argsort_top_k` may emit `-1` for padding slots. The remap must handle this: clamp to `0` (slot 0 is always loaded). MUL_MAT_ID with `id=-1` causes the `0xFFFFFFFFFFFFFFFF` read crash seen with `--gpulayers 48`. This is likely the root cause of that variant of Bug 7.
+
+#### Step 2.7b: Register Weight Tensors by Layer
+
+**File:** `src/flash_moe/flash_moe_manager.cpp` (modify `register_tensor`)
+
+Currently `register_tensor` overrides `ne[2]` and registers with the LRU cache. Add: store a reference to each weight tensor, keyed by layer.
+
+```cpp
+// New field in ExpertManager (flash_moe_manager.h):
+std::unordered_map<int, std::vector<ggml_tensor*>> layer_weight_tensors;
+
+// In register_tensor, after existing logic:
+int layer = -1;
+const char* blk_pos = strstr(tensor->name, "blk.");
+if (blk_pos && sscanf(blk_pos, "blk.%d.", &layer) == 1) {
+    layer_weight_tensors[layer].push_back(tensor);
+}
+```
+
+**⚠️ Pitfall:** Backend copy tensors (e.g., `VLK0#blk.0.ffn_gate_exps.weight#0`) are created by the scheduler AFTER model load. `register_tensor` only sees the original tensors. If the split uses copy tensors for MUL_MAT_ID's src[0], the callback must write to the copy tensor, not the original. **Two approaches:**
+- (a) In the callback, scan the split's nodes to find the actual weight tensor used by MUL_MAT_ID for this layer. More robust but requires node access.
+- (b) Use `ggml_backend_tensor_set` on the original tensor. If the scheduler's copy logic copies CPU→GPU BEFORE the callback fires, we'd be writing to the wrong tensor. **BUT:** with the DISK_BACKED skip (Bug 4 fix at line 1474), the copy doesn't happen for expert tensors. So the GPU copy tensor has undefined data and we must write to it directly.
+
+**Resolution:** The callback needs access to the actual weight tensors used in the current split's MUL_MAT_ID nodes. The cleanest approach: modify the callback to also scan the split's node list (passed via userdata or a pre-built index). Alternatively, build a mapping during `prepare_nodes` (which still runs at line 1601 but now only builds the tensor index, no loading/remapping).
+
+**Revised role of `prepare_nodes`:** Lightweight index pass.
+- Scan nodes for MUL_MAT_ID/ADD_ID with expert weight src[0]
+- Store `layer → {ids_tensor, [weight_tensor_0, weight_tensor_1, ...]}` mapping in ExpertManager
+- Do NOT read IDs, do NOT load experts, do NOT remap
+- The callback uses this pre-built index
+
+#### Step 2.7c: Wire the Callback
+
+**File:** `src/llama-context.cpp` or `gpttype_adapter.cpp`
+
+Option A (cleanest): Set the callback where `cparams.cb_eval` is assigned.
+
+```cpp
+// In llama-context.cpp, near line 1199, or in gpttype_adapter.cpp after context creation:
+if (FlashMoE::get_manager().is_enabled()) {
+    // Chain with any existing callback
+    auto* prev_cb = cparams.cb_eval;
+    auto* prev_ud = cparams.cb_eval_user_data;
+    struct ChainData { ggml_backend_sched_eval_callback prev; void* prev_ud; };
+    static ChainData chain = { prev_cb, prev_ud };
+    cparams.cb_eval = [](ggml_tensor* t, bool ask, void* ud) -> bool {
+        auto* c = (ChainData*)ud;
+        if (!ExpertManager::eval_callback(t, ask, ud)) return false;
+        if (c->prev) return c->prev(t, ask, c->prev_ud);
+        return true;
+    };
+    cparams.cb_eval_user_data = &chain;
+}
+```
+
+Option B (simpler, koboldcpp doesn't use cb_eval):
+
+```cpp
+// gpttype_adapter.cpp, after llama_new_context_with_model:
+if (FlashMoE::get_manager().is_enabled()) {
+    ggml_backend_sched_set_eval_callback(
+        llama_get_sched(ctx),
+        ExpertManager::eval_callback,
+        nullptr
+    );
+}
+```
+
+**⚠️ Pitfall:** `llama_get_sched` may not be public API in koboldcpp's fork. Check `llama.h` for availability. Alternative: access via `llama_context` internals if needed.
+
+#### Step 2.7d: Gut `prepare_nodes` — Index-Only Pass
+
+Rewrite `prepare_nodes` to only build the weight tensor index:
+
+```cpp
+void ExpertManager::prepare_nodes(ggml_tensor** nodes, int n_nodes) {
+    if (!enabled) return;
+    std::lock_guard<std::mutex> lock(manager_mutex);
+
+    // Clear previous split's index — rebuild for this split.
+    current_split_layers.clear();
+
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor* node = nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) continue;
+
+        ggml_tensor* weights = node->src[0];
+        bool is_expert = (weights->flags & GGML_TENSOR_FLAG_DISK_BACKED) ||
+            strstr(weights->name, "ffn_gate_exps") ||
+            strstr(weights->name, "ffn_up_exps") ||
+            strstr(weights->name, "ffn_down_exps");
+        if (!is_expert) continue;
+
+        int layer = -1;
+        const char* blk_pos = strstr(weights->name, "blk.");
+        if (!blk_pos || sscanf(blk_pos, "blk.%d.", &layer) != 1) continue;
+
+        // Store the actual weight tensor used in this split (may be a copy tensor).
+        current_split_layers[layer].weight_tensors.push_back(weights);
+        current_split_layers[layer].ids_tensor = node->src[2];
+    }
+}
+```
+
+The callback then reads `current_split_layers[layer]` to find the weight tensors to write into.
+
+#### Step 2.7e: Handle the gpulayers=48 Crash (Bug 7 variant)
+
+**Hypothesis:** The `access violation reading 0xFFFFFFFFFFFFFFFF` crash with `--gpulayers 48` is caused by `-1` values in the IDs tensor.
+
+- `ggml_argsort_top_k` pads unused slots with `-1`
+- The current `prepare_nodes` remap leaves `-1` unchanged (line 323: "Negative / out-of-range IDs stay as-is")
+- `-1` as a `size_t` index = `0xFFFFFFFFFFFFFFFF` → OOB read
+
+**Fix in the callback:** Clamp all IDs to `[0, K-1]` after remapping. Any `-1` or out-of-range ID maps to slot `0`. Since slot `0` always has valid data (the first expert loaded), MUL_MAT_ID reads valid memory. The MoE weight for that token will be wrong, but the router weight for padding slots is 0.0, so it doesn't affect output.
+
+**Verification:** Add logging before the remap to print raw IDs and check for `-1` values. Run with `--gpulayers 48` and confirm the crash disappears.
+
+#### Step 2.7f: Tests
+
+New test binary: `test_flash_moe_eval_callback`
+
+| Test | Description |
+|------|-------------|
+| `test_callback_ask_phase` | Verify callback returns true only for tensors named `"ffn_moe_topk"` |
+| `test_callback_remap_basic` | Mock: IDs=[3,7,3], K=8 → slot map {3→0,7→1}, remapped=[0,1,0] |
+| `test_callback_remap_padding` | IDs=[3,-1,7], expect [-1 → 0]: remapped=[0,0,1] |
+| `test_callback_remap_overflow` | IDs with >K unique experts → only first K get slots, rest clamp to 0 |
+| `test_callback_weight_tensor_index` | Verify `prepare_nodes` (index pass) populates `current_split_layers` correctly |
+| `test_callback_chaining` | If a prior callback exists, verify both fire in sequence |
+
+### Performance Analysis
+
+**Overhead per token:**
+- One `ggml_backend_synchronize` per MoE layer (48 layers for Qwen3-30B-A3B)
+- On Lunar Lake iGPU (shared memory), sync ≈ microseconds (no PCIe fence)
+- SSD reads: K=8 experts × 3 projections × ~1MB ≈ 24 MB/layer, ~1.2 GB/token at 48 layers
+- With LRU cache hits (experts reuse across tokens): much less actual I/O
+
+**Comparison with reference implementation (danveloper/flash-moe):**
+- Their pipeline: GPU routing [0.55ms] → SSD reads [2.41ms] → GPU expert compute [deferred]
+- Our pipeline: same serial ordering, achieved via eval callback instead of custom pipeline
+- Their approach: no ggml, custom Metal kernels, direct command buffer control
+- Our approach: ggml-native, works with any backend (Vulkan, CPU, CUDA), no custom kernels
+
+**Why the sync overhead is acceptable:**
+- The reference implementation also serializes: "The serial pipeline (GPU → SSD → GPU) is hardware-optimal because SSD DMA and GPU compute share the same memory controller and cannot be profitably overlapped"
+- On Lunar Lake (shared memory controller), this is equally true
+- The dominant cost is SSD I/O (~2ms/layer), not sync overhead (~μs/layer)
+
+### Migration Path
+
+1. **Implement Steps 2.7a-2.7f** — callback-based expert loading
+2. **Remove `prepare_nodes` expert loading/remapping** — keep only the index pass
+3. **Remove the Bug 4 DISK_BACKED skip** at `ggml-backend.cpp:1474` — no longer needed because expert weight copies are handled by the callback, not the scheduler's copy loop. (Actually, keep the skip — the scheduler's copy would still read empty CPU buffers. The callback writes directly to the GPU copy tensor.)
+4. **Validate with --gpulayers 0, 1, 48** — all should work
+5. **Benchmark** — tokens/sec, SSD reads/token, cache hit rate
+
+### Invariants (New)
+
+6. **Eval callback ordering:** The callback must fire AFTER `ggml_argsort_top_k` and BEFORE the first `ggml_mul_mat_id` in each MoE layer. The ggml graph topological order guarantees this — argsort is a dependency of MUL_MAT_ID.
+
+7. **ID clamping:** All IDs written back by the callback must be in `[0, K-1]`. Never write `-1` or raw expert IDs — MUL_MAT_ID would read out-of-bounds from the K-slot tensor.
+
+8. **Weight tensor identity:** The callback must write to the SAME tensor object that MUL_MAT_ID will read from. For GPU layers, this is the scheduler's copy tensor (found via `prepare_nodes` index), not the original CPU tensor.
 
 ---
 
