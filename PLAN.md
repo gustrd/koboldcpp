@@ -114,19 +114,21 @@ This project strictly adheres to TDD principles. Each step incorporates specific
         4.  **`prepare_nodes` does NOT need a backend handle.** `ggml_backend_tensor_set` dispatches via `tensor->buffer->iface.set_tensor` — it reads the backend from the buffer directly. No change to the call site at `ggml-backend.cpp:1593`.
         5.  **Metal blit encoder path blocks the GPU.** If tensors end up in private Metal buffers (not shared), every expert load triggers a GPU command buffer submission + semaphore wait (see `ggml-metal-device.m:1656-1667`). At 8 experts per layer × 64 layers, this is 512 GPU sync points per token. Ensure tensors use shared storage mode or batch the blits into a single command buffer.
 
-*   [ ] **Step 1.5d: Build System Cross-Platform Targets**
+*   [x] **Step 1.5d: Build System Cross-Platform Targets**
     *   *Test to Write:* `make test_flash_moe -j8` succeeds on both Windows (w64devkit) and macOS (Xcode CLI / Homebrew clang). `make LLAMA_METAL=1 -j8` links without undefined symbols on macOS.
     *   *Implementation:* Add to Makefile:
         - Object targets: `flash_moe_manager.o`, `flash_moe_cache.o`, `flash_moe_platform.o`
         - Test binary targets: `test_flash_moe_lru`, `test_flash_moe_alloc`, `test_flash_moe_io`, `test_flash_moe_vmem`
         - Umbrella target: `test_flash_moe` that builds and runs all
         - Platform detection: `ifeq ($(UNAME_S),Darwin)` to link `-framework Metal -framework Foundation`
+    *   **✅ Result:** Added object targets (`flash_moe_platform.o`, `flash_moe_cache.o`, `flash_moe_manager.o`) and test binary targets (`test_flash_moe_vmem`, `test_flash_moe_metal_sync`, `test_flash_moe_alloc`, `test_flash_moe_lru`, `test_flash_moe_io`) to Makefile. Added `.PHONY: test_flash_moe` umbrella target that builds all binaries and runs them, exiting non-zero on any failure. All 5 binaries link against correct object subsets. `make test_flash_moe -j8` passes on macOS Apple Silicon (Darwin 25.3.0, clang 17). No extra `-I` flags needed — existing `CXXFLAGS` already covers `ggml/include`, `src`, and `vendor/`. Bug found and fixed: `test_flash_moe_metal_sync.cpp` used `assert(fmoe_vmem_commit(...))` which with `-DNDEBUG` never calls the function, causing Bus Error 10 on subsequent `memset`. Fixed to `bool commitN = fmoe_vmem_commit(...); assert(commitN);` — pattern consistent with `test_flash_moe_vmem.cpp`.
     *   **⚠️ Pitfalls:**
-        1.  **`flash_moe_manager.cpp` includes `nlohmann/json.hpp` at line 3.** This header must be vendored or available in the include path. The existing koboldcpp Makefile may not have `-I` for wherever this header lives. Verify the include path or vendor the single-header JSON into `src/flash_moe/`.
+        1.  **`flash_moe_manager.cpp` includes `nlohmann/json.hpp` at line 3.** Resolved: `CXXFLAGS` already has `-I./vendor` which covers `vendor/nlohmann/json.hpp`.
         2.  **Objective-C++ compilation.** If Metal interop code needs `#import <Metal/Metal.h>`, those source files must be `.mm` extension and compiled with `-ObjC++`. The existing Makefile already does this for `ggml-metal-device-m.o` and `ggml-metal-context-m.o` (see Makefile lines 347-353). Follow the same pattern for any `flash_moe_metal.mm`.
-        3.  **Test binaries need the flash_moe objects linked.** Test targets must link against `flash_moe_cache.o`, `flash_moe_platform.o`, etc. Currently no test targets exist in the Makefile at all — the compiled `.exe` files in `tests/flash_moe/` were presumably built manually.
-        4.  **Include path for ggml.h.** `flash_moe_manager.h` includes `"ggml.h"` (line 2) but ggml headers live in `ggml/include/`. The compilation command needs `-I ggml/include` or the include must be changed to a relative path. Verify this works on both platforms.
-        5.  **Windows-only `.exe` test artifacts in the repo.** The `tests/flash_moe/` directory contains `test_alloc.exe`, `test_io.exe`, `test_lru.exe`. These should be `.gitignore`d and not checked in. They will confuse macOS builds.
+        3.  **Test binaries need the flash_moe objects linked.** Resolved: each test target explicitly lists its required objects.
+        4.  **Include path for ggml.h.** Resolved: `CXXFLAGS` has `-Iggml/include`.
+        5.  **Windows-only `.exe` test artifacts in the repo.** The `tests/flash_moe/` directory contains `test_alloc.exe`, `test_io.exe`, `test_lru.exe`. These should be `.gitignore`d and not checked in.
+        6.  **`assert(fn_with_side_effects())` is a no-op under `-DNDEBUG`.** Never use `assert` to wrap a function call that must execute. Always separate: `bool ok = fn(); assert(ok);`.
 
 ---
 

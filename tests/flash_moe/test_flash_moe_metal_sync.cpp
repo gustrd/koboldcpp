@@ -37,7 +37,8 @@ void test_metal_buffer_alignment() {
 
     void* buf = fmoe_vmem_reserve(expert_size);
     assert(buf != nullptr);
-    assert(fmoe_vmem_commit(buf, expert_size));
+    bool commit1 = fmoe_vmem_commit(buf, expert_size);
+    assert(commit1);
 
     uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
     assert(addr % page_sz == 0);
@@ -60,7 +61,8 @@ void test_expert_tensor_offset() {
     size_t total_size = fmoe_page_align((size_t)n_experts * proj_bytes);
     void*  tensor_buf = fmoe_vmem_reserve(total_size);
     assert(tensor_buf);
-    assert(fmoe_vmem_commit(tensor_buf, total_size));
+    bool commit2 = fmoe_vmem_commit(tensor_buf, total_size);
+    assert(commit2);
     memset(tensor_buf, 0, total_size);
 
     // Simulate ggml_backend_tensor_set: write known pattern for each expert
@@ -96,7 +98,8 @@ void test_idempotent_set() {
     size_t       total_size = fmoe_page_align(proj_bytes * 2);
     void*        tensor_buf = fmoe_vmem_reserve(total_size);
     assert(tensor_buf);
-    assert(fmoe_vmem_commit(tensor_buf, total_size));
+    bool commit3 = fmoe_vmem_commit(tensor_buf, total_size);
+    assert(commit3);
     memset(tensor_buf, 0, total_size);
 
     // Write expert 0 once
@@ -127,7 +130,8 @@ void test_source_buffer_requirements() {
 
     void* src_buf = fmoe_vmem_reserve(expert_size);
     assert(src_buf);
-    assert(fmoe_vmem_commit(src_buf, expert_size));
+    bool commit4 = fmoe_vmem_commit(src_buf, expert_size);
+    assert(commit4);
 
     uintptr_t addr = reinterpret_cast<uintptr_t>(src_buf);
 
