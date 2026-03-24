@@ -1333,6 +1333,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.flash_moe_dir   = params.flash_moe_dir.empty() ? NULL : params.flash_moe_dir.c_str();
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

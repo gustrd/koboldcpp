@@ -1097,6 +1097,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--flash-moe-dir"}, "DIR",
+        "directory containing Flash-MoE extracted expert files",
+        [](common_params & params, std::string value) {
+            params.flash_moe_dir = value;
+        }
+    ));
+
+    add_opt(common_arg(
         {"-co", "--color"}, "[on|off|auto]",
         "Colorize output to distinguish prompt and user input from generations ('on', 'off', or 'auto', default: 'auto')\n"
         "'auto' enables colors when output is to a terminal",

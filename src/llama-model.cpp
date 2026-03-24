@@ -13,6 +13,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#include "flash_moe/flash_moe_manager.h"
 
 #include "models/models.h"
 
@@ -438,6 +439,10 @@ struct llama_model::impl {
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    
+    if (params.flash_moe_dir) {
+        FlashMoE::get_manager().init(params.flash_moe_dir);
+    }
 }
 
 llama_model::~llama_model() {

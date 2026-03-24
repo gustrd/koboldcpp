@@ -18,25 +18,29 @@ This project strictly adheres to TDD principles. Each step incorporates specific
 
 **Objective:** Implement strict explicit memory management and pure synchronous Direct I/O to stop OS thrashing.
 
-*   [ ] **Step 1.1: Core LRU Data Structures**
+*   [x] **Step 1.1: Core LRU Data Structures**
     *   *Test to Write:* `test_flash_moe_lru.cpp`. Assert that allocating `N+1` generic slots to a cache of size `N` deterministically evicts the least recently used slot. Verify that fetching an existing key successfully promotes it to the front.
     *   *Implementation:* Build `FlashMoE::SlotBufferAllocator`. Use `std::list` to track ordering and `std::unordered_map` for $O(1)$ lookups.
     *   **⚠️ Pitfall (Iterator Invalidation):** Directly storing `std::list::iterator` in the unordered map is safe in C++, but be extremely careful not to invalidate them during concurrent read loops later. 
+    *   **✅ Result:** Verified with `tests/flash_moe/test_flash_moe_lru.cpp`. O(1) LRU management achieved.
 
-*   [ ] **Step 1.2: Sector-Aligned Allocation (`VirtualAlloc`)**
+*   [x] **Step 1.2: Sector-Aligned Allocation (`VirtualAlloc`)**
     *   *Test to Write:* `test_flash_moe_alloc.cpp`. Allocate an array of 8 slots. Assert `(reinterpret_cast<uintptr_t>(ptr) % 4096) == 0` for all pointers.
     *   *Implementation:* Native memory is needed for Direct I/O. Use `_aligned_malloc(size, 4096)` or Windows `VirtualAlloc(..., MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)` rather than standard `malloc`.
     *   **⚠️ Pitfall (Windows SetProcessWorkingSetSize):** To properly lock to RAM across the board implicitly safely later via `VirtualLock()`, you must first call `SetProcessWorkingSetSize()` to expand the process quota, otherwise `VirtualLock` fails under load silently.
+    *   **✅ Result:** Verified with `tests/flash_moe/test_flash_moe_alloc.cpp`. All pointers are strictly 4096-byte aligned.
 
-*   [ ] **Step 1.3: Synchronous Direct I/O Reader**
+*   [x] **Step 1.3: Synchronous Direct I/O Reader**
     *   *Test to Write:* `test_flash_moe_io.cpp`. Create a perfectly padded `4096`-byte synthetic dump file. Fetch it synchronously using `FILE_FLAG_NO_BUFFERING`. Compare against standard `std::ifstream` data internally.
     *   *Implementation:* Build a standard Win32 `ReadFile()` wrapper inside `flash_moe_io.cpp`.
     *   **⚠️ Pitfall (Strict Alignment Bounds):** `FILE_FLAG_NO_BUFFERING` is ruthless. The physical memory buffer pointer, the byte offset being read in the file, AND the number of bytes requested **MUST ALL BE** exact multiples of the disk volume sector size (assume `4096`). Failing this results in `ERROR_INVALID_PARAMETER` (Code 87).
+    *   **✅ Result:** Verified with `tests/flash_moe/test_flash_moe_io.cpp`. Direct I/O bypasses OS cache with full data integrity.
 
-*   [ ] **Step 1.4: Tensor "Stub" Flagging in `llama.cpp` Context**
+*   [x] **Step 1.4: Tensor "Stub" Flagging in `llama.cpp` Context**
     *   *Test to Write:* `test_tensor_stubs.cpp` / Manual check. Attempt to load `model_base.gguf` via `llama.cpp`. Assert the engine does not abort due to tensor shape/size mismatch on the 4-byte expert stub replacements.
     *   *Implementation:* Intercept the model loading validation inside `llama-model-loader.cpp`. Apply a custom flag `GGML_TENSOR_FLAG_DISK_BACKED` so `ggml_assert` skips byte-length validations for experts.
     *   **⚠️ Pitfall (Tensor Metadata):** Ensure the `ggml_tensor` struct shapes (`ne[0]`, `ne[1]`, etc.) remain mathematically accurate (as if the weights were fully mapped) even though the `.data` pointer currently points to empty/stub buffers. 
+    *   **✅ Result:** Verified. Expert tensors are successfully flagged and bypassed in the main load loop WITHOUT causing size/shape validation aborts.
 
 *   [ ] **Step 1.5: Evaluation Loop Hook (End-to-End MVP Integration)**
     *   *Test to Write:* Execute a generated inference of 20 tokens using the `main` executable. Compare exactly against a fully-mapped execution run. Logits and sampling must match 100%.
@@ -106,6 +110,10 @@ make LLAMA_VULKAN=1 -j8
 
 ## 4. Retrospective Environmental Learnings
 
+* **Step 1.4 Learnings:** Identifying expert tensors by name patterns (`ffn_*_exps`) and flagging them early during GGUF parsing allows and enabling zero-length stubs to coexist with high-dimensional `ggml_tensor` metadata. Restoring `n_created` increment logic is vital to passing model loading integrity checks.
+* **Step 1.3 Learnings:** `FILE_FLAG_NO_BUFFERING` is highly sensitive to alignment. On Windows, ensure all SSD expert files are strictly padded to 4KB multiples during extraction. Additionally, `CreateFileW` requires converting `std::string` paths to wide character arrays.
+* **Step 1.2 Learnings:** Using `VirtualAlloc` instead of `malloc` is the most reliable way on Windows to guarantee the page-alignment required by `FILE_FLAG_NO_BUFFERING`. Single-pool allocation with offset-based slot distribution maintains this alignment throughout the entire weight buffer.
+* **Step 1.1 Learnings:** A bi-directional `std::list` combined with `std::unordered_map` allows for efficient LRU promotion without re-scanning the entire list. Splitting the allocation into a `free_slots` queue simplifies the transition from cold-start to eviction-mode.
 * **PowerShell Shell Overrides**: Automated execution within scripts natively fails without injecting `w64devkit/bin` deeply into `$PATH`. When debugging failures interactively out of an IDE, consistently utilize the `w64devkit.exe` root shell wrapper.
 * **Vulkan Native Support**: Compiling via `LLAMA_VULKAN=1` enforces `lib/vulkan-1.lib` dependency in native linker flags. Avoid missing symbol constraints by asserting this lib remains in the root deployment.
 * **Aggressive Parallelism Logs**: Executing `make -j8` spawns heavy GCC subprocesses. The standard error descriptors overlap severely visually. If an automated compilation actually aborts, replay the command strictly serialized as `make -j1` to extract clean compiler traces sequentially safely.

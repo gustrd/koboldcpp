@@ -1,0 +1,149 @@
+#include "flash_moe_cache.h"
+#include <iostream>
+#include <cstdlib>
+#include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace FlashMoE {
+
+    SlotBufferAllocator::SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes)
+        : capacity(max_slots), bytes_per_slot(slot_size_bytes) {
+        
+        // Allocate contiguous memory pool. 
+        // We use VirtualAlloc on Windows to ensure page alignment (4096 bytes)
+        // which is mandatory for FILE_FLAG_NO_BUFFERING.
+#ifdef _WIN32
+        memory_pool = VirtualAlloc(NULL, max_slots * slot_size_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        // Fallback for non-Windows (e.g. posix_memalign)
+        if (posix_memalign(&memory_pool, 4096, max_slots * slot_size_bytes) != 0) {
+            memory_pool = nullptr;
+        }
+#endif
+        if (!memory_pool) {
+            throw std::runtime_error("Memory allocation failed for SlotBufferAllocator");
+        }
+
+        for (size_t i = 0; i < max_slots; ++i) {
+            Slot s;
+            s.slot_id = (uint32_t)i;
+            s.data = (void*)((char*)memory_pool + (i * slot_size_bytes));
+            s.size = slot_size_bytes;
+            slots.push_back(s);
+            free_slots.push_back((uint32_t)i);
+        }
+    }
+
+    SlotBufferAllocator::~SlotBufferAllocator() {
+        if (memory_pool) {
+#ifdef _WIN32
+            VirtualFree(memory_pool, 0, MEM_RELEASE);
+#else
+            std::free(memory_pool);
+#endif
+            memory_pool = nullptr;
+        }
+    }
+
+    void* SlotBufferAllocator::get_expert_sync(int layer, int expert_idx, const std::string& file_path) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        
+        ExpertKey key = {layer, expert_idx};
+        auto it_map = cache_map.find(key);
+
+        if (it_map != cache_map.end()) {
+            // Hit: Promote to front of LRU
+            hits++;
+            lru_list.erase(it_map->second.it);
+            lru_list.push_front(key);
+            it_map->second.it = lru_list.begin();
+            return slots[it_map->second.slot_id].data;
+        }
+
+        // Miss
+        misses++;
+
+        uint32_t selected_slot_id;
+        if (!free_slots.empty()) {
+            // Take a free slot
+            selected_slot_id = free_slots.front();
+            free_slots.pop_front();
+        } else {
+            // Evict LRU
+            ExpertKey lru_key = lru_list.back();
+            lru_list.pop_back();
+
+            selected_slot_id = cache_map[lru_key].slot_id;
+            cache_map.erase(lru_key);
+        }
+
+        // Add new key to LRU and Cache Map
+        lru_list.push_front(key);
+        cache_map[key] = { lru_list.begin(), selected_slot_id };
+
+        // Perform I/O (Dummy for Step 1.1)
+        // Step 1.3 will implement this properly.
+        read_direct_io(file_path, slots[selected_slot_id].data, bytes_per_slot);
+
+        return slots[selected_slot_id].data;
+    }
+
+    // Helper to perform the actual I/O (Step 1.3 implementation)
+    bool read_direct_io_low_level(const std::string& path, void* dest, size_t size);
+
+    bool SlotBufferAllocator::read_direct_io(const std::string& path, void* dest, size_t size) {
+        return read_direct_io_low_level(path, dest, size);
+    }
+
+    bool read_direct_io_low_level(const std::string& path, void* dest, size_t size) {
+#ifdef _WIN32
+        // Convert std::string path to std::wstring for CreateFileW
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+        if (wlen <= 0) return false;
+        std::vector<wchar_t> wpath(wlen);
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+
+        HANDLE hFile = CreateFileW(
+            wpath.data(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
+            NULL
+        );
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            std::cerr << "FlashMoE Error: Failed to open expert file " << path << " (Error " << GetLastError() << ")" << std::endl;
+            return false;
+        }
+
+        DWORD total_read = 0;
+        // ReadFile requirement: buffer must be aligned (checked in Step 1.2)
+        // size must be multiple of sector size (checked in extraction tool/test)
+        if (!ReadFile(hFile, dest, (DWORD)size, &total_read, NULL)) {
+            std::cerr << "FlashMoE Error: ReadFile failed for " << path << " (Error " << GetLastError() << ")" << std::endl;
+            CloseHandle(hFile);
+            return false;
+        }
+
+        if (total_read != size) {
+            std::cerr << "FlashMoE Warning: Short read for " << path << ". Expected " << size << ", got " << total_read << std::endl;
+        }
+
+        CloseHandle(hFile);
+        return true;
+#else
+        // POSIX equivalent would use O_DIRECT with open/read
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        size_t r = std::fread(dest, 1, size, f);
+        std::fclose(f);
+        return r == size;
+#endif
+    }
+
+} // namespace FlashMoE

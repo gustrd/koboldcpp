@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "flash_moe/flash_moe_manager.h"
 
 #include <algorithm>
 #include <array>
@@ -836,7 +837,8 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
 
-    if (name.find("ffn_gate_exps") != std::string::npos ||
+    if (cur->flags & GGML_TENSOR_FLAG_DISK_BACKED ||
+        name.find("ffn_gate_exps") != std::string::npos ||
         name.find("ffn_up_exps") != std::string::npos ||
         name.find("ffn_down_exps") != std::string::npos) {
         return cur;
@@ -1252,6 +1254,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
+    if (tensor->name[0] != '\0' && (strstr(tensor->name, "ffn_gate_exps") || strstr(tensor->name, "ffn_up_exps") || strstr(tensor->name, "ffn_down_exps"))) {
+        tensor->flags |= GGML_TENSOR_FLAG_DISK_BACKED;
+        FlashMoE::get_manager().register_tensor(tensor);
+    }
+
     return tensor;
 }
 
@@ -1501,8 +1508,8 @@ bool llama_model_loader::load_all_data(
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
-        if (weight == nullptr) {
-            // this can happen with split experts models
+        if (weight == nullptr || (cur->flags & GGML_TENSOR_FLAG_DISK_BACKED)) {
+            // this can happen with split experts models or Flash-MoE expert stubs
             continue;
         }
 
