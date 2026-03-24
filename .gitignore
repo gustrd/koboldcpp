@@ -145,3 +145,4 @@ conda/
 
 # Jetbrains idea folder
 .idea/
+test_*

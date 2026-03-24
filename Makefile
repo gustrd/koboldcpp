@@ -927,6 +927,54 @@ quantize_ace: otherarch/acestep/quantize-acestep.cpp tools/mtmd/clip.cpp ggml_v3
 simplecpuinfo: simplecpuinfo.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+# ─── Flash-MoE objects ────────────────────────────────────────────────────────
+FMOE_SRC = src/flash_moe
+FMOE_TEST_SRC = tests/flash_moe
+
+flash_moe_platform.o: $(FMOE_SRC)/flash_moe_platform.cpp $(FMOE_SRC)/flash_moe_platform.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+flash_moe_cache.o: $(FMOE_SRC)/flash_moe_cache.cpp $(FMOE_SRC)/flash_moe_cache.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+flash_moe_manager.o: $(FMOE_SRC)/flash_moe_manager.cpp $(FMOE_SRC)/flash_moe_manager.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ─── Flash-MoE test binaries ──────────────────────────────────────────────────
+test_flash_moe_vmem: $(FMOE_TEST_SRC)/test_flash_moe_vmem.cpp flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_flash_moe_metal_sync: $(FMOE_TEST_SRC)/test_flash_moe_metal_sync.cpp flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_flash_moe_alloc: $(FMOE_TEST_SRC)/test_flash_moe_alloc.cpp flash_moe_cache.o flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_flash_moe_lru: $(FMOE_TEST_SRC)/test_flash_moe_lru.cpp flash_moe_cache.o flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_flash_moe_io: $(FMOE_TEST_SRC)/test_flash_moe_io.cpp flash_moe_cache.o flash_moe_platform.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# ─── Umbrella: build and run all Flash-MoE tests ─────────────────────────────
+FMOE_TEST_BINS = test_flash_moe_vmem test_flash_moe_metal_sync test_flash_moe_alloc test_flash_moe_lru test_flash_moe_io
+
+test_flash_moe: $(FMOE_TEST_BINS)
+	@echo "=== Running Flash-MoE tests ==="; \
+	FAIL=0; \
+	for t in $(FMOE_TEST_BINS); do \
+		echo "--- $$t ---"; \
+		./$$t || FAIL=$$((FAIL+1)); \
+	done; \
+	if [ $$FAIL -eq 0 ]; then \
+		echo "=== All Flash-MoE tests passed ==="; \
+	else \
+		echo "=== $$FAIL Flash-MoE test(s) FAILED ==="; \
+		exit 1; \
+	fi
+
+.PHONY: test_flash_moe
+
 build-info.h:
 	$(DONOTHING)
 
