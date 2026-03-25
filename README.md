@@ -1,4 +1,48 @@
-# koboldcpp
+# koboldcpp (Flash-MoE Experimental Fork)
+
+> **⚠️ EXPERIMENTAL FORK**
+> This fork is an experimental, mostly "vibecoded" implementation of Flash-MoE for KoboldCpp.
+> It is intended to be used as a reference for handling massive MoE models natively on devices with limited RAM and is **not the original KoboldCpp**. For the official KoboldCpp, please visit the upstream repository.
+
+## 🔥 What is Flash-MoE?
+
+**Flash-MoE** (Zero-Swap Large Model Inference Engine) allows you to run massive Mixture-of-Experts (MoE) models that are larger than your available RAM (e.g. Qwen3.5-397B, Qwen3-30B-A3B) via `llama.cpp` **without** triggering OS-level disk thrashing or lockups. 
+
+Instead of loading the entire multidimensional expert weight estimators into memory:
+1. **Zero-Swap**: Expert tensors are kept completely on disk, not uploaded to the GPU during model load.
+2. **K-Slot Remapping**: Expert buffers are dynamically shrunk exactly to the number of active experts (K) needed per token.
+3. **Dynamic Loading**: An eval callback reads the MoE router output on the fly, fetching only the required cold experts via Direct I/O from SSD into an CPU/Unified LRU cache, mapping them directly into compute slots in-memory.
+4. **Prompt Batching Restrictions**: `n_batch` is forced to 1 during prompt eval to guarantee exactly K unique experts maximum per forward pass, preventing memory slot overflow.
+
+## 👉 How to Run Flash-MoE
+
+### 1. Build from Source
+**Windows (via w64devkit):**
+```bash
+make -j
+```
+
+**MacOS (via terminal):**
+```bash
+make koboldcpp_default LLAMA_METAL=1 -j$(sysctl -n hw.logicalcpu)
+```
+
+### 2. Convert and Extract Model Experts
+You need a pre-quantized MoE GGUF model. Before running the model, extract its experts into binary slots for Direct I/O using the provided script.
+```bash
+# Requires the `gguf` python package
+python flash-moe/extract_experts.py /path/to/your/model.gguf --experts-dir /path/to/experts_dir/
+```
+
+### 3. Run the Server
+Launch KoboldCpp using the extracted experts directory via the `--flashmoedir` flag. Use `--gpulayers 0` for pure CPU+SSD streaming, or specify layers to offload attention/non-MoE weights to the GPU. *(Note: `n_batch` will be automatically forced to 1).*
+
+```bash
+python koboldcpp.py --model /path/to/your/model.gguf --flashmoedir /path/to/experts_dir/ --gpulayers 0
+```
+Then navigate to `http://localhost:5001` or your configured port.
+
+---
 
 KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models, inspired by the original **KoboldAI**. It's a single self-contained distributable that builds off **llama.cpp** and adds many additional powerful features. [Download Releases Here](https://github.com/LostRuins/koboldcpp/releases/latest).
 
