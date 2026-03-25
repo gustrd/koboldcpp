@@ -2672,6 +2672,12 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         if (FlashMoE::get_manager().is_enabled()) {
             llama_ctx_params.cb_eval = FlashMoE::ExpertManager::eval_callback;
             llama_ctx_params.cb_eval_user_data = nullptr;
+            // Limit prompt eval to 1 token per forward pass so each layer needs
+            // at most K=8 unique experts. Larger batches would require loading
+            // up to n_experts (128) per layer, causing RAM swap — the opposite
+            // of what FlashMoE is for.
+            llama_ctx_params.n_batch  = 1;
+            llama_ctx_params.n_ubatch = 1;
         }
 
         llama_ctx_v4 = llama_init_from_model(llamamodel, llama_ctx_params);

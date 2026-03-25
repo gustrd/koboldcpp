@@ -23,11 +23,6 @@ namespace FlashMoE {
         int n_experts = 0;
         std::unordered_set<int> loaded_expert_ids; // experts whose data is in GPU buffer
 
-        // Slot map saved from the first projection (gate) in a forward pass.
-        // Subsequent projections (up, down) in separate splits reuse this map
-        // because ids_tensor has already been remapped to slot indices by gate's split.
-        std::unordered_map<int32_t, int32_t> pass_expert_to_slot;
-
         struct Projection {
             size_t offset; // byte offset of this projection within one expert file
             size_t bytes;  // bytes for one expert's projection
@@ -233,6 +228,18 @@ namespace FlashMoE {
                 return;
             }
 
+            // H11d diagnosis: log buffer backend name for first few writes.
+            {
+                static int buf_log_count = 0;
+                if (buf_log_count++ < 6) {
+                    const char* buf_name = ggml_backend_buffer_name(buf);
+                    fprintf(stderr, "[FlashMoE DIAG] ensure_expert_loaded L=%d exp=%d slot=%d proj=%s buf=\"%s\" nb2=%zu proj_bytes=%zu\n",
+                            layer, expert_id, slot_index, proj_key.c_str(),
+                            buf_name ? buf_name : "?",
+                            (size_t)target->nb[2], proj_info.bytes);
+                }
+            }
+
             // Phase 2.6: write to slot_index (0..K-1), not expert_id (0..127).
             size_t tensor_offset = (size_t)slot_index * proj_info.bytes;
             const void* src = (const char*)cpu_buf + proj_info.offset;
@@ -287,91 +294,61 @@ namespace FlashMoE {
         }
     }
 
-    // Helper: load experts + remap ids_tensor for one layer.
+    // Helper: load experts for one layer using identity mapping (slot = expert_id).
     // Called either from prepare_nodes (cross-split case) or eval_callback (same-split case).
     // Caller must hold manager_mutex.
     //
-    // When gate/up/down are in separate backend splits, this function is called
-    // once per split. The first call (gate) reads real expert IDs from ids_tensor,
-    // builds a slot map, loads experts, remaps ids_tensor in-place, and saves the
-    // slot map in LayerState::pass_expert_to_slot. Subsequent calls (up, down)
-    // detect that ids_tensor is already remapped (all values < max_slots) and
-    // reuse the saved slot map to load the correct experts without re-reading IDs.
+    // Identity mapping: every unique expert ID in ids_tensor is loaded into the slot
+    // at offset (expert_id * nb[2]) in the weight buffer. No remap of ids_tensor is
+    // needed — MUL_MAT_ID already indexes by expert ID. This is correct for any batch
+    // size: each token's experts are loaded wherever they naturally belong.
     static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::LayerInfo& info) {
         ggml_tensor* ids_tensor = info.ids_tensor;
         if (!ids_tensor) return;
 
-        // Determine if this is the first or subsequent projection for this layer
-        // in the current forward pass. eval_callback clears pass_expert_to_slot
-        // when new routing is computed (ffn_moe_weights fires), so:
-        //   empty   → first projection  → build slot map, load experts, remap ids
-        //   non-empty → subsequent projection → reuse saved map, load only
-        bool first_projection = g_layers[layer].pass_expert_to_slot.empty();
+        int n_ids = (int)ggml_nelements(ids_tensor);
+        std::vector<int32_t> id_values(n_ids);
+        ggml_backend_tensor_get(ids_tensor, id_values.data(), 0, n_ids * sizeof(int32_t));
 
-        if (first_projection) {
-            // === First projection for this layer in this pass ===
-            int n_ids = (int)ggml_nelements(ids_tensor);
-            std::vector<int32_t> id_values(n_ids);
-            ggml_backend_tensor_get(ids_tensor, id_values.data(), 0, n_ids * sizeof(int32_t));
+        int n_exp = g_layers[layer].n_experts;
 
-            int n_exp = g_layers[layer].n_experts;
-            int max_slots = (mgr.n_expert_used > 0) ? mgr.n_expert_used : n_exp;
+        // Collect unique valid expert IDs from this batch.
+        std::unordered_set<int32_t> unique_experts;
+        for (auto id : id_values) {
+            if (id >= 0 && id < n_exp) unique_experts.insert(id);
+        }
 
-            // Read real expert IDs, build slot map.
-            int32_t slot = 0;
-            for (auto id : id_values) {
-                if (id >= 0 && id < n_exp &&
-                    g_layers[layer].pass_expert_to_slot.find(id) == g_layers[layer].pass_expert_to_slot.end()) {
-                    if (slot >= max_slots) break;
-                    g_layers[layer].pass_expert_to_slot[id] = slot++;
-                }
-            }
-
-            // [VERIFY] Log IDs and slot assignments for first few layers.
+        // [VERIFY] Log unique expert count for first few calls.
+        {
             static int id_log_count = 0;
             if (id_log_count++ < 4) {
                 fprintf(stderr, "[FlashMoE VERIFY] L=%d ids(%d)=[", layer, n_ids);
                 for (int i = 0; i < n_ids && i < 12; ++i)
                     fprintf(stderr, "%d%s", id_values[i], i+1<n_ids&&i+1<12?",":"");
-                fprintf(stderr, "] slots={");
-                for (const auto& [eid, slt] : g_layers[layer].pass_expert_to_slot)
-                    fprintf(stderr, "%d->%d,", eid, slt);
-                fprintf(stderr, "} n_weights=%zu (first proj, real IDs)\n", info.weight_tensors.size());
+                fprintf(stderr, "] unique=%d n_weights=%zu (identity mapping)\n",
+                        (int)unique_experts.size(), info.weight_tensors.size());
             }
+        }
 
-            // Load each expert into its assigned slot.
-            for (const auto& [eid, slt] : g_layers[layer].pass_expert_to_slot) {
-                for (auto* wt : info.weight_tensors) {
-                    mgr.ensure_expert_loaded(layer, eid, wt, slt);
-                }
+        // Load each unique expert into slot = expert_id (identity mapping).
+        // MUL_MAT_ID reads src0->data + expert_id * nb[2], which matches exactly.
+        for (int32_t eid : unique_experts) {
+            for (auto* wt : info.weight_tensors) {
+                mgr.ensure_expert_loaded(layer, eid, wt, eid);
             }
+        }
 
-            // Remap IDs in ids_tensor in-place ONCE for all three projections.
+        // Clamp only truly invalid IDs (< 0 or >= n_exp) to 0.
+        // Valid IDs stay as-is — no remap needed.
+        bool needs_clamp = false;
+        for (auto id : id_values) {
+            if (id < 0 || id >= n_exp) { needs_clamp = true; break; }
+        }
+        if (needs_clamp) {
             for (auto& id : id_values) {
-                if (id >= 0 && id < n_exp) {
-                    auto it = g_layers[layer].pass_expert_to_slot.find(id);
-                    id = (it != g_layers[layer].pass_expert_to_slot.end()) ? it->second : 0;
-                } else {
-                    id = 0;  // clamp invalid/padding IDs to slot 0
-                }
+                if (id < 0 || id >= n_exp) id = 0;
             }
             ggml_backend_tensor_set(ids_tensor, id_values.data(), 0, n_ids * sizeof(int32_t));
-        } else {
-            // === Subsequent projection (up or down) — ids already remapped ===
-            // Use slot map saved from gate's pass to load experts with correct real IDs.
-
-            static int reuse_log_count = 0;
-            if (reuse_log_count++ < 4) {
-                fprintf(stderr, "[FlashMoE VERIFY] L=%d already remapped, reusing saved slot map (%zu experts) n_weights=%zu\n",
-                        layer, g_layers[layer].pass_expert_to_slot.size(), info.weight_tensors.size());
-            }
-
-            for (const auto& [eid, slt] : g_layers[layer].pass_expert_to_slot) {
-                for (auto* wt : info.weight_tensors) {
-                    mgr.ensure_expert_loaded(layer, eid, wt, slt);
-                }
-            }
-            // ids_tensor is already correctly remapped from gate's pass. No action needed.
         }
 
         info.loaded = true;
@@ -379,6 +356,16 @@ namespace FlashMoE {
 
     void ExpertManager::prepare_nodes(ggml_tensor** nodes, int n_nodes) {
         if (!enabled) return;
+
+        // H11 diagnosis: log every prepare_nodes call unconditionally (backend + node count).
+        {
+            static int pn_call = 0;
+            if (pn_call++ < 20) {
+                const char* first_name = (n_nodes > 0 && nodes[0]) ? nodes[0]->name : "(none)";
+                fprintf(stderr, "[FlashMoE DIAG] prepare_nodes call=%d n_nodes=%d first=\"%s\"\n",
+                        pn_call, n_nodes, first_name);
+            }
+        }
 
         std::lock_guard<std::mutex> lock(manager_mutex);
 
@@ -486,16 +473,6 @@ namespace FlashMoE {
             if (sscanf(suffix_pos, "ffn_moe_weights-%d", &layer) != 1) return true;
         } else {
             return true;
-        }
-
-        // Clear the per-layer slot map NOW — new routing has been computed.
-        // This ensures that when prepare_nodes later calls load_and_remap_layer
-        // for gate/up/down splits, the first call sees an empty map (= first
-        // projection) and subsequent calls see a populated map (= reuse).
-        // This is the ONLY place pass_expert_to_slot is cleared, providing a
-        // clean per-forward-pass lifecycle.
-        if (g_layers.count(layer)) {
-            g_layers[layer].pass_expert_to_slot.clear();
         }
 
         auto it_layer = mgr.current_split_layers.find(layer);
