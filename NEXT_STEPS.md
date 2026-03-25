@@ -1,58 +1,64 @@
 # Immediate Next Steps: Flash-MoE Inference Integration
 
-> [!CAUTION]
-> **CURRENT BLOCKER: Gibberish Output (Loss of Quality) during Inference**
-> During Phase 2B (CPU Smoke Test), we fixed the `ne[2]` shape mutation crash that caused a segmentation fault by keeping `ne[2]` at 128 (the original expert count) so `MUL_MAT_ID` strides remain correct. However, the model now outputs gibberish (` as the, in 2014, the latest most, by, it, that,`).
-> - **Symptoms:** The prompt generates text without crashing, but the output indicates that the loaded expert tensors are functionally random or incorrectly aligned/addressed.
-> - **Potential Causes:** 
->   1. `MUL_MAT_ID` stride calculation might be using something other than `nb[2]` for expert indexing, or the offset math `slot_index * proj_info.bytes` is misaligned for block-quantized types (like `Q4_K_M`).
->   2. The tensor data extracted by `extract_experts.py` might be corrupted or sliced incorrectly due to block-quantized memory layouts not being straightforward contiguous chunks per expert.
->   3. `eval_callback`'s `id_values` modification (remapping expert IDs to slots) might be breaking semantic pairings (e.g., if there are multiple route arrays or differently shaped routing tables like `[n_tokens, n_expert_used]`).
-> - **Action Required:** Debug the precise tensor memory layout expected by `MUL_MAT_ID` for quantized `Q4_K_M` tensors and verify that `extract_experts.py` and `ensure_expert_loaded` are mapping bytes exactly where the ggml compute kernel expects them.
+> [!NOTE]
+> **Status (2026-03-25):** CPU-only inference (`--gpulayers 0`) produces mostly coherent output. The H5 bug (up/down loading wrong experts) is fixed. Two issues remain: first-token corruption and GPU hang.
 
-## 1. Phase 2B: Real-Model Extraction & CPU Verification
-**Goal:** Verify the splintering logic and correct expert selection on a production GGUF.
+## 1. Fix: First-Token Corruption (H10) — `--gpulayers 0`
 
-- [ ] **Run Extraction on Qwen2-57B-A14B or DeepSeek-V3**:
-  - Run `python flash-moe/extract_experts.py <model.gguf> experts_dir/`.
-  - Confirm the total number of `.bin` files equals `n_layers * n_experts`.
-- [ ] **Manual Metadata Audit**:
-  - Open `experts_dir/expert_index.json`.
-  - Verify `"n_layers"`, `"n_experts"`, and `"n_expert_used"` match the model's architecture.
-  - Check that all `"file_size"` values are multiples of 4096 (Direct I/O alignment).
-- [ ] **CPU-Only Smoke Test**:
-  - Command: `python koboldcpp.py --model model.gguf --flashmoedir experts_dir/ --gpulayers 0`.
-  - Monitor logs for `"FlashMoE: Initialized"` and `"eval_callback firing"`.
-  - **Success Criteria:** Generated tokens match a baseline run (no Flash-MoE) on the same prompt/seed.
+**Symptom:** First token(s) are garbled (`"Hello\n  ofthe, id card is..."`), then output becomes coherent.
 
-## 2. Phase 2C: Vulkan Verification & Copy Tensor Invariants
-**Goal:** Ensure the inference pipeline remains synchronous when offloaded to GPU.
+**Priority:** Medium — output is usable but not production-quality.
 
-- [ ] **Vulkan-Enabled Test run**:
-  - Command: `python koboldcpp.py --model model.gguf --flashmoedir experts_dir/ --gpulayers 99 --usevulkan 0`.
-  - **Watch for:** `MUL_MAT_ID` out-of-bounds crashes. If clamping (Bug 7) works, this should not crash even if the experts are wrong.
-- [ ] **Copy Tensor Validation**:
-  - Add diagnostic logging to `FlashMoE::ExpertManager::eval_callback` to print `tensor->name` and `tensor->buffer` type.
-  - Verify that for GPU-offloaded layers, the callback is writing to the **Vulkan copy tensor** (usually named `VULKAN#...#0`), not the original CPU tensor.
-- [ ] **Race Condition Check**:
-  - Ensure `ggml-backend.cpp:1474` DISK_BACKED skip is effectively preventing the scheduler from overwriting the callback's data.
+- [ ] **Verify stride alignment**: Log `target->nb[2]` vs `proj_info.bytes` in `ensure_expert_loaded`. If they differ, MUL_MAT_ID accesses the wrong byte offsets within the K-slot buffer.
+- [ ] **Count unique experts per prompt eval**: In `load_and_remap_layer`, log how many unique experts appear in `id_values`. If >8 per layer for a 33-token prompt, excess experts are clamped to slot 0. This is a design limitation, not a bug.
+- [ ] **Test with single-token prompt**: Use `--prompt "A"` to isolate. If single-token output is correct, the issue is multi-token-specific (H10c).
+- [ ] **Test with `--noflashattention`**: This collapses splits, putting all 3 projections in one split. If first-token corruption disappears, it confirms a timing/ordering issue specific to multi-split loading.
 
-## 3. Phase 2D: Performance & Cache Tuning
-**Goal:** Optimize I/O and RAM usage for 8GB-16GB local systems.
+## 2. Fix: `--gpulayers 99` Hang (H11)
 
-- [ ] **LRU Cache Benchmarking**:
-  - Monitor memory usage vs. generation speed with different `--cache-size-mib` values.
-  - Target: Keep ~4-8 GiB of "hot" experts in RAM while the rest stream from SSD.
-- [ ] **Direct I/O Efficiency**:
-  - Use `Process Monitor` to verify that `koboldcpp.py` is issuing non-buffered reads.
-  - Confirm that Windows Defender is not intercepting these reads (add exclusion if necessary).
+**Symptom:** With all layers on Metal GPU, inference hangs indefinitely — no output.
 
-## 4. Phase 3: Asynchronous I/O Transition (If Needed)
-**Goal:** Overlap SSD reads with GPU compute to hide I/O latency.
+**Priority:** High for macOS usability.
 
-- [ ] **Pre-fetching in eval_callback**:
-  - If tokens/second is bottlenecked by SSD latency (e.g. < 0.5 tok/s), implement an asynchronous pre-fetch logic in the `eval_callback` for the *next* layer's experts while the current layer compute runs on GPU.
-  - This requires transitioning from standard `fread`/`pread` to `ReadFileEx` (Windows) or `io_uring`/`aio` (Linux/macOS).
+- [ ] **Add unconditional `prepare_nodes` entry log**: Log node count and first node's backend name for EVERY call, not just MoE splits. This reveals whether GPU splits even call `prepare_nodes`.
+- [ ] **Check if `eval_callback` ask phase fires for GPU splits**: If no `[FlashMoE DIAG] ask:` lines appear for layer tensors with `--gpulayers 99`, the Metal backend bypasses the callback loop.
+- [ ] **Log buffer type in `ensure_expert_loaded`**: Print `target->buffer` type. For GPU splits, `prepare_nodes` should capture the Metal copy tensor as `src[0]` of MUL_MAT_ID. If it captures the CPU original, `ggml_backend_tensor_set` writes to CPU memory that Metal never reads.
+- [ ] **Test with `--gpulayers 1`**: Does a single GPU layer work? This isolates whether the issue is all-GPU-specific or affects any GPU layer.
+
+## 3. Performance Baseline (After Correctness)
+
+- [ ] Measure tok/s vs baseline (no FlashMoE) on same prompt/model
+- [ ] Monitor LRU cache hit rate after warmup
+- [ ] On Windows: verify Direct I/O with Process Monitor, add Defender exclusion
+
+## 4. Async I/O (Phase 3, If Needed)
+
+Only if sync pipeline < 0.5 tok/s after cache warmup. Requires `ReadFileEx` (Windows) / `io_uring` (Linux) / GCD (macOS).
 
 ---
-**Status:** Transitioning from Phase 2A (Tooling) to Phase 2B (Smoke Tests).
+
+## Key Diagnostic Commands
+
+```bash
+# Build
+make koboldcpp_default LLAMA_METAL=1 -j$(sysctl -n hw.logicalcpu)
+
+# CPU-only with diagnostics
+python3 koboldcpp.py \
+  --model ~/_models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf \
+  --flashmoedir ~/flash_moe_experts \
+  --gpulayers 0 --debugmode 1 \
+  --prompt "Say exactly: hello" --genlimit 5 \
+  2>&1 | grep "VERIFY\|DIAG\|FlashMoE:"
+
+# GPU with diagnostics
+python3 koboldcpp.py \
+  --model ~/_models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf \
+  --flashmoedir ~/flash_moe_experts \
+  --gpulayers 99 --debugmode 1 \
+  --prompt "A" --genlimit 1 \
+  2>&1 | grep "VERIFY\|DIAG\|FlashMoE:\|prepare_nodes"
+
+# Unit tests
+make test_flash_moe
+```

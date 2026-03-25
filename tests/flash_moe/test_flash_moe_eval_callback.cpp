@@ -199,12 +199,17 @@ void test_prepare_nodes_index() {
     mgr.enabled = true;
     mgr.current_split_layers.clear();
 
-    ggml_tensor w1, w2, ids;
+    ggml_tensor w1 = {}, w2 = {}, ids = {};
     strcpy(w1.name, "blk.5.ffn_gate_exps.weight");
     strcpy(w2.name, "blk.5.ffn_up_exps.weight");
     strcpy(ids.name, "ffn_moe_topk-5");
+    // Initialize ne[] so ggml_nelements returns a sensible value
+    ids.ne[0] = 3; ids.ne[1] = 1; ids.ne[2] = 1; ids.ne[3] = 1;
 
-    ggml_tensor node, node2;
+    // Provide mock data for ids tensor (real expert IDs)
+    g_tensor_data[&ids] = {42, 99, 42};
+
+    ggml_tensor node = {}, node2 = {};
     node.op  = GGML_OP_MUL_MAT_ID; node.src[0]  = &w1; node.src[2]  = &ids;
     node2.op = GGML_OP_MUL_MAT_ID; node2.src[0] = &w2; node2.src[2] = &ids;
 
@@ -215,6 +220,9 @@ void test_prepare_nodes_index() {
     assert(mgr.current_split_layers.count(5) == 1);
     assert(mgr.current_split_layers[5].weight_tensors.size() == 2);
     assert(mgr.current_split_layers[5].ids_tensor == &ids);
+
+    // Clean up mock data
+    g_tensor_data.erase(&ids);
 
     std::cout << "  OK" << std::endl;
 }

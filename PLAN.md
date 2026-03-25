@@ -69,75 +69,48 @@ The [reference implementation](https://github.com/danveloper/flash-moe) confirms
 | **Bug 5:** prepare_nodes fires before router | ✅ Fixed (replaced by eval callback) |
 | **Bug 6:** OOM from full expert allocation | ✅ Fixed (K-slot allocation) |
 | **Bug 7:** MUL_MAT_ID OOB from -1 IDs | ✅ Fixed + verified (10 unit tests) |
+| **Bug 8 (H5):** up/down projections load wrong experts | ✅ Fixed (`pass_expert_to_slot` reuse across splits) |
 | **Tests:** 54 tests across 13 binaries | ✅ All pass on Windows/Vulkan |
+| **macOS CPU smoke test (`--gpulayers 0`)** | ⚠️ Mostly working — first-token corruption, see H10 |
+| **macOS GPU test (`--gpulayers 99`)** | ❌ Hangs — never outputs, see H11 |
 
 ---
 
 ## 4. Next Steps
 
-### Step A: Extract Expert Files from Real GGUF
+### Step A: Extract Expert Files from Real GGUF — ✅ DONE
+Extraction completed for Qwen3-30B-A3B-Instruct-2507-Q4_K_M. 48 layers x 128 experts = 6144 `.bin` files in `~/flash_moe_experts/`.
 
-```bash
-python flash-moe/extract_experts.py <path/to/Qwen3-30B-A3B.gguf> <output-dir>
-```
+### Step B: CPU Smoke Test (`--gpulayers 0`) — ⚠️ MOSTLY WORKING
 
-Verify:
-- `expert_index.json` has `n_layers`, `n_experts`, `n_expert_used=8`, proj offsets/sizes per layer.
-- File count = `n_layers × n_experts` (e.g., 48 × 128 = 6144 `.bin` files).
-- File sizes are 4KB-aligned (required for `FILE_FLAG_NO_BUFFERING`).
-- Total disk: expect 12–25 GB for Q4_K_M.
+CPU-only inference produces mostly coherent output. Expert loading pipeline verified:
+- All 48 layers x 3 projections load correctly (VERIFY: MATCH for all tested writes)
+- `pass_expert_to_slot` reuse works: gate reads real IDs, up/down reuse saved map
+- Speed: ~3 T/s (vs 24 T/s baseline — expected, disk-bound)
 
-**⚠️ Pitfalls:**
-- `extract_experts.py` imports `inspect_gguf.py` — must be in the same directory.
-- [x] `n_expert_used` and other metadata wrapped in `config` sub-object in `expert_index.json`.
-- [ ] Verify per-layer `file_size` in the index matches the actual `.bin` file sizes exactly — mismatch causes `pread` EOF errors (Bug 2 redux).
+**Remaining issue (H10):** First token(s) are corrupted (`"Hello\n  ofthe, id card is..."` instead of clean start). Likely causes:
+- Multi-token prompt eval has >8 unique experts per layer; excess clamped to slot 0
+- Or `nb[2]` stride mismatch between K-slot layout and MUL_MAT_ID expectations
 
----
+See `DEBUG_STRATEGY.md` H10 for diagnosis plan.
 
-### Step B: First Inference Smoke Test
+### Step C: GPU Inference (`--gpulayers 99`) — ❌ BLOCKED (Hang)
 
-**Run CPU-only first** (`--gpulayers 0`). This isolates expert loading from GPU/Vulkan complexity:
-```bash
-koboldcpp.py --model Qwen3-30B-A3B.gguf --flashmoedir <output-dir> --gpulayers 0
-```
-Expected log output:
-```
-FlashMoE: Initialized with 48 layers, 128 experts, K=8 slots/tensor
-FlashMoE: eval_callback firing for layer 0 (node: ffn_moe_topk-0)
-```
-If output tokens match baseline (same model, no Flash-MoE), the core pipeline is correct.
+With `--gpulayers 99`, inference hangs and never produces output.
 
-**⚠️ Pitfalls:**
-- **`koboldcpp_default.dll` link check:** Run `make LLAMA_VULKAN=1 -j8` first; confirm Flash-MoE symbols are present (`nm koboldcpp_default.dll | grep FlashMoE`).
-- **Callback not firing:** Check that `ggml_backend_sched_set_eval_callback` is called after context creation in `gpttype_adapter.cpp`. Add diagnostic: `fprintf(stderr, "FlashMoE: callback registered\n")`.
-- **Wrong tensor name format:** The node name may not contain `ffn_moe_topk` if llama.cpp renamed it. Run with `GGML_DEBUG=1` or add logging to `eval_callback`'s ask phase to see all tensor names.
-- **Layer index off by one:** The name format `ffn_moe_topk-N` uses the layer index from `llama-graph.cpp`. Verify N matches `g_layers` keys in the manager.
-- **Cache too large for iGPU:** On 16 GB Lunar Lake, model weights + 4 GiB LRU cache + Vulkan + OS may exceed RAM. Start with `--cache-size-mib 1024`.
+**Likely causes (see DEBUG_STRATEGY.md H11):**
+- Eval callback may not fire for Metal backend splits
+- `prepare_nodes` may not see MUL_MAT_ID nodes in GPU splits
+- `ensure_expert_loaded` writes to CPU tensor but MUL_MAT_ID reads Metal copy tensor
+- `ggml_backend_tensor_set` to Metal buffer may deadlock
 
----
-
-### Step C: GPU Inference (`--gpulayers 99`)
-
-Once CPU-only works, enable Vulkan compute:
-```bash
-koboldcpp.py --model Qwen3-30B-A3B.gguf --flashmoedir <output-dir> --gpulayers 99
-```
-
-**⚠️ Pitfalls:**
-- **Copy tensor identity:** The callback writes to `current_split_layers[layer].weight_tensors`. For Vulkan, `prepare_nodes` must have seen the **Vulkan copy tensor** as `src[0]` of `MUL_MAT_ID` — not the original CPU tensor. Verify tensor names in logs.
-- **DISK_BACKED skip still needed:** Confirm `ggml-backend.cpp:1474` skip is active for Vulkan build. Without it, empty CPU data races with the callback's write.
-- **Vulkan sync:** `ggml_backend_synchronize` at line 1590 must complete before the callback. This is already in code — verify it isn't optimized away.
-- **If `--gpulayers 0` works but `--gpulayers 99` doesn't:** The issue is in the copy tensor identity or the DISK_BACKED skip. Add logging to `prepare_nodes` to print weight tensor names mid-inference.
-
----
+**Diagnosis needed:** Add unconditional logging to `prepare_nodes` and check if `ask` phase fires for GPU splits.
 
 ### Step D: Performance Baseline
-
 After correctness is confirmed:
 1. Measure tokens/second vs. baseline (standard mmap, same model).
-2. Process Monitor: filter `ReadFile` on expert dir — verify `FILE_FLAG_NO_BUFFERING` handles, count opens/token.
-3. LRU hit rate: `g_cache->hits / (g_cache->hits + g_cache->misses)`. Should rise after warmup.
-4. Add expert dir to Windows Defender exclusions before benchmarking (avoids 1-5ms/open overhead).
+2. LRU hit rate: `g_cache->hits / (g_cache->hits + g_cache->misses)`. Should rise after warmup.
+3. On Windows: Process Monitor for Direct I/O verification, Defender exclusion for benchmarking.
 
 ---
 

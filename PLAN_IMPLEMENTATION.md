@@ -139,6 +139,16 @@ make test_flash_moe
 - **Invariant:** ∀ id written back: `0 <= id < K`. Slot 0 always has valid data.
 - **Test:** `test_flash_moe_bug7_oob.cpp` — 10 tests covering all clamp scenarios.
 
+### Bug 8 (H5): up/down Projections Load Wrong Experts (FIXED)
+- **Symptom:** Output is gibberish — gate projection loads correct experts, but up and down load experts 0-7 instead of the real top-K (e.g., 73, 114, 95, ...).
+- **Root cause:** Gate/up/down run in separate backend splits (Splits 4, 5, 6). Gate's `load_and_remap_layer` remaps `ids_tensor` in-place to slot indices `[0..K-1]`. When up's split calls `load_and_remap_layer`, it reads the already-remapped IDs as expert IDs.
+- **Fix:** Added `pass_expert_to_slot` map to `LayerState`. Lifecycle:
+  1. `eval_callback` fires on `ffn_moe_weights-N` → clears map (new routing computed)
+  2. First `load_and_remap_layer` (gate): `pass_expert_to_slot.empty()` → true → build map, load, remap
+  3. Subsequent calls (up, down): `pass_expert_to_slot.empty()` → false → reuse map, load only
+- **Verification:** VERIFY logs confirm all 3 projections load the same real experts with byte-level MATCH.
+- **Note:** Original DEBUG_STRATEGY.md proposed a value-based heuristic (`any id >= max_slots`), but this fails when all real expert IDs happen to be < K (e.g., {3, 7} when K=8). The `empty()` check is robust regardless of ID values.
+
 ---
 
 ## Eval Callback Design (Phase 2.7)
