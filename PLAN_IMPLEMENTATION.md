@@ -147,9 +147,11 @@ make test_flash_moe
 - **Fix:** Replaced with eval callback (Phase 2.7). See §Eval Callback Design below.
 
 ### Bug 6: OOM with Full Expert Tensor Allocation
-- **Symptom:** 17.5 GB allocation for expert tensors (`128 experts × per-expert-size × 48 layers`).
-- **Original fix:** K-slot allocation — `register_tensor` overrides `tensor->ne[2]` from 128 → K=8. Memory reduced to ~1.0 GB.
-- **Current design:** `ne[2]` stays at 128 (identity mapping). The 128-wide buffer is allocated but only K=8 experts are loaded per forward pass (n_batch=1 guarantees this). Total buffer memory is larger but no swap occurs because data is loaded on-demand from SSD.
+- **Symptom:** ~12-17.5 GB allocation for expert tensors (`128 experts × per-expert-size × 48 layers`), leading to excessive RAM footprint on Lunar Lake.
+- **History:**
+  1. **First attempt (K-Slot v1):** Shrunk `ne[2]` to K=8. Worked for gen, broke multi-token prompt eval (H10).
+  2. **Identity mapping:** Kept `ne[2]=128`, used slot=expert_id. Fixed H10 but consumed ~12 GB on Lunar Lake.
+  3. **Current (K-Slot v2 + n_batch=1):** Shrinks `ne[2]` to K=8. `eval_callback` remaps IDs in-place to `[0, K-1]`. Combined with `n_batch=1`, this guarantees at most K unique experts per pass, so slots never overflow. Memory reduced to ~5 GB.
 
 ### Bug 7: MUL_MAT_ID OOB Access (FIXED + VERIFIED)
 - **Symptom:** `access violation reading 0xFFFFFFFFFFFFFFFF` with `--gpulayers 48`.
@@ -163,11 +165,11 @@ make test_flash_moe
 - **Invariant:** ∀ id written back: `0 <= id < n_experts`. Expert 0 always has valid data loaded.
 - **Test:** `test_flash_moe_bug7_oob.cpp` — 10 tests covering all clamp scenarios.
 
-### Bug 8 (H5): up/down Projections Load Wrong Experts (FIXED, then SUPERSEDED)
+### Bug 8 (H5): up/down Projections Load Wrong Experts (FIXED)
 - **Symptom:** Gate loaded correct experts, but up/down loaded experts 0-7 instead of real top-K.
 - **Root cause:** Gate/up/down run in separate backend splits. Gate's remap changed `ids_tensor` in-place to slot indices `[0..K-1]`. Up/down read already-remapped IDs as real expert IDs.
 - **Original fix:** `pass_expert_to_slot` map saved from gate, reused by up/down.
-- **Superseded by:** Identity mapping (slot = expert_id). No remap means no split ordering issue. The entire `pass_expert_to_slot` subsystem was deleted.
+- **Current fix:** With K-slot v2, all projections in the same layer share the same `eid_to_slot` mapping built by `load_and_remap_layer`. The remap is applied once to the ids tensor before any projection reads it, so all projections see consistent slot indices.
 
 ### H10: Prompt Eval Quality Degradation (FIXED)
 - **Symptom:** First tokens garbled during prompt eval, generation tokens correct.
@@ -176,9 +178,7 @@ make test_flash_moe
   ```
   L=0 ids(264)=[73,114,95,106,...] unique=128 slots=8 clamped=120 (first proj)
   ```
-- **Fix (two parts):**
-  1. **Identity mapping** — `slot = expert_id`, no remap. All unique experts loaded into their natural positions. Correct for any batch size.
-  2. **n_batch=1** — prevents loading all 128 experts per layer during prompt eval (would cause RAM swap). Each forward pass processes 1 token × K=8 selections = 8 unique experts max.
+- **Fix:** Enforce `n_batch=1` during prompt eval. This prevents loading evaluating multiple tokens simultaneously, guaranteeing that only a maximum of K=8 valid experts are needed per forward pass.
 - **Verification:** "Say exactly the word: hello" → outputs "hello" then `<|im_end|>`. Correct.
 
 ---
@@ -186,27 +186,27 @@ make test_flash_moe
 ## How MUL_MAT_ID Addresses Experts (from `ggml-cpu.c:1599-1631`)
 
 ```c
-const int n_as = ne02;  // = 128 (full expert count, from weight tensor shape)
+const int n_as = ne02;  // = K (e.g. 8, after K-Slot optimization)
 
 // Group tokens by expert ID (from ids_tensor):
 for (iid1 = 0; iid1 < ids->ne[1]; ++iid1)     // for each token
     for (id = 0; id < n_ids; ++id)               // for each of K=8 selections
-        i02 = ids->data[iid1*ids->nb[1] + id*ids->nb[0]];  // expert ID
+        i02 = ids->data[iid1*ids->nb[1] + id*ids->nb[0]];  // REMAPPED slot index
         assert(i02 >= 0 && i02 < n_as);
         matrix_rows[i02][count[i02]++] = {id, iid1};
 
-// For each expert that has at least one token routed to it:
-for (cur_a = 0; cur_a < n_as; ++cur_a)           // loops 0..127
-    if (matrix_row_counts[cur_a] == 0) continue;  // skip unused experts
+// For each slot that has at least one token routed to it:
+for (cur_a = 0; cur_a < n_as; ++cur_a)           // loops 0..K-1
+    if (matrix_row_counts[cur_a] == 0) continue;  // skip unused slots
     src0_cur = src0->data + cur_a * nb02;         // expert data at stride offset
-    // matmul src0_cur × src1 for all tokens in this expert's group
+    // matmul src0_cur × src1 for all tokens in this slot's group
 ```
 
-Key facts for identity mapping:
-- `n_as = ne02 = 128` — kernel sees 128 expert slots.
-- With identity mapping, IDs are unchanged. Expert 73 → `src0->data + 73 * nb02`.
+Key facts for K-slot mapping:
+- `n_as = ne02 = K` (e.g. 8) — kernel only sees K expert slots, not 128.
+- IDs have been remapped by `load_and_remap_layer` to `[0, K-1]`. E.g., expert 73 → slot 2.
 - `nb02 == proj_info.bytes` confirmed at runtime (`884736` for gate/up projections).
-- Experts not needed by any token have `matrix_row_counts[i] == 0` → skipped. Stale data in those slots is never read.
+- With n_batch=1, at most K unique experts exist per pass, so all K slots are used and valid.
 
 ---
 
@@ -241,7 +241,7 @@ Key: `eval_callback` fires on `ffn_moe_weights-N` in Split 3. Then `prepare_node
 | In-graph ggml_add remap | ✗ | Mapping unknown at graph-build time |
 | **Eval callback** | ✓ | Fires per-node AFTER GET_ROWS, BEFORE MUL_MAT_ID. Serial pipeline. Works for all GPU configs. |
 
-### Execution Flow Per Layer (Identity Mapping)
+### Execution Flow Per Layer (K-Slot Mapping)
 
 ```
 ggml_get_rows executes → ffn_moe_weights = expert combination weights
@@ -255,12 +255,13 @@ eval_callback fires (ask=false) for node named "ffn_moe_weights-N":
 ↓
 load_and_remap_layer:
   1. ggml_backend_tensor_get(ids_tensor) → raw IDs [73, 114, 95, ...]
-  2. Collect unique expert IDs from batch
-  3. For each unique expert: ensure_expert_loaded(layer, eid, tensor, slot=eid)
-  4. Only clamp truly invalid IDs (< 0 or >= n_experts) to 0
-  5. If any clamped: ggml_backend_tensor_set(ids_tensor, patched)
+  2. Build eid_to_slot map: {73→0, 114→1, 95→2, ...} (up to K slots)
+  3. For each (eid, slot): ensure_expert_loaded(layer, eid, tensor, slot)
+  4. Remap ALL IDs in-place: [73, 114, 95, ...] → [0, 1, 2, ...]
+  5. Clamp invalid IDs (< 0 or >= n_experts) to 0
+  6. ggml_backend_tensor_set(ids_tensor, remapped)
 ↓
-ggml_mul_mat_id reads src0->data + expert_id * nb02 → correct expert data ✓
+ggml_mul_mat_id reads src0->data + slot_index * nb02 → correct expert data ✓
 ```
 
 ### The ggml Callback Mechanism (`ggml-backend.cpp:1603-1640`)
@@ -342,22 +343,24 @@ if (FlashMoE::get_manager().is_enabled()) {
 
 ---
 
-## Identity Mapping Details (replaced K-Slot Allocation)
+## K-Slot Mapping Details
 
 ### Evolution
-1. **Phase 2.6 (original):** `register_tensor` shrunk `ne[2]` from 128→K=8. Eval callback remapped IDs to `[0, K-1]`. Memory: ~1.0 GB. Worked for single-token generation but broke multi-token prompt eval (H10).
-2. **Current design:** `register_tensor` does NOT shrink `ne[2]`. `load_and_remap_layer` uses identity mapping (`slot = expert_id`). No remap of `ids_tensor`. n_batch=1 caps unique experts at K per pass.
+1. **Phase 2.6 v1:** `register_tensor` shrunk `ne[2]` from 128→K=8. Eval callback remapped IDs to `[0, K-1]`. Memory: ~1.0 GB. Worked for single-token generation but broke multi-token prompt eval (H10: 128 unique experts overflowed K=8 slots).
+2. **Identity mapping (temporary):** `register_tensor` did NOT shrink `ne[2]`. Used `slot = expert_id`. Fixed H10 but allocated 128 slots per layer → ~12 GB on Lunar Lake.
+3. **Phase 2.6 v2 (current):** `register_tensor` shrinks `ne[2]` to K=8. Combined with `n_batch=1`, each forward pass has at most K unique experts. `load_and_remap_layer` builds a fresh `eid_to_slot` map per call and remaps IDs in-place. No slot overflow, minimal memory.
 
 ### What was removed
-- `pass_expert_to_slot` map in `LayerState`
+- `pass_expert_to_slot` persistent map in `LayerState`
 - First/subsequent projection detection logic
 - `eval_callback` clearing `pass_expert_to_slot`
-- All ID remap logic (valid IDs pass through unchanged)
+- Verbose `[FlashMoE DIAG]` and `[FlashMoE VERIFY]` diagnostic logging
 
 ### What stays
 - `prepare_nodes` indexing (still needed to find weight tensors per split)
 - `eval_callback` clearing loaded state (still needed for per-forward-pass lifecycle)
 - `ensure_expert_loaded` (writes expert data to weight tensor at slot offset)
+- `load_and_remap_layer` with K-slot ID remapping
 - LRU cache (unchanged)
 - Invalid ID clamping (< 0 or >= n_experts → 0)
 
@@ -365,14 +368,36 @@ if (FlashMoE::get_manager().is_enabled()) {
 
 ## Performance Reference
 
+### Measured: Windows / Vulkan / Lunar Lake (CPU-only, `--gpulayers 0`)
+```
+Model: Qwen3-30B-A3B-Instruct-2507-Q4_K_M
+CtxLimit:232/8192, Amt:214/1024
+Init:     0.05s
+Process:  8.57s  (476.1 ms/T = 2.10 T/s)
+Generate: 71.10s (332.2 ms/T = 3.01 T/s)
+Total:    79.67s (2.69 T/s)
+```
+Note: GPU is NOT used for MoE computation (expert tensors forced to CPU buffer). GPU offloading is next priority.
+
+### Measured: Windows / Vulkan / Lunar Lake (GPU Offload, `--gpulayers 48`)
+```
+Model: Qwen3-30B-A3B-Instruct-2507-Q4_K_M
+CtxLimit:173/8192, Amt:155/1024
+Init:     0.05s
+Process:  10.48s (582.1 ms/T = 1.72 T/s)
+Generate: 85.89s (554.1 ms/T = 1.80 T/s)
+Total:    96.37s (1.61 T/s)
+```
+Note: Because the expert mapping logic is currently bound strictly to CPU buffers, `--gpulayers 48` forces massive copy-sync boundaries (ping-ponging) between Vulkan (attention logic) and CPU (MoE calculation) per layer. Fixing this buffer-assignment is the very next required step.
+
+### Measured: macOS / Metal (`--gpulayers 99`)
+- Generation: ~2.2 T/s
+
+### Theoretical
 **Per-token overhead (Qwen3-30B-A3B, 48 layers):**
 - 48 × `ggml_backend_synchronize` — µs each on Lunar Lake (shared memory, no PCIe fence)
 - SSD reads: K=8 × 3 projections × ~1 MB ≈ 24 MB/layer → ~1.2 GB/token gross
 - LRU cache hit rate high after warmup (experts reuse across tokens) → actual I/O << 1.2 GB
-
-**Reference (danveloper/flash-moe on Apple Silicon):**
-- GPU routing: 0.55 ms | SSD reads: 2.41 ms | Serial, not overlapped
-- Their conclusion: serial pipeline is hardware-optimal on unified-memory SoCs (SSD DMA + GPU share same memory controller)
 
 ---
 
