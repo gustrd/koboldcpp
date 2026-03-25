@@ -399,9 +399,21 @@ Built the foundational components:
     *   Corrected layer index parsing for KoboldCpp's `ffn_moe_topk-N` format.
     *   Verified `ggml_backend_sched_eval_callback` registration.
     *   **Unit Tests:** Updated `test_flash_moe_eval_callback.cpp` and `test_flash_moe_integration_wiring.cpp` to verify new naming and config format; all tests passing natively on Windows.
-*   **Bug 7: MUL_MAT_ID OOB Access.** [FIXED]
-    *   Implemented in-place expert ID remapping and clamping to `[0, K-1]` within the eval callback.
-    *   This ensures all GPU memory accesses are within bounds for the slot-allocated weight tensors.
+*   **Bug 7: MUL_MAT_ID OOB Access.** [FIXED + VERIFIED]
+    *   Implemented in-place expert ID remapping and clamping to `[0, K-1]` within `eval_callback`.
+    *   **Invariant:** Every ID written back to the selected_experts tensor satisfies `0 <= id < K`.
+      - Valid IDs (0..n_experts-1) → assigned slot (0..K-1), or clamp to 0 if no slot (>K unique experts).
+      - Padding IDs (-1 from `ggml_argsort_top_k`) → clamp to slot 0.
+      - Out-of-range IDs (>= n_experts, corrupted) → clamp to slot 0.
+    *   **Unit Tests:** `test_flash_moe_bug7_oob.cpp` — 10 dedicated tests covering:
+      - Padding IDs (-1) clamped to 0 (the `--gpulayers 48` crash scenario)
+      - Out-of-range IDs clamped to 0
+      - >K unique experts: overflow experts clamp to 0 (not raw IDs)
+      - All-padding tensor, empty tensor, K=1 edge case, n_experts=0 edge case
+      - Normal happy path: K unique experts, no clamping needed
+      - Mixed valid + invalid + padding IDs
+      - `assert_no_oob()` helper enforces the invariant on every test output.
+
 
 **Objective:** Fix Bug 6 (OOM: 17.5 GB expert tensor allocation) by reducing each projection tensor from `[h, d, n_experts=128]` to `[h, d, n_expert_used=K=8]`, and remap router IDs from raw expert IDs to slot indices so `MUL_MAT_ID` indexes into the K-slot tensor correctly.
 
@@ -459,12 +471,14 @@ The ID remapping MUST happen AFTER the router computes, not before. Options A-E 
 **Option E: In-graph ggml_add remap** — ✗ Mapping vector unknown at graph-build time; requires two-pass.
 **Option F: Eval callback (CHOSEN)** — ✓ Uses existing `ggml_backend_sched_eval_callback`. Fires per-node AFTER argsort, BEFORE MUL_MAT_ID. Serial pipeline like [reference impl](https://github.com/danveloper/flash-moe). Works for CPU and GPU layers. No graph modification. See §4.6.
 
-### Test Coverage (44 tests, 11 binaries — all pass)
+### Test Coverage (54 tests, 13 binaries — all pass)
 
 | Binary | Tests |
 |--------|-------|
-| `test_flash_moe_slot_remap` | 7 new slot/remap tests |
-| (all previous binaries) | 37 tests |
+| `test_flash_moe_slot_remap` | 7 slot/remap tests |
+| `test_flash_moe_eval_callback` | 5 eval_callback tests (ask phase, remap, padding, overflow, prepare_nodes index) |
+| `test_flash_moe_bug7_oob` | 10 dedicated Bug 7 OOB-clamp invariant tests |
+| (all previous binaries) | 32 tests |
 
 ---
 
