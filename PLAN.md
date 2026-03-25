@@ -57,7 +57,7 @@ The [reference implementation](https://github.com/danveloper/flash-moe) confirms
 | **Phase 1:** LRU cache, Direct I/O, platform abstraction, tensor flagging | ✅ Done |
 | **Phase 1.5:** Cross-platform fixes, Metal GPU-safe copies | ✅ Done |
 | **Phase 2:** End-to-end integration, expert extraction tool | ✅ Done |
-| **Phase 2.5a:** Extract experts from GGUF (`extract_experts.py`) | ⬜ Not run against real GGUF yet |
+| **Phase 2.5a:** Extract experts from GGUF (`extract_experts.py`) | ✅ Done (Updated for config sub-object) |
 | **Phase 2.5b:** `--flashmoedir` CLI flag wired through koboldcpp.py → C++ | ✅ Done |
 | **Phase 2.5c:** Flash-MoE objects linked into all koboldcpp build targets | ✅ Done |
 | **Phase 2.6:** K-slot tensor allocation (Bug 6 fix) | ✅ Done |
@@ -89,8 +89,8 @@ Verify:
 
 **⚠️ Pitfalls:**
 - `extract_experts.py` imports `inspect_gguf.py` — must be in the same directory.
-- `n_expert_used` must be added to `expert_index.json` (script should do this automatically).
-- Verify per-layer `file_size` in the index matches the actual `.bin` file sizes exactly — mismatch causes `pread` EOF errors (Bug 2 redux).
+- [x] `n_expert_used` and other metadata wrapped in `config` sub-object in `expert_index.json`.
+- [ ] Verify per-layer `file_size` in the index matches the actual `.bin` file sizes exactly — mismatch causes `pread` EOF errors (Bug 2 redux).
 
 ---
 

@@ -264,14 +264,16 @@ def extract_experts(
     n_expert_used = _get_expert_used_count(gguf_path)
 
     expert_index: dict[str, Any] = {
-        "n_layers":       n_layers,
-        "n_experts":      n_experts,
-        "token_id_base":  _token_id_base,
-        "token_id_count": n_layers * n_experts,
-        "experts":        index_entries,
+        "config": {
+            "n_layers":       n_layers,
+            "n_experts":      n_experts,
+            "token_id_base":  _token_id_base,
+            "token_id_count": n_layers * n_experts,
+        },
+        "experts": index_entries,
     }
     if n_expert_used is not None:
-        expert_index["n_expert_used"] = n_expert_used
+        expert_index["config"]["n_expert_used"] = n_expert_used
 
     index_path = experts_dir / "expert_index.json"
     index_path.write_text(json.dumps(expert_index, indent=2), encoding="utf-8")
