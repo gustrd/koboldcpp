@@ -1520,6 +1520,9 @@ bool llama_model_loader::load_all_data(
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr || (cur->flags & GGML_TENSOR_FLAG_DISK_BACKED)) {
             // this can happen with split experts models or Flash-MoE expert stubs
+            if (weight != nullptr) {
+                size_done += ggml_nbytes(cur);
+            }
             continue;
         }
 

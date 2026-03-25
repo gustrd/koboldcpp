@@ -160,5 +160,9 @@ test_flash_moe_vmem
 test_flash_moe_integration_wiring
 test_flash_moe_real_init
 test_flash_moe_variable_sizes
+test_flash_moe_bug7_oob
+test_flash_moe_eval_callback
+test_flash_moe_slot_remap
 
 .claude/
+

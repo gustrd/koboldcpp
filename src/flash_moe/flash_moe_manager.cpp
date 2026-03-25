@@ -142,15 +142,18 @@ namespace FlashMoE {
         std::lock_guard<std::mutex> lock(manager_mutex);
 
         // Phase 2.6: Slot-based allocation.
-        // Override ne[2] from n_experts (128) to n_expert_used (K=8).
-        // This must happen BEFORE ggml_backend_alloc_ctx_tensors so the allocator
-        // sizes the buffer for K slots, not 128.  Saves ~94% RAM per projection.
-        // Safe because DISK_BACKED tensors never have GGUF data loaded into them
-        // (upload is skipped at llama-model-loader.cpp:1521).
-        if (n_expert_used > 0 && tensor->ne[2] > (int64_t)n_expert_used) {
-            tensor->ne[2] = (int64_t)n_expert_used;
-            tensor->nb[3] = tensor->nb[2] * (size_t)n_expert_used;
-        }
+        // We do NOT shrink ne[2] here — the MUL_MAT_ID compute kernel
+        // must see the original expert-count shape so its internal stride
+        // math (nb[2]*id) is correct. The "K-slot" contract is enforced
+        // purely by eval_callback: it remaps selected expert IDs to the
+        // range [0, K-1] before MUL_MAT_ID runs, so only the first K
+        // columns of the weight buffer are ever accessed.
+        //
+        // The physical buffer is still fully sized by ggml_backend_alloc_ctx_tensors
+        // using the original ne[]. For the GPU copy tensor allocated by
+        // ggml_backend_sched, the same principle applies (the sched copies
+        // only the K used experts row-by-row via ensure_expert_loaded, then
+        // the remapped IDs address only those rows).
 
         // Record the tensor pointer so ensure_expert_loaded can call
         // ggml_backend_tensor_set on it later.
@@ -162,7 +165,7 @@ namespace FlashMoE {
 
         std::cout << "FlashMoE: Registered tensor " << name
                   << " (layer=" << layer << ", proj=" << proj
-                  << ", slots=" << tensor->ne[2] << ")" << std::endl;
+                  << ", ne=" << tensor->ne[0] << "x" << tensor->ne[1] << "x" << tensor->ne[2] << ")" << std::endl;
     }
 
     void ExpertManager::ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index) {
@@ -188,27 +191,56 @@ namespace FlashMoE {
             return;
         }
 
+        if (!target) {
+            std::cerr << "FlashMoE Error: ensure_expert_loaded called with null target for layer="
+                      << layer << " expert=" << expert_id << std::endl;
+            return;
+        }
+
         if (target) {
             // Write to the specific copy tensor provided by prepare_nodes.
             // Determine which projection this tensor is from its name.
+            if (!target->name) {
+                std::cerr << "FlashMoE Error: target tensor has no name for layer=" << layer << std::endl;
+                return;
+            }
             const char* name = target->name;
             std::string proj_key;
-            if (strstr(name, "ffn_gate_exps")) proj_key = "gate";
-            else if (strstr(name, "ffn_up_exps")) proj_key = "up";
+            if      (strstr(name, "ffn_gate_exps")) proj_key = "gate";
+            else if (strstr(name, "ffn_up_exps"))   proj_key = "up";
             else if (strstr(name, "ffn_down_exps")) proj_key = "down";
-            else return;
+            else {
+                // Not a MoE expert tensor? (should not happen if indexed by prepare_nodes)
+                return;
+            }
 
             auto proj_it = ls.projs.find(proj_key);
-            if (proj_it == ls.projs.end()) return;
+            if (proj_it == ls.projs.end()) {
+                std::cerr << "FlashMoE Error: Projection " << proj_key << " not found in layer " << layer << " index." << std::endl;
+                return;
+            }
             const auto& proj_info = proj_it->second;
 
             ggml_backend_buffer_t buf =
                 target->view_src ? target->view_src->buffer : target->buffer;
-            if (!buf) return;
+            if (!buf) {
+                std::cerr << "FlashMoE Error: target tensor (" << target->name << ") has no buffer!" << std::endl;
+                return;
+            }
 
             // Phase 2.6: write to slot_index (0..K-1), not expert_id (0..127).
             size_t tensor_offset = (size_t)slot_index * proj_info.bytes;
             const void* src = (const char*)cpu_buf + proj_info.offset;
+            
+            // Safety: check total bytes
+            size_t tensor_size = ggml_nbytes(target);
+            if (tensor_offset + proj_info.bytes > tensor_size) {
+                std::cerr << "FlashMoE Error: OOB write to " << target->name 
+                          << " (offset=" << tensor_offset << " bytes=" << proj_info.bytes 
+                          << " total=" << tensor_size << ")" << std::endl;
+                return;
+            }
+
             ggml_backend_tensor_set(target, src, tensor_offset, proj_info.bytes);
         } else {
             // Fallback path: write all projections to registered original tensors.
