@@ -27,4 +27,10 @@ int64_t ggml_nelements(const ggml_tensor* tensor) {
     return tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
 }
 
+size_t ggml_nbytes(const ggml_tensor* tensor) {
+    // Minimal stub: for test purposes assume 4 bytes per element
+    if (!tensor) return 0;
+    return (size_t)(tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3]) * 4;
+}
+
 } // extern "C"

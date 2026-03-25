@@ -1,12 +1,14 @@
 # Immediate Next Steps: Flash-MoE Inference Integration
 
 > [!CAUTION]
-> **CURRENT BLOCKER: Load-Time Crash (0xFFFFFFFFFFFFFFFF)**
-> During Phase 2B (CPU Smoke Test), the engine crashes during model initialization (`load_model`).
-> - **Symptoms:** Shutdown occurs during `load_tensors` phase, specifically around layer 19.
-> - **Log Clue:** `reading 0xFFFFFFFFFFFFFFFF`. This indicates a `-1` offset or invalid pointer dereference.
-> - **Initial Analysis:** The `llama-model-loader` is likely trying to read the full 128-expert data from the GGUF into the truncated 8-slot tensor allocated by `register_tensor`. Even though the tensor is marked `DISK_BACKED`, the loader's standard "copy data to buffer" loop may not be skipping it correctly, or is failing due to the size mismatch (`ne[2]` change 128 -> 8).
-> - **Action Required:** Debug `llama-model-loader.cpp`'s tensor loading loop and ensure it respects truncated/disk-backed tensors during initialization.
+> **CURRENT BLOCKER: Gibberish Output (Loss of Quality) during Inference**
+> During Phase 2B (CPU Smoke Test), we fixed the `ne[2]` shape mutation crash that caused a segmentation fault by keeping `ne[2]` at 128 (the original expert count) so `MUL_MAT_ID` strides remain correct. However, the model now outputs gibberish (` as the, in 2014, the latest most, by, it, that,`).
+> - **Symptoms:** The prompt generates text without crashing, but the output indicates that the loaded expert tensors are functionally random or incorrectly aligned/addressed.
+> - **Potential Causes:** 
+>   1. `MUL_MAT_ID` stride calculation might be using something other than `nb[2]` for expert indexing, or the offset math `slot_index * proj_info.bytes` is misaligned for block-quantized types (like `Q4_K_M`).
+>   2. The tensor data extracted by `extract_experts.py` might be corrupted or sliced incorrectly due to block-quantized memory layouts not being straightforward contiguous chunks per expert.
+>   3. `eval_callback`'s `id_values` modification (remapping expert IDs to slots) might be breaking semantic pairings (e.g., if there are multiple route arrays or differently shaped routing tables like `[n_tokens, n_expert_used]`).
+> - **Action Required:** Debug the precise tensor memory layout expected by `MUL_MAT_ID` for quantized `Q4_K_M` tensors and verify that `extract_experts.py` and `ensure_expert_loaded` are mapping bytes exactly where the ggml compute kernel expects them.
 
 ## 1. Phase 2B: Real-Model Extraction & CPU Verification
 **Goal:** Verify the splintering logic and correct expert selection on a production GGUF.

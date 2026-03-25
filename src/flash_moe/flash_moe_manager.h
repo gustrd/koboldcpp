@@ -20,6 +20,7 @@ namespace FlashMoE {
         struct LayerInfo {
             ggml_tensor* ids_tensor = nullptr;
             std::vector<ggml_tensor*> weight_tensors;
+            bool loaded = false; // true if prepare_nodes already handled loading + remap
         };
 
         std::string experts_dir;
@@ -47,6 +48,11 @@ namespace FlashMoE {
 
         bool is_enabled() const { return enabled; }
 
+        // Load expert data from disk cache and write to target tensor at slot_index.
+        // slot_index: which slot (0..n_expert_used-1) to write into (Phase 2.6).
+        // If target is nullptr, writes to the registered original tensor.
+        void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index);
+
     private:
         // Internal state for tracking loaded experts
         struct LoadedExpert {
@@ -55,11 +61,6 @@ namespace FlashMoE {
             void* ptr; // Virtual address in the reserved range
             bool is_resident;
         };
-
-        // Load expert data from disk cache and write to target tensor at slot_index.
-        // slot_index: which slot (0..n_expert_used-1) to write into (Phase 2.6).
-        // If target is nullptr, writes to the registered original tensor.
-        void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index);
     };
 
     // Global singleton for the manager

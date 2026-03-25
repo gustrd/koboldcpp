@@ -1,174 +1,237 @@
+// test_flash_moe_eval_callback.cpp
+//
+// Linked tests for ExpertManager::eval_callback and prepare_nodes.
+// These link against flash_moe_manager.cpp + ggml_stubs.cpp.
+//
+// Tests updated for the ordering fix: callback now triggers on
+// "ffn_moe_weights-N" (after GET_ROWS) instead of "ffn_moe_topk-N" (before).
+// IDs are read/written from ids_tensor (= ffn_moe_topk stored in
+// current_split_layers[layer].ids_tensor), NOT from t (= ffn_moe_weights).
+//
+// Build:
+//   clang++ -std=c++17 -I src -I ggml/include -I vendor \
+//     tests/flash_moe/test_flash_moe_eval_callback.cpp \
+//     tests/flash_moe/ggml_stubs.cpp \
+//     src/flash_moe/flash_moe_manager.cpp \
+//     src/flash_moe/flash_moe_cache.cpp \
+//     src/flash_moe/flash_moe_platform.cpp \
+//     -o /tmp/test_eval_callback && /tmp/test_eval_callback
+
 #include "../../src/flash_moe/flash_moe_manager.h"
-#include <iostream>
-#include <vector>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <unordered_map>
+#include <vector>
 
 using namespace FlashMoE;
-
 
 extern "C" {
     extern void (*g_mock_tensor_set)(ggml_tensor*, const void*, size_t, size_t);
     extern void (*g_mock_tensor_get)(const ggml_tensor*, void*, size_t, size_t);
 }
 
-// Global mocks for get/set
-std::vector<int32_t> g_mock_ids;
-void mock_set_ids(const std::vector<int32_t>& ids) { g_mock_ids = ids; }
+// Per-tensor data storage: tensor pointer → int32 data buffer.
+// Allows get/set mocks to route to the correct tensor's data.
+std::unordered_map<const ggml_tensor*, std::vector<int32_t>> g_tensor_data;
 
-void my_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    (void)tensor; (void)offset;
-    memcpy(data, g_mock_ids.data(), size);
+static void my_tensor_get(const ggml_tensor* tensor, void* data, size_t offset, size_t size) {
+    auto it = g_tensor_data.find(tensor);
+    if (it != g_tensor_data.end())
+        memcpy(data, (const char*)it->second.data() + offset, size);
 }
 
-void my_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    (void)tensor; (void)offset;
-    memcpy(g_mock_ids.data(), data, size);
+static void my_tensor_set(ggml_tensor* tensor, const void* data, size_t offset, size_t size) {
+    auto it = g_tensor_data.find(tensor);
+    if (it != g_tensor_data.end())
+        memcpy((char*)it->second.data() + offset, data, size);
 }
 
+// Write a minimal expert_index.json to dir so mgr.init() succeeds and
+// g_layers[*].n_experts is populated.
+static void write_minimal_index(const char* dir, int n_layers, int n_experts, int k) {
+    // Build JSON manually
+    std::ofstream f(std::string(dir) + "/expert_index.json");
+    f << "{\n";
+    f << "  \"config\": {"
+      << "\"n_layers\":" << n_layers << ","
+      << "\"n_experts\":" << n_experts << ","
+      << "\"n_expert_used\":" << k
+      << "},\n";
+    f << "  \"experts\": {\n";
+    // One entry per layer (expert 0) — sizes don't matter for remap tests
+    for (int l = 0; l < n_layers; ++l) {
+        f << "    \"" << l << "_0\": {"
+          << "\"file\":\"blk00_exp000.bin\","
+          << "\"file_size\":4096,"
+          << "\"gate_offset\":0,\"gate_bytes\":1024,"
+          << "\"up_offset\":1024,\"up_bytes\":1024,"
+          << "\"down_offset\":2048,\"down_bytes\":1024,"
+          << "\"dtype\":\"Q4_K\","
+          << "\"gate_shape\":[128,8],\"up_shape\":[128,8],\"down_shape\":[8,128]"
+          << "}";
+        if (l + 1 < n_layers) f << ",";
+        f << "\n";
+    }
+    f << "  }\n}\n";
+}
+
+// ─── Test 1: Ask phase trigger ────────────────────────────────────────────────
+// Fixed: trigger on "ffn_moe_weights-N", NOT "ffn_moe_topk-N".
 void test_callback_ask_phase() {
-    std::cout << "Testing eval_callback ask phase..." << std::endl;
-    
-    ggml_tensor t1;
-    strcpy(t1.name, "ffn_moe_topk-0");
-    assert(ExpertManager::eval_callback(&t1, true, nullptr) == true);
-    
-    ggml_tensor t2;
-    strcpy(t2.name, "other_tensor");
-    assert(ExpertManager::eval_callback(&t2, true, nullptr) == false);
-    
+    std::cout << "Testing eval_callback ask phase (ordering fix)..." << std::endl;
+
+    ggml_tensor t;
+
+    // Must trigger: GET_ROWS output, fires AFTER GET_ROWS uses original IDs
+    strcpy(t.name, "ffn_moe_weights-0");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == true);
+
+    strcpy(t.name, "ffn_moe_weights-23");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == true);
+
+    // Must NOT trigger: ARGSORT output — firing here would corrupt GET_ROWS
+    strcpy(t.name, "ffn_moe_topk-0");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == false);
+
+    strcpy(t.name, "ffn_moe_topk-23");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == false);
+
+    // Must NOT trigger: weight norm runs after GET_ROWS, no need to intercept again
+    strcpy(t.name, "ffn_moe_weights_norm-0");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == false);
+
+    // Must NOT trigger: unrelated tensors
+    strcpy(t.name, "other_tensor");
+    assert(ExpertManager::eval_callback(&t, true, nullptr) == false);
+
     std::cout << "  OK" << std::endl;
 }
 
-void test_callback_remap_basic() {
-    std::cout << "Testing eval_callback remap basic..." << std::endl;
-    
+// ─── Test 2: Remap reads from ids_tensor, not from t ─────────────────────────
+// t is ffn_moe_weights (F32 probs), ids_tensor is ffn_moe_topk (I32 expert IDs).
+void test_callback_remap_reads_ids_tensor() {
+    std::cout << "Testing eval_callback remap reads from ids_tensor..." << std::endl;
+
+    // Write JSON so g_layers[0].n_experts = 128
+    write_minimal_index("/tmp/mock_eval_cb", 1, 128, 8);
+
     ExpertManager& mgr = get_manager();
-    // Use a temporary experts dir for init
-    mgr.init("tests/flash_moe/mock_experts", 128); 
-    // Note: this might fail if dir doesn't exist, but we only need it to set enabled=true
-    // and n_expert_used. Let's force them for the test if init fails.
+    mgr.init("/tmp/mock_eval_cb", 128);
     mgr.enabled = true;
     mgr.n_expert_used = 8;
-    mgr.n_experts = 128;
-    mgr.n_layers = 1;
+    mgr.current_split_layers.clear();
 
-    ggml_tensor t;
-    strcpy(t.name, "ffn_moe_topk-0");
-    t.ne[0] = 3; t.ne[1] = 1; t.ne[2] = 1; t.ne[3] = 1;
-    
-    // IDs: [3, 7, 3] -> unique are {3, 7}. Map: 3->0, 7->1. Remapped: [0, 1, 0]
-    mock_set_ids({3, 7, 3});
-    
-    // We need a weight tensor in current_split_layers to avoid early return
+    // t = ffn_moe_weights (the GET_ROWS output) — callback trigger
+    ggml_tensor t_weights;
+    strcpy(t_weights.name, "ffn_moe_weights-0");
+    t_weights.ne[0] = 3; t_weights.ne[1] = 1; t_weights.ne[2] = 1; t_weights.ne[3] = 1;
+
+    // ids_tensor = ffn_moe_topk — holds expert IDs to remap
+    ggml_tensor t_ids;
+    strcpy(t_ids.name, "ffn_moe_topk-0");
+    t_ids.ne[0] = 3; t_ids.ne[1] = 1; t_ids.ne[2] = 1; t_ids.ne[3] = 1;
+
+    // IDs: [3, 7, 3] → unique: {3→0, 7→1} → remapped: [0, 1, 0]
+    g_tensor_data[&t_ids] = {3, 7, 3};
+
+    // Set up current_split_layers: ids_tensor must point to t_ids
     ggml_tensor w;
     strcpy(w.name, "blk.0.ffn_gate_exps.weight");
+    w.ne[0] = 128; w.ne[1] = 8; w.ne[2] = 128; w.ne[3] = 1;
     mgr.current_split_layers[0].weight_tensors.push_back(&w);
-    
-    // Note: eval_callback will try to call ensure_expert_loaded which calls g_cache.
-    // If g_cache is null it prints error and continues. That's fine for testing remap logic.
-    
-    bool cont = ExpertManager::eval_callback(&t, false, nullptr);
+    mgr.current_split_layers[0].ids_tensor = &t_ids;
+
+    bool cont = ExpertManager::eval_callback(&t_weights, false, nullptr);
     assert(cont == true);
-    
-    assert(g_mock_ids[0] == 0);
-    assert(g_mock_ids[1] == 1);
-    assert(g_mock_ids[2] == 0);
-    
+
+    auto& result = g_tensor_data[&t_ids];
+    assert(result[0] == 0);  // 3 → slot 0
+    assert(result[1] == 1);  // 7 → slot 1
+    assert(result[2] == 0);  // 3 → slot 0 (duplicate)
+
     std::cout << "  OK" << std::endl;
 }
 
-void test_callback_remap_padding() {
-    std::cout << "Testing eval_callback remap padding (Bug 7 fix)..." << std::endl;
-    
+// ─── Test 3: Invalid IDs clamped to slot 0 (Bug 7 regression) ────────────────
+void test_callback_remap_clamping() {
+    std::cout << "Testing eval_callback remap clamping (Bug 7)..." << std::endl;
+
     ExpertManager& mgr = get_manager();
     mgr.enabled = true;
     mgr.n_expert_used = 8;
-    
-    ggml_tensor t;
-    strcpy(t.name, "ffn_moe_topk-0");
-    t.ne[0] = 3; t.ne[1] = 1; t.ne[2] = 1; t.ne[3] = 1;
-    
-    // IDs: [3, -1, 7] -> -1 should be clamped to 0. Remapped: [0, 0, 1]
-    mock_set_ids({3, -1, 7});
-    
-    ExpertManager::eval_callback(&t, false, nullptr);
-    
-    assert(g_mock_ids[0] == 0); // 3 -> slot 0
-    assert(g_mock_ids[1] == 0); // -1 -> clamp 0
-    assert(g_mock_ids[2] == 1); // 7 -> slot 1
-    
+    mgr.current_split_layers.clear();
+
+    ggml_tensor t_weights;
+    strcpy(t_weights.name, "ffn_moe_weights-0");
+    t_weights.ne[0] = 3; t_weights.ne[1] = 1; t_weights.ne[2] = 1; t_weights.ne[3] = 1;
+
+    ggml_tensor t_ids;
+    strcpy(t_ids.name, "ffn_moe_topk-0");
+    t_ids.ne[0] = 3; t_ids.ne[1] = 1; t_ids.ne[2] = 1; t_ids.ne[3] = 1;
+
+    // -1 is padding (router), must clamp to 0
+    g_tensor_data[&t_ids] = {3, -1, 7};
+
+    ggml_tensor w;
+    strcpy(w.name, "blk.0.ffn_gate_exps.weight");
+    w.ne[0] = 128; w.ne[1] = 8; w.ne[2] = 128; w.ne[3] = 1;
+    mgr.current_split_layers[0].weight_tensors.push_back(&w);
+    mgr.current_split_layers[0].ids_tensor = &t_ids;
+
+    ExpertManager::eval_callback(&t_weights, false, nullptr);
+
+    auto& result = g_tensor_data[&t_ids];
+    assert(result[0] == 0);  // 3 → slot 0
+    assert(result[1] == 0);  // -1 → clamped to 0
+    assert(result[2] == 1);  // 7 → slot 1
+
     std::cout << "  OK" << std::endl;
 }
 
-void test_callback_remap_overflow() {
-    std::cout << "Testing eval_callback remap overflow (>K experts)..." << std::endl;
-    
-    ExpertManager& mgr = get_manager();
-    mgr.n_expert_used = 2; // Only 2 slots
-    
-    ggml_tensor t;
-    strcpy(t.name, "ffn_moe_topk-0");
-    t.ne[0] = 4; t.ne[1] = 1; t.ne[2] = 1; t.ne[3] = 1;
-    
-    // IDs: [10, 20, 30, 10] -> slots: 10->0, 20->1, 30->clamp 0. Remapped: [0, 1, 0, 0]
-    mock_set_ids({10, 20, 30, 10});
-    
-    ExpertManager::eval_callback(&t, false, nullptr);
-    
-    assert(g_mock_ids[0] == 0);
-    assert(g_mock_ids[1] == 1);
-    assert(g_mock_ids[2] == 0); // 30 overflowed slots 0,1 -> clamp 0
-    assert(g_mock_ids[3] == 0); // 10 is slot 0
-    
-    std::cout << "  OK" << std::endl;
-}
-
+// ─── Test 4: prepare_nodes indexes weight + ids tensors correctly ─────────────
 void test_prepare_nodes_index() {
     std::cout << "Testing prepare_nodes index pass..." << std::endl;
-    
+
     ExpertManager& mgr = get_manager();
     mgr.enabled = true;
     mgr.current_split_layers.clear();
-    
+
     ggml_tensor w1, w2, ids;
     strcpy(w1.name, "blk.5.ffn_gate_exps.weight");
     strcpy(w2.name, "blk.5.ffn_up_exps.weight");
-    strcpy(ids.name, "ids_tensor");
-    
-    ggml_tensor node;
-    node.op = GGML_OP_MUL_MAT_ID;
-    node.src[0] = &w1;
-    node.src[2] = &ids;
-    
-    ggml_tensor node2;
-    node2.op = GGML_OP_MUL_MAT_ID;
-    node2.src[0] = &w2;
-    node2.src[2] = &ids;
-    
+    strcpy(ids.name, "ffn_moe_topk-5");
+
+    ggml_tensor node, node2;
+    node.op  = GGML_OP_MUL_MAT_ID; node.src[0]  = &w1; node.src[2]  = &ids;
+    node2.op = GGML_OP_MUL_MAT_ID; node2.src[0] = &w2; node2.src[2] = &ids;
+
     ggml_tensor* nodes[] = { &node, &node2 };
     mgr.prepare_nodes(nodes, 2);
-    
+
     assert(mgr.current_split_layers.size() == 1);
     assert(mgr.current_split_layers.count(5) == 1);
     assert(mgr.current_split_layers[5].weight_tensors.size() == 2);
     assert(mgr.current_split_layers[5].ids_tensor == &ids);
-    
+
     std::cout << "  OK" << std::endl;
 }
 
 int main() {
-    try {
-        g_mock_tensor_get = my_tensor_get;
-        g_mock_tensor_set = my_tensor_set;
+    // Use mkdir -p equivalent via system() for the temp dir
+    system("mkdir -p /tmp/mock_eval_cb");
 
+    g_mock_tensor_get = my_tensor_get;
+    g_mock_tensor_set = my_tensor_set;
+
+    try {
         test_callback_ask_phase();
-        test_callback_remap_basic();
-        test_callback_remap_padding();
-        test_callback_remap_overflow();
+        test_callback_remap_reads_ids_tensor();
+        test_callback_remap_clamping();
         test_prepare_nodes_index();
-        std::cout << "All eval_callback tests passed!" << std::endl;
+        std::cout << "\nAll eval_callback tests passed!" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << std::endl;
         return 1;

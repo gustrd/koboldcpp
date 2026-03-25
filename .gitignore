@@ -163,6 +163,8 @@ test_flash_moe_variable_sizes
 test_flash_moe_bug7_oob
 test_flash_moe_eval_callback
 test_flash_moe_slot_remap
+test_flash_moe_ordering_fix
 
 .claude/
+
 
