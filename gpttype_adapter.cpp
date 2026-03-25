@@ -15,6 +15,7 @@
 #include "model_adapter.h"
 #include "otherarch.h"
 #include "llama.h"
+#include "flash_moe/flash_moe_manager.h"
 #include <vector>
 #include <map>
 #include <cstdint>
@@ -2667,6 +2668,11 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.swa_full = kcpp_data->swa_full;
         llama_ctx_params.type_k = (inputs.quant_k>1?GGML_TYPE_Q4_0:(inputs.quant_k==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
         llama_ctx_params.type_v = (inputs.quant_v>1?GGML_TYPE_Q4_0:(inputs.quant_v==1?GGML_TYPE_Q8_0:GGML_TYPE_F16));
+
+        if (FlashMoE::get_manager().is_enabled()) {
+            llama_ctx_params.cb_eval = FlashMoE::ExpertManager::eval_callback;
+            llama_ctx_params.cb_eval_user_data = nullptr;
+        }
 
         llama_ctx_v4 = llama_init_from_model(llamamodel, llama_ctx_params);
         if(load_guidance)

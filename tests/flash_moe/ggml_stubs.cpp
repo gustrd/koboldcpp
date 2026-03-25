@@ -5,12 +5,21 @@
 
 extern "C" {
 
+void (*g_mock_tensor_set)(ggml_tensor*, const void*, size_t, size_t) = nullptr;
+void (*g_mock_tensor_get)(const ggml_tensor*, void*, size_t, size_t) = nullptr;
+
 void ggml_backend_tensor_set(ggml_tensor* tensor, const void* data, size_t offset, size_t size) {
-    (void)tensor; (void)data; (void)offset; (void)size;
+    if (g_mock_tensor_set) {
+        g_mock_tensor_set(tensor, data, offset, size);
+        return;
+    }
 }
 
 void ggml_backend_tensor_get(const ggml_tensor* tensor, void* data, size_t offset, size_t size) {
-    (void)tensor; (void)data; (void)offset; (void)size;
+    if (g_mock_tensor_get) {
+        g_mock_tensor_get(tensor, data, offset, size);
+        return;
+    }
 }
 
 int64_t ggml_nelements(const ggml_tensor* tensor) {

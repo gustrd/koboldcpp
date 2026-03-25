@@ -66,10 +66,18 @@ namespace FlashMoE {
             enabled = false;
             return;
         }
+        if (index.empty()) {
+            std::cerr << "FlashMoE Error: Failed to parse index.json in " << dir << std::endl;
+            enabled = false;
+            return;
+        }
 
-        n_layers      = index["n_layers"];
-        n_experts     = index["n_experts"];
-        n_expert_used = index.value("n_expert_used", 0);
+        // Phase 2.6: Set default K experts for slot-based weight tensors (8 is standard for DeepSeek-V3/MoE).
+        n_expert_used = 8;
+
+        n_layers      = (int)index["config"]["n_layers"];
+        n_experts     = (int)index["config"]["n_experts"];
+        n_expert_used = index["config"].value("n_expert_used", 8);
 
         for (int l = 0; l < n_layers; ++l) {
             LayerState& ls = g_layers[l];
@@ -232,29 +240,8 @@ namespace FlashMoE {
 
         std::lock_guard<std::mutex> lock(manager_mutex);
 
-        // Phase 2.6: Slot-based loading + ID remapping.
-        //
-        // For each expert-MoE layer encountered in the node list:
-        //  1. Read the router IDs tensor to discover which experts are needed.
-        //  2. Assign each unique expert a slot index 0..K-1 (where K = n_expert_used).
-        //  3. Load each expert into its assigned slot of the weight tensor.
-        //  4. Remap the IDs tensor in-place: raw IDs → slot indices.
-        //
-        // Slot assignment is done once per layer.  All three projections (gate, up,
-        // down) for the same layer use the SAME slot mapping so their indices stay
-        // consistent.
-        //
-        // NOTE (Bug 5): In single-split mode (--gpulayers 0, pure CPU), the IDs
-        // tensor has not been computed yet when prepare_nodes runs.  In that case
-        // ggml_backend_tensor_get returns zeros → no experts loaded → output is
-        // degenerate.  The fix requires multi-split (Vulkan gpulayers > 0).
-
-        struct LayerWork {
-            std::unordered_map<int32_t, int32_t> expert_to_slot; // expert_id → slot
-            std::vector<int32_t> id_values;
-            ggml_tensor* ids_tensor = nullptr;
-        };
-        std::unordered_map<int, LayerWork> layer_work;
+        // Clear previous split's index — rebuild for this split.
+        current_split_layers.clear();
 
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor* node = nodes[i];
@@ -263,8 +250,7 @@ namespace FlashMoE {
             if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) continue;
 
             ggml_tensor* weights = node->src[0];
-            // Check DISK_BACKED flag OR name pattern (backend copies like
-            // "VLK0#blk.0.ffn_gate_exps.weight#0" lose the original flags)
+            // Check DISK_BACKED flag OR name pattern
             bool is_expert = (weights->flags & GGML_TENSOR_FLAG_DISK_BACKED) ||
                 strstr(weights->name, "ffn_gate_exps") ||
                 strstr(weights->name, "ffn_up_exps") ||
@@ -272,59 +258,102 @@ namespace FlashMoE {
             if (!is_expert) continue;
 
             // Identify layer from weights name.
-            // Original: "blk.N.ffn_..."   Backend copy: "VLK0#blk.N.ffn_...#0"
             int layer = -1;
             const char* blk_pos = strstr(weights->name, "blk.");
-            if (!blk_pos || sscanf(blk_pos, "blk.%d.", &layer) != 1) continue;
-
-            // First time we see this layer: read IDs and build the slot mapping.
-            if (layer_work.find(layer) == layer_work.end()) {
-                LayerWork& lw = layer_work[layer];
-                lw.ids_tensor = node->src[2];
-
-                // Read expert IDs safely via the backend API (works for GPU tensors).
-                lw.id_values.resize(ggml_nelements(lw.ids_tensor));
-                ggml_backend_tensor_get(lw.ids_tensor, lw.id_values.data(), 0,
-                    lw.id_values.size() * sizeof(int32_t));
-
-                // Assign slot indices 0..K-1 to unique valid expert IDs,
-                // in first-occurrence order across the entire batch.
-                int n_exp    = g_layers[layer].n_experts;
-                int max_slots = (n_expert_used > 0) ? n_expert_used : n_exp;
-                int32_t slot = 0;
-                for (auto id : lw.id_values) {
-                    if (id >= 0 && id < n_exp &&
-                        lw.expert_to_slot.find(id) == lw.expert_to_slot.end()) {
-                        if (slot >= max_slots) break; // cap at K slots
-                        lw.expert_to_slot[id] = slot++;
-                    }
+            if (blk_pos) {
+                if (sscanf(blk_pos, "blk.%d.", &layer) != 1) {
+                    // Try without trailing dot
+                    if (sscanf(blk_pos, "blk.%d", &layer) != 1) continue;
                 }
-            }
+            } else continue;
 
-            // Load each needed expert into its assigned slot in this weight tensor.
-            const LayerWork& lw = layer_work[layer];
-            for (const auto& [eid, slt] : lw.expert_to_slot) {
-                ensure_expert_loaded(layer, eid, weights, slt);
+            // Store the actual weight tensor and IDs tensor used in this split.
+            // Multiple projections for the same layer (gate/up/down) will
+            // be added to the same LayerInfo vector.
+            current_split_layers[layer].weight_tensors.push_back(weights);
+            current_split_layers[layer].ids_tensor = node->src[2];
+        }
+
+        if (!current_split_layers.empty()) {
+            std::cout << "FlashMoE: Indexed " << current_split_layers.size()
+                      << " MoE layers in current split." << std::endl;
+        }
+    }
+
+    bool ExpertManager::eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
+        (void)user_data;
+
+        // "ask" phase: should we pause after this node?
+        if (ask) {
+            // Pause after ARGSORT nodes that produce expert IDs.
+            // KoboldCpp names these "ffn_moe_topk-N" (layer suffix).
+            return (strstr(t->name, "ffn_moe_topk") != nullptr);
+        }
+
+        // "data" phase: argsort just computed, backend synchronized.
+        // t is the selected_experts tensor: [n_expert_used, n_tokens], I32.
+        ExpertManager& mgr = get_manager();
+        if (!mgr.enabled) return true;
+
+        std::lock_guard<std::mutex> lock(mgr.manager_mutex);
+
+        // 1. Extract layer number from tensor name ("ffn_moe_topk-N").
+        int layer = -1;
+        const char* suffix_pos = strstr(t->name, "ffn_moe_topk-");
+        if (suffix_pos) {
+            if (sscanf(suffix_pos, "ffn_moe_topk-%d", &layer) != 1) return true;
+        } else {
+            // Fallback for different naming (e.g. if llama.cpp changed it)
+            const char* blk_pos = strstr(t->name, "blk.");
+            if (!blk_pos || sscanf(blk_pos, "blk.%d", &layer) != 1) return true;
+        }
+
+        fprintf(stderr, "FlashMoE: eval_callback firing for layer %d (node: %s)\n", layer, t->name);
+
+        auto it_layer = mgr.current_split_layers.find(layer);
+        if (it_layer == mgr.current_split_layers.end()) {
+            // This layer was not indexed by prepare_nodes.
+            return true;
+        }
+
+        // 2. Read computed expert IDs.
+        int n_ids = (int)ggml_nelements(t);
+        std::vector<int32_t> id_values(n_ids);
+        ggml_backend_tensor_get(t, id_values.data(), 0, n_ids * sizeof(int32_t));
+
+        // 3. Build slot mapping (expert_id → slot_index, first-occurrence order).
+        std::unordered_map<int32_t, int32_t> expert_to_slot;
+        int n_exp = g_layers[layer].n_experts;
+        int max_slots = (mgr.n_expert_used > 0) ? mgr.n_expert_used : n_exp;
+        int32_t slot = 0;
+        for (auto id : id_values) {
+            if (id >= 0 && id < n_exp &&
+                expert_to_slot.find(id) == expert_to_slot.end()) {
+                if (slot >= max_slots) break;
+                expert_to_slot[id] = slot++;
             }
         }
 
-        // After all weight tensors have been filled, remap IDs for every layer.
-        // This converts raw expert IDs [42, 97, 13, ...] to slot indices [0, 1, 2, ...].
-        // The MUL_MAT_ID op indexes into the K-slot weight tensor using these remapped IDs.
-        for (auto& [layer, lw] : layer_work) {
-            if (!lw.ids_tensor || lw.id_values.empty()) continue;
-
-            int n_exp = g_layers[layer].n_experts;
-            for (auto& id : lw.id_values) {
-                if (id >= 0 && id < n_exp) {
-                    auto it = lw.expert_to_slot.find(id);
-                    id = (it != lw.expert_to_slot.end()) ? it->second : -1;
-                }
-                // Negative / out-of-range IDs stay as-is (router padding = -1).
+        // 4. Load each expert into its assigned slot for all weight tensors in this layer.
+        for (const auto& [eid, slt] : expert_to_slot) {
+            for (auto* wt : it_layer->second.weight_tensors) {
+                mgr.ensure_expert_loaded(layer, eid, wt, slt);
             }
-            ggml_backend_tensor_set(lw.ids_tensor, lw.id_values.data(), 0,
-                lw.id_values.size() * sizeof(int32_t));
         }
+
+        // 5. Remap IDs in-place: raw → slot indices.
+        // Fix for Bug 7: clamp ALL IDs to [0, K-1]. Padding/invalid IDs map to slot 0.
+        for (auto& id : id_values) {
+            if (id >= 0 && id < n_exp) {
+                auto it = expert_to_slot.find(id);
+                id = (it != expert_to_slot.end()) ? it->second : 0;
+            } else {
+                id = 0;  // clamp invalid/padding IDs to slot 0
+            }
+        }
+        ggml_backend_tensor_set(t, id_values.data(), 0, n_ids * sizeof(int32_t));
+
+        return true;  // continue execution
     }
 
 } // namespace FlashMoE

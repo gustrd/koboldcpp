@@ -287,7 +287,8 @@ Built the foundational components:
 
         **D. Windows Build Specifics**
 
-        1.  **Build command:** `make LLAMA_VULKAN=1 -j8` inside `w64devkit.exe`.
+        *   **Build System:** `w64devkit` (Bash/GCC 15.2.0).
+        *   **Build Command (PowerShell):** `$env:PATH = 'C:\Users\gustr\_git\w64devkit\bin;' + $env:PATH; make LLAMA_VULKAN=1 -j8`
         2.  **Vulkan library:** Requires `lib/vulkan-1.lib` in the build directory. The Makefile at line 434 links with `lib/vulkan-1.lib` on Windows.
         3.  **nlohmann/json.hpp dependency:** `flash_moe_manager.cpp:5` includes `nlohmann/json.hpp`. Verify this header exists in the include path. It's a single-header library — should be vendored in the repo or include path.
         4.  **Windows.h conflicts.** `flash_moe_cache.cpp` and `flash_moe_platform.cpp` include `<windows.h>`. Watch for `min`/`max` macro conflicts with `<algorithm>`. Use `#define NOMINMAX` before including `<windows.h>` if issues arise.
@@ -393,6 +394,14 @@ Built the foundational components:
 ---
 
 ## 4.5 Phase 2.6: Slot-Based Expert Tensor Allocation — PARTIALLY DONE
+*   **Phase 2.7: Serial Compute (Eval Callback).** [COMPLETED]
+    *   Implemented `ExpertManager::eval_callback` to pause execution after ARGSORT nodes.
+    *   Corrected layer index parsing for KoboldCpp's `ffn_moe_topk-N` format.
+    *   Verified `ggml_backend_sched_eval_callback` registration.
+    *   **Unit Tests:** Updated `test_flash_moe_eval_callback.cpp` and `test_flash_moe_integration_wiring.cpp` to verify new naming and config format; all tests passing natively on Windows.
+*   **Bug 7: MUL_MAT_ID OOB Access.** [FIXED]
+    *   Implemented in-place expert ID remapping and clamping to `[0, K-1]` within the eval callback.
+    *   This ensures all GPU memory accesses are within bounds for the slot-allocated weight tensors.
 
 **Objective:** Fix Bug 6 (OOM: 17.5 GB expert tensor allocation) by reducing each projection tensor from `[h, d, n_experts=128]` to `[h, d, n_expert_used=K=8]`, and remap router IDs from raw expert IDs to slot indices so `MUL_MAT_ID` indexes into the K-slot tensor correctly.
 

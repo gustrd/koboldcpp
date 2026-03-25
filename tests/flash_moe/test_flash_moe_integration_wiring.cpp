@@ -12,8 +12,10 @@ void create_dummy_index(const std::string& dir) {
     fs::create_directories(dir);
     std::ofstream f(dir + "/expert_index.json");
     f << R"({
-        "n_layers": 2,
-        "n_experts": 8,
+        "config": {
+            "n_layers": 2,
+            "n_experts": 8
+        },
         "experts": {
             "0_0": { "file_size": 32768, "gate_offset": 0, "gate_bytes": 1024, "up_offset": 1024, "up_bytes": 1024, "down_offset": 2048, "down_bytes": 1024 },
             "1_0": { "file_size": 32768, "gate_offset": 0, "gate_bytes": 1024, "up_offset": 1024, "up_bytes": 1024, "down_offset": 2048, "down_bytes": 1024 }
