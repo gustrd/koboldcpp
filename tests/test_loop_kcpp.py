@@ -52,35 +52,6 @@ class TestLoopKCPP(unittest.TestCase):
         mock_urlopen.side_effect = Exception("Connection error")
         self.assertTrue(loop_kcpp.http_contains("http://test.com", "MyWorker"))
 
-    @patch("urllib.request.urlopen")
-    def test_is_local_api_alive_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__.return_value = mock_response
-        mock_urlopen.return_value = mock_response
-
-        self.assertTrue(loop_kcpp.is_local_api_alive("http://localhost:5001"))
-
-    @patch("urllib.request.urlopen")
-    def test_is_local_api_alive_failure(self, mock_urlopen):
-        mock_urlopen.side_effect = Exception("Down")
-        self.assertFalse(loop_kcpp.is_local_api_alive("http://localhost:5001"))
-
-    @patch("psutil.Process")
-    def test_is_cpu_active(self, mock_process_cls):
-        mock_proc = MagicMock()
-        mock_process_cls.return_value = mock_proc
-        mock_popen = MagicMock(spec=subprocess.Popen)
-        mock_popen.pid = 1234
-
-        # Test active
-        mock_proc.cpu_percent.return_value = 5.0
-        self.assertTrue(loop_kcpp.is_cpu_active(mock_popen))
-
-        # Test inactive
-        mock_proc.cpu_percent.return_value = 0.5
-        self.assertFalse(loop_kcpp.is_cpu_active(mock_popen))
-
     def test_interruptible_sleep(self):
         loop_kcpp.stop_event.clear()
         # Test normal completion

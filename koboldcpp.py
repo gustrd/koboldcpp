@@ -513,13 +513,8 @@ class StdoutRedirector:
 # Contents:
 #   - _enable_windows_ansi(): Enable ANSI escape sequences on Windows consoles
 #   - debug_dark_yellow_utf(): Debug printing with color and UTF-8 safety
-#   - restart_program(): Restart the current Python process
-#   - detect_repeated_prefix(): Detect repeated substrings (for bug detection)
-#
-# See also: GRD_DEBUG section in horde worker (~line 6888) for usage example.
 # ==============================================================================
 
-GRD_REPEATED_CHARS_LIMIT = 15
 
 def _enable_windows_ansi() -> None:
     """
@@ -580,62 +575,6 @@ def debug_dark_yellow_utf(msg: str, *, file=sys.stderr, encoding: str = "utf-8",
         safe = full.encode(encoding, errors=errors).decode(encoding, errors="replace")
         print(safe, end="", file=file)
 
-def restart_program() -> None:
-    """
-    Restart the current Python program, replacing the current process with a fresh Python process
-    invoked with the same executable and the same command-line arguments.
-
-    Important: this function does not return if successful — the current process is replaced.
-    Use with care (don't call inside an interactive notebook unless you expect the kernel to be replaced).
-    """
-    python = sys.executable
-    args = [python] + sys.argv
-    # Make sure std streams are flushed before exec
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except Exception:
-        pass
-    os.execv(python, args)
-
-def detect_repeated_prefix(s: str, min_repeats: int = GRD_REPEATED_CHARS_LIMIT) -> Tuple[Optional[str], int]:
-    """
-    Detect if the string `s` begins (ignoring leading whitespace) with some substring 
-    repeated at least `min_repeats` times.
-    If found, prints the substring and how many times it appears consecutively from the start,
-    and returns (substring, count). If not found, returns (None, 0).
-
-    Strategy:
-    - Trim leading whitespace from `s`.
-    - Try candidate substring lengths from 1 up to floor(len(s) / min_repeats).
-      (If len(s) < min_repeats then no candidate possible.)
-    - For each candidate length L, take prefix = s[:L] and count how many consecutive copies
-      of prefix occur starting at index 0.
-    - Return the first (smallest L) match that yields count >= min_repeats.
-    """
-    s = s.lstrip()
-    n = len(s)
-    if n == 0 or n < min_repeats:
-        debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
-        return None, 0
-
-    max_sub_len = n // min_repeats  # a substring longer than this cannot repeat min_repeats times
-    for sub_len in range(1, max_sub_len + 1):
-        prefix = s[:sub_len]
-        count = 0
-        i = 0
-        # Count consecutive repeats of `prefix` from the beginning
-        while i + sub_len <= n and s[i:i+sub_len] == prefix:
-            count += 1
-            i += sub_len
-        if count >= min_repeats:
-            debug_dark_yellow_utf(f"Substring '{prefix}' repeated {count} times from the beginning.")
-            return prefix, count
-
-    debug_dark_yellow_utf(f"No substring repeated >= {min_repeats} times from start.")
-    return None, 0
-
-# ==============================================================================
 # END OF GRD CUSTOM EXTENSIONS
 # ==============================================================================
 
@@ -8261,23 +8200,14 @@ def run_horde_worker(args, api_key, worker_name):
         if current_generation:
 
             # ------------------------------------------------------------------
-            # GRD_DEBUG: Single-token sampling bug detection and auto-restart
+            # GRD_DEBUG: Single-token sampling bug detection
             # ------------------------------------------------------------------
             # This detects a bug where the model gets stuck generating the same
-            # token repeatedly. If detected, the program automatically restarts.
-            # Uses functions from GRD CUSTOM EXTENSIONS section (~line 408).
+            # token repeatedly.
+            # Uses functions from GRD CUSTOM EXTENSIONS section.
             # ------------------------------------------------------------------
-            try:
-                generated_string = current_generation["results"][0]["text"]
-                debug_dark_yellow_utf(generated_string)
-
-                repeated_substring, count = detect_repeated_prefix(generated_string)
-                if count >= GRD_REPEATED_CHARS_LIMIT:
-                    debug_dark_yellow_utf("ERROR: Single token sample bug detected. Restarting...")
-                    restart_program()
-            except Exception as e:
-                debug_dark_yellow_utf("DEBUG ERROR: " + str(e))
-                pass
+            generated_string = current_generation["results"][0]["text"]
+            debug_dark_yellow_utf(generated_string)
             # ------------------------------------------------------------------
 
             submit_dict = {
@@ -8290,13 +8220,6 @@ def run_horde_worker(args, api_key, worker_name):
             submit_thread.start() #submit job in new thread so nothing is waiting
         else:
             print_with_time("Error, Abandoned current job due to errors. Getting new job.")
-            # ------------------------------------------------------------------
-            # GRD_DEBUG: Auto-restart due to ARC driver bugs
-            # ------------------------------------------------------------------
-            # Intel ARC driver bugs can sometimes cause the program to get stuck
-            # or fail in ways that require a process restart to recover.
-            # ------------------------------------------------------------------
-            restart_program()
         current_id = None
         current_payload = None
         time.sleep(0.1)

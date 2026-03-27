@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import platform
 import re
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from typing import Optional
 
 import psutil  # required for reliable process tree termination
@@ -55,6 +57,63 @@ import psutil  # required for reliable process tree termination
 
 # Global tracking for the last time the worker printed something
 last_activity_time = time.time()
+
+
+def _search_json_for_string(obj, substring: str) -> bool:
+    """Recursive search for substring in JSON (keys/values)."""
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if substring.lower() in str(k).lower():
+                    return True
+                if _search_json_for_string(v, substring):
+                    return True
+        elif isinstance(obj, list):
+            for it in obj:
+                if _search_json_for_string(it, substring):
+                    return True
+        else:
+            if substring.lower() in str(obj).lower():
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def http_contains(url: str, substring: str, timeout: int = 10) -> bool:
+    """
+    Performs GET request to URL, attempts to parse JSON and searches for substring.
+    Returns False only if the substring is not found in a valid response.
+    Returns True for timeout errors (assumes worker is still online).
+    """
+
+    headers = {
+        "X-Fields": "name",
+        "User-Agent": "Mozilla/5.0",    # prevents bot blocking
+        "Accept": "application/json",   # tells server what you expect  
+    }
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                text = str(raw)
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "application/json" in content_type or text.lstrip().startswith(("{", "[")):
+                try:
+                    json_data = json.loads(text)
+                    if _search_json_for_string(json_data, substring):
+                        return True
+                except json.JSONDecodeError as e:
+                    print(f"{time.asctime()} - JSON parse error: {e}. Falling back to text search.", file=sys.stderr)
+            return substring.lower() in text.lower()
+
+    except Exception as e:
+        print(f"{time.asctime()} - HTTP error when querying {url}: {e}. Will try again.", file=sys.stderr)
+        return True
 
 
 def log(msg: str) -> None:
@@ -388,10 +447,8 @@ def main() -> None:
     parser.add_argument("--stop-kills-worker", action="store_true", help="When stopping the monitor, also terminate the worker")
     parser.add_argument("--activity-timeout", type=int, default=300, help="Seconds of silence before considering the worker stuck (default: 300)")
     
-    # Deprecated/unused arguments kept for compatibility
-    parser.add_argument("--string", help="Substring to search for (deprecated, unused)")
-    parser.add_argument("--url", help="API URL to check (deprecated, unused)")
-    parser.add_argument("--local-url", help="Local API URL (deprecated, unused)")
+    parser.add_argument("--string", default=None, help="Substring to search for in API response (worker name)")
+    parser.add_argument("--url", default="https://aihorde.net/api/v2/workers", help="API URL to check")
     
     args = parser.parse_args()
 
@@ -452,13 +509,27 @@ def main() -> None:
 
             # Check activity based on last log time
             time_since_last_log = time.time() - last_activity_time
+            is_stuck = False
+
             if time_since_last_log < args.activity_timeout:
-                log(f"Worker appears active. Last log: {int(time_since_last_log)}s ago.")
+                if args.string:
+                    if not http_contains(args.url, args.string):
+                        log(f"Worker '{args.string}' not found at {args.url}.")
+                        is_stuck = True
+                    else:
+                        log(f"Worker appears active (found '{args.string}' and active logs).")
+                else:
+                    log(f"Worker appears active. Last log: {int(time_since_last_log)}s ago.")
+            else:
+                log(f"Worker confirmed stuck (no logs for {int(time_since_last_log)}s).")
+                is_stuck = True
+
+            if not is_stuck:
                 if interruptible_sleep(args.interval, args.sleep_interval, current_proc):
                     break
                 continue
 
-            log(f"Worker confirmed stuck (no logs for {int(time_since_last_log)}s). Restarting...")
+            log("Restarting...")
             ensure_terminate_process(current_proc, timeout=8, try_graceful_windows=True, end_reason="Worker confirmed stuck (no activity)")
             current_proc = None
 
