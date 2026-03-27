@@ -2685,6 +2685,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+
+    // Flash-MoE: override K-slot count from model metadata (hparams beats expert_index.json)
+    if (hparams.n_expert_used > 0) {
+        FlashMoE::get_manager().set_n_expert_used((int)hparams.n_expert_used);
+    }
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {

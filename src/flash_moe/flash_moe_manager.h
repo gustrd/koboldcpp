@@ -30,12 +30,28 @@ namespace FlashMoE {
         int n_experts     = 0;
         int n_expert_used = 0;  // K: slots per projection tensor (Phase 2.6)
 
+        // Per-expert bias tensors (gate/up/down) — kept at full size (ne[1]=n_expert),
+        // but the first K rows are remapped before each forward pass so that
+        // ggml_add_id (which uses remapped selected_experts in [0..K-1]) picks up
+        // the correct expert biases.
+        struct BiasEntry {
+            ggml_tensor* tensor;          // original GGUF bias tensor (ne[1] = n_expert, unmodified)
+            std::vector<uint8_t> backup;  // full copy saved on first use (all n_expert rows)
+            int64_t nb1;                  // row stride in bytes (ne[0] * sizeof(dtype))
+            int n_expert;                 // total expert count (e.g. 128)
+        };
+        // layer → (proj → BiasEntry), proj ∈ {"gate", "up", "down"}
+        std::unordered_map<int, std::unordered_map<std::string, BiasEntry>> bias_tensors;
+
         std::unordered_map<ggml_tensor*, TensorState> tensor_map;
         std::unordered_map<int, LayerInfo> current_split_layers;
         std::mutex manager_mutex;
 
         // Initialize from CLI
         void init(const std::string& dir, size_t cache_mib = 4096);
+
+        // Override K from model hparams (call after init, before register_tensor)
+        void set_n_expert_used(int n);
 
         // Register a tensor to be backed by Flash-MoE
         void register_tensor(ggml_tensor* tensor);
