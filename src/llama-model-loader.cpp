@@ -1265,7 +1265,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     if (tensor->name[0] != '\0' && (strstr(tensor->name, "ffn_gate_exps") || strstr(tensor->name, "ffn_up_exps") || strstr(tensor->name, "ffn_down_exps"))) {
-        tensor->flags |= GGML_TENSOR_FLAG_DISK_BACKED;
+        if (strstr(tensor->name, ".weight") != nullptr) {
+            tensor->flags |= GGML_TENSOR_FLAG_DISK_BACKED;
+        }
         FlashMoE::get_manager().register_tensor(tensor);
     }
 
