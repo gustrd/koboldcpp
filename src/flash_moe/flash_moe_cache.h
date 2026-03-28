@@ -22,8 +22,7 @@ namespace FlashMoE {
     // Hash for ExpertKey to use in unordered_map
     struct ExpertKeyHash {
         std::size_t operator()(const ExpertKey& k) const {
-            // Simple hash combining
-            return (std::hash<int>()(k.layer) ^ (std::hash<int>()(k.expert_idx) << 1));
+            return (size_t)k.layer << 16 | (size_t)k.expert_idx;
         }
     };
 
@@ -53,7 +52,9 @@ namespace FlashMoE {
         size_t get_miss_count() const { return misses; }
         
         // Phase B: Tiered Management
+        // Phase H: Continuous Tiered Management
         void pin_experts(const std::vector<ExpertKey>& keys, const std::string& experts_dir, size_t read_size);
+        void repin_experts(const std::vector<ExpertKey>& new_top_keys, const std::string& experts_dir, size_t read_size);
         bool is_pinned(const ExpertKey& key) const;
 
     private:

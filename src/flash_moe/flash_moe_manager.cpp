@@ -45,14 +45,13 @@ namespace FlashMoE {
         return g_instance;
     }
 
-    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n) {
+    void ExpertManager::init(const std::string& dir, size_t cache_mib) {
         std::lock_guard<std::mutex> lock(manager_mutex);
         experts_dir = dir;
         cache_size_mib = cache_mib;
-        warmup_tokens = warmup_n;
         enabled = true;
         tokens_seen = 0;
-        cache_phase = CachePhase::WARMUP;
+        cache_phase = CachePhase::DYNAMIC;
 
         // Parse expert_index.json
         std::string index_path = dir + "/expert_index.json";
@@ -78,8 +77,6 @@ namespace FlashMoE {
         }
 
         // Phase 2.6: Set default K experts for slot-based weight tensors (8 is standard for DeepSeek-V3/MoE).
-        n_expert_used = 8;
-
         n_layers      = (int)index["config"]["n_layers"];
         n_experts     = (int)index["config"]["n_experts"];
         n_expert_used = index["config"].value("n_expert_used", 8);
@@ -130,6 +127,8 @@ namespace FlashMoE {
 
                 float pinned_proportion = (float)pinned_slots / (float)n_slots;
 
+                fprintf(stderr, "FlashMoE Debug: init(cache_mib=%zu) -> expert_bytes=%zu, n_slots=%zu, pinned_slots=%zu\n", 
+                        cache_size_mib, expert_bytes, n_slots, pinned_slots);
                 fprintf(stderr, "FlashMoE: Cache Config: %zu total slots (%zu MiB)\n", n_slots, cache_size_mib);
                 fprintf(stderr, "FlashMoE:   Rotating (LRU): %zu slots (sized for K=%d * %d layers)\n", rotating_slots, n_expert_used, n_layers);
                 fprintf(stderr, "FlashMoE:   Pinned Tier:    %zu slots (%.1f%% of cache)\n", pinned_slots, pinned_proportion * 100.0f);
@@ -300,23 +299,22 @@ namespace FlashMoE {
     //
     // Identity mapping: every unique expert ID in ids_tensor is loaded into the slot
     // at offset (expert_id * nb[2]) in the weight buffer. No remap of ids_tensor is
-    // needed — MUL_MAT_ID already indexes by expert ID. This is correct for any batch
-    // size: each token's experts are loaded wherever they naturally belong.
-    static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::LayerInfo& info) {
+static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::LayerInfo& info) {
         // Increment tokens_seen on layer 0; reset per-token counters
         if (layer == 0) {
             mgr.tokens_seen++;
             mgr.token_hits    = 0;
             mgr.token_misses  = 0;
             mgr.token_experts = 0;
-            if (mgr.cache_phase == CachePhase::WARMUP && mgr.tokens_seen >= 10) {
-                mgr.cache_phase = CachePhase::PROFILING;
-                fprintf(stderr, "FlashMoE: Transitioning to PROFILING phase at token %llu\n", mgr.tokens_seen);
-            } else if (mgr.cache_phase == CachePhase::PROFILING && mgr.tokens_seen >= (uint64_t)mgr.warmup_tokens) {
-                mgr.promote_highly_used_experts();
-                mgr.cache_phase = CachePhase::PINNED;
+            
+            // Continuous promotion: update the pinned tier at EVERY token.
+            // Repinning is now a delta-based operation, so it's very fast.
+            mgr.promote_highly_used_experts();
+
+            // Throttled disk save: expert_heatmap.json is only written every 10 tokens 
+            // to preserve SSD lifespan.
+            if (mgr.tokens_seen > 0 && mgr.tokens_seen % 10 == 0) {
                 mgr.save_heat_map();
-                fprintf(stderr, "FlashMoE: Warmup complete. Promotion triggered and heatmap saved.\n");
             }
         }
 
@@ -342,8 +340,8 @@ namespace FlashMoE {
             }
         }
         
-        // Phase A: Update heat map if profiling
-        if (mgr.cache_phase == CachePhase::PROFILING) {
+        // Update heat map at every token to maintain a real-time sliding window.
+        {
             std::unordered_set<int32_t> unique_ids;
             for (auto id : id_values) {
                 if (id >= 0 && id < n_exp) unique_ids.insert(id);
@@ -623,7 +621,7 @@ namespace FlashMoE {
             }
         }
         
-        g_cache->pin_experts(top_keys, experts_dir, max_expert_bytes);
+        g_cache->repin_experts(top_keys, experts_dir, max_expert_bytes);
     }
 
     void ExpertManager::save_heat_map() {
@@ -665,12 +663,10 @@ namespace FlashMoE {
             }
             fprintf(stderr, "FlashMoE: Loaded heat map from %s. Total entries: %zu\n", path.c_str(), j.size());
             
-            // If we have a significant heat map, set tokens_seen = warmup_tokens so the
-            // first call to load_and_remap_layer triggers promotion immediately.
             if (heat_map.size() > 0) {
-                cache_phase = CachePhase::PROFILING;
-                tokens_seen = (uint64_t)warmup_tokens;
-                fprintf(stderr, "FlashMoE: Heat map loaded — will promote on next token.\n");
+                fprintf(stderr, "FlashMoE: Pinning top %zu experts into RAM...\n", j.size());
+                promote_highly_used_experts();
+                fprintf(stderr, "FlashMoE: Pinning complete. %zu experts pinned.\n", j.size());
             }
         } catch (...) {
             fprintf(stderr, "FlashMoE Warning: Failed to parse %s\n", path.c_str());

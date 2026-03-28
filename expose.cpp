@@ -55,6 +55,10 @@ extern "C"
 
         executable_path = inputs.executable_path;
 
+        printf("Expose Debug: flash_moe_dir=%s, flash_moe_cache_gb=%d\n", 
+               inputs.flash_moe_dir ? inputs.flash_moe_dir : "NULL", 
+               inputs.flash_moe_cache_gb);
+
         if(file_format==FileFormat::GPTJ_1 || file_format==FileFormat::GPTJ_2 || file_format==FileFormat::GPTJ_3 || file_format==FileFormat::GPTJ_4  || file_format==FileFormat::GPTJ_5)
         {
             printf("\n---\nIdentified as Legacy GPT-J model: (ver %d)\nAttempting to Load...\n---\n", file_format);

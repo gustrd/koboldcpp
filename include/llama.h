@@ -322,7 +322,6 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
 
         const char * flash_moe_dir; // directory containing Flash-MoE expert files
-        int32_t      flash_moe_warmup; // number of tokens for expert frequency profiling
         int32_t      flash_moe_cache_gb; // total GiB for expert cache (LRU + pinned)
     };
 

@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <unordered_set>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -115,41 +117,95 @@ namespace FlashMoE {
     }
 
     void SlotBufferAllocator::pin_experts(const std::vector<ExpertKey>& keys, const std::string& experts_dir, size_t read_size) {
+        // Just call repin_experts for simplicity, they do the same thing now but efficiently.
+        repin_experts(keys, experts_dir, read_size);
+    }
+
+    void SlotBufferAllocator::repin_experts(const std::vector<ExpertKey>& new_top_keys, const std::string& experts_dir, size_t read_size) {
         std::lock_guard<std::mutex> lock(cache_mutex);
-        
-        // 1. Identify experts that were in the rotating tier but are now pinned.
-        for (const auto& key : keys) {
-            auto it = cache_map.find(key);
-            if (it != cache_map.end()) {
-                uint32_t slot_id = it->second.slot_id;
-                lru_list.erase(it->second.it);
-                cache_map.erase(it);
-                free_slots.push_front(slot_id);
+        if (pinned_capacity == 0) return;
+
+        size_t n = std::min(new_top_keys.size(), pinned_capacity);
+        std::unordered_set<ExpertKey, ExpertKeyHash> new_top_set;
+        for (size_t i = 0; i < n; ++i) {
+            new_top_set.insert(new_top_keys[i]);
+        }
+
+        // 1. Identify which currently pinned experts are being evicted from the pinned tier
+        std::vector<ExpertKey> to_evict;
+        std::vector<uint32_t> available_slots;
+        std::unordered_set<uint32_t> used_slots;
+
+        for (auto const& [key, slot_id] : pinned_map) {
+            if (new_top_set.find(key) == new_top_set.end()) {
+                to_evict.push_back(key);
+                available_slots.push_back(slot_id);
+            } else {
+                used_slots.insert(slot_id);
             }
         }
 
-        pinned_map.clear();
-        size_t n = std::min(keys.size(), pinned_capacity);
-        
-        fprintf(stderr, "FlashMoE: Pinning top %zu experts into RAM...\n", n);
-        
+        // If pinned_map was partially empty, add those slots to available_slots
+        for (uint32_t i = 0; i < (uint32_t)pinned_capacity; ++i) {
+            if (used_slots.find(i) == used_slots.end() && 
+                std::find(available_slots.begin(), available_slots.end(), i) == available_slots.end()) {
+                available_slots.push_back(i);
+            }
+        }
+
+        // 2. Identify which new experts need to be loaded
+        std::vector<ExpertKey> to_load;
         for (size_t i = 0; i < n; ++i) {
-            const ExpertKey& key = keys[i];
-            uint32_t slot_id = (uint32_t)i; // Pinned slots are [0, pinned_capacity-1]
-            
-            // Build file path
-            std::string fname = experts_dir + "/blk"
-                + (key.layer     < 10 ? "0" : "") + std::to_string(key.layer)
-                + "_exp"
-                + (key.expert_idx < 10 ? "00" : (key.expert_idx < 100 ? "0" : ""))
-                + std::to_string(key.expert_idx) + ".bin";
-            
-            if (read_direct_io(fname, slots[slot_id].data, read_size)) {
-                pinned_map[key] = slot_id;
+            const auto& key = new_top_keys[i];
+            if (pinned_map.find(key) == pinned_map.end()) {
+                to_load.push_back(key);
+            }
+        }
+
+        if (to_evict.empty() && to_load.empty()) {
+            return; // No change in pinned set
+        }
+
+        if (!to_evict.empty()) {
+            // fprintf(stderr, "FlashMoE: Evicting %zu experts from pinned tier.\n", to_evict.size());
+            for (const auto& key : to_evict) {
+                pinned_map.erase(key);
+            }
+        }
+
+        if (!to_load.empty()) {
+            // fprintf(stderr, "FlashMoE: Pinning %zu new experts.\n", to_load.size());
+            for (const auto& key : to_load) {
+                // If this expert was in rotating tier, remove it from there
+                auto it_rot = cache_map.find(key);
+                if (it_rot != cache_map.end()) {
+                    uint32_t rot_slot_id = it_rot->second.slot_id;
+                    lru_list.erase(it_rot->second.it);
+                    cache_map.erase(it_rot);
+                    free_slots.push_front(rot_slot_id);
+                }
+
+                if (available_slots.empty()) {
+                    fprintf(stderr, "FlashMoE Error: No available slots for pinning!\n");
+                    break;
+                }
+                uint32_t slot_id = available_slots.back();
+                available_slots.pop_back();
+
+                // Build file path
+                std::string fname = experts_dir + "/blk"
+                    + (key.layer     < 10 ? "0" : "") + std::to_string(key.layer)
+                    + "_exp"
+                    + (key.expert_idx < 10 ? "00" : (key.expert_idx < 100 ? "0" : ""))
+                    + std::to_string(key.expert_idx) + ".bin";
+                
+                if (read_direct_io(fname, slots[slot_id].data, read_size)) {
+                    pinned_map[key] = slot_id;
+                }
             }
         }
         
-        fprintf(stderr, "FlashMoE: Pinning complete. %zu experts pinned.\n", pinned_map.size());
+        // fprintf(stderr, "FlashMoE: Pinned tier updated. Total pinned: %zu\n", pinned_map.size());
     }
 
     // Helper to perform the actual I/O (Step 1.3 implementation)

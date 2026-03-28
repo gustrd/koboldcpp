@@ -51,10 +51,22 @@ After the first pinning, the heat map stops updating. If the user shifts topic, 
 
 ## Prioritized Backlog
 
+## Current Status (2026-03-28)
+- **Persistence Restoration**: Heatmap loading/saving is restored. `expert_heatmap.json` is correctly read at startup.
+- **Immediate Pinning**: System now attempts to pre-pin experts from the loaded heatmap before the first token.
+- **Dynamic Window**: Heatmap updates at every token (with disk flush every 10 tokens).
+
+## Active Issues
+- **Cache Config Mismatch**: Despite passing `--flashmoecachegb 5`, logs show `0 MiB` and only `384` slots (the floor size). This suggests a struct alignment or value passing issue between Python (`koboldcpp.py`) and C++ (`expose.h`).
+- **Warmup Misses**: First token shows 0% hits due to random paths taken by the 34 dummy warmup tokens used by `gpttype_adapter.cpp`.
+- **Memory Usage**: Total process RAM is lower than expected (4.2GB vs expected >5GB), confirming the cache budget isn't being applied.
+
+## Todo List
+
 | Priority | Task | Effort | Files |
 |----------|------|--------|-------|
 | ✅ Done | Unify cache params: `--flashmoecachegb`, sizes, and floor limits | 1h | `koboldcpp.py`, `expose.h`, `include/llama.h`, `src/llama-model.cpp`, `flash_moe_manager.cpp` |
-| 🔴 Critical | Phase H: Sliding Window Heat Map (continuous repin) | 2–3 days | `koboldcpp.py`, `expose.h`, `gpttype_adapter.cpp`, `llama-model.cpp`, `flash_moe_*.cpp/h` |
+| 🟢 Done | Phase H: Continuous Sliding Window Heat Map | 4h | `flash_moe_manager.cpp`, `koboldcpp.py`, `expose.h`, `gpttype_adapter.cpp`, `llama-model.cpp`, `flash_moe_*.cpp/h` |
 | 🟡 High | Phase E: File Handle Pooling | 1–2 days | new files + `flash_moe_cache.cpp` |
 | 🔵 Low | GPU-side pinning (Phase G) | 3+ days | depends on GPU offload |
 
