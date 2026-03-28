@@ -63,6 +63,11 @@ namespace FlashMoE {
         
         // layer -> (expert_id -> heat)
         std::unordered_map<int, std::unordered_map<int, ExpertHeatEntry>> heat_map;
+
+        // Per-token stats (reset on layer 0, printed on last layer)
+        int token_hits    = 0;  // experts served from cache (no disk read)
+        int token_misses  = 0;  // experts loaded from SSD
+        int token_experts = 0;  // total unique experts this token
         
         std::mutex manager_mutex;
 
@@ -74,6 +79,8 @@ namespace FlashMoE {
         
         void update_heat_map(int layer, int expert_id);
         void promote_highly_used_experts();
+        void save_heat_map();
+        void load_heat_map();
 
         // Register a tensor to be backed by Flash-MoE
         void register_tensor(ggml_tensor* tensor);
@@ -90,9 +97,6 @@ namespace FlashMoE {
         // slot_index: which slot (0..n_expert_used-1) to write into (Phase 2.6).
         // If target is nullptr, writes to the registered original tensor.
         void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index);
-
-        // Update heat map for an expert access
-        void update_heat_map(int layer, int expert_id);
 
     private:
         // Internal state for tracking loaded experts

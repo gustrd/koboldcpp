@@ -191,12 +191,9 @@ namespace FlashMoE {
             return false;
         }
 
-        if (total_read != size) {
-            std::cerr << "FlashMoE Warning: Short read for " << path << ". Expected " << size << ", got " << total_read << std::endl;
-        }
-
+        // Short read is OK: file may be smaller than slot (pinning uses max_expert_bytes).
         CloseHandle(hFile);
-        return true;
+        return total_read > 0;
 #elif defined(__APPLE__)
         // macOS: F_NOCACHE advises the kernel to bypass the buffer cache.
         // Unlike FILE_FLAG_NO_BUFFERING, this is advisory — it silently falls
@@ -205,18 +202,22 @@ namespace FlashMoE {
         if (fd < 0) return false;
         fcntl(fd, F_NOCACHE, 1);
         size_t total = 0;
-        // Loop to handle short reads (e.g. APFS extent boundaries)
+        // Loop to handle short reads (e.g. APFS extent boundaries).
+        // r == 0 means EOF — file is smaller than the slot buffer (e.g. pinning uses
+        // max_expert_bytes but each layer's files can be smaller). That's fine:
+        // ensure_expert_loaded only accesses proj_info.offset+bytes which fit in the file.
         while (total < size) {
             ssize_t r = pread(fd, (char*)dest + total, size - total, (off_t)total);
-            if (r <= 0) {
+            if (r < 0) {
                 std::cerr << "FlashMoE Error: pread failed for " << path << std::endl;
                 close(fd);
                 return false;
             }
+            if (r == 0) break; // EOF — file smaller than slot, OK
             total += (size_t)r;
         }
         close(fd);
-        return true;
+        return total > 0;
 #else
         // Linux: O_DIRECT requires 512-byte aligned buffer/offset/size.
         // Fall back to buffered I/O for now (fix in a future step if needed).
@@ -224,7 +225,7 @@ namespace FlashMoE {
         if (!f) return false;
         size_t r = std::fread(dest, 1, size, f);
         std::fclose(f);
-        return r == size;
+        return r > 0; // short read OK: file may be smaller than slot buffer
 #endif
     }
 

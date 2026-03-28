@@ -270,50 +270,7 @@ namespace FlashMoE {
             return;
         }
 
-        // Step 2 (OSS_FIX.md): Stride diagnostic — proj_info.bytes must equal nb[2].
-        // If they differ, expert data lands at wrong offsets within the tensor.
-        {
-            static std::atomic<int> stride_diag_count{0};
-            int sdc = stride_diag_count++;
-            if (sdc < 9) {
-                size_t tensor_nb2 = (size_t)target->nb[2];
-                bool match = (proj_info.bytes == tensor_nb2);
-                fprintf(stderr, "[FlashMoE STRIDE] L=%d E=%d slot=%d %s: proj_bytes=%zu nb[2]=%zu nb[1]=%zu ne[1]=%ld type=%s %s\n",
-                        layer, expert_id, slot_index, proj_key.c_str(),
-                        proj_info.bytes, tensor_nb2,
-                        (size_t)target->nb[1], (long)target->ne[1],
-                        ggml_type_name(target->type),
-                        match ? "OK" : "MISMATCH <<<");
-            }
-        }
-
-        // Step 3 (OSS_FIX.md): Dump raw source bytes for byte-perfect verification.
-        {
-            static std::atomic<int> src_dump_count{0};
-            int sdc = src_dump_count++;
-            if (sdc < 3) {
-                const uint8_t* b = (const uint8_t*)src;
-                size_t n = std::min(proj_info.bytes, (size_t)16);
-                fprintf(stderr, "[FlashMoE SRC] L=%d E=%d %s: src[0..%zu]=", layer, expert_id, proj_key.c_str(), n - 1);
-                for (size_t i = 0; i < n; i++) fprintf(stderr, "%02x ", b[i]);
-                fprintf(stderr, "\n");
-            }
-        }
-
         ggml_backend_tensor_set(target, src, tensor_offset, proj_info.bytes);
-
-        // Phase 3 diagnostic: verify first few bytes of written data look sane.
-        static std::atomic<int> verify_count{0};
-        int vc = ++verify_count;
-        if (vc <= 3) {
-            // Read back 4 bytes to check for all-zero or plausibly non-zero data.
-            uint8_t sample[4] = {};
-            size_t to_read = std::min(sizeof(sample), proj_info.bytes);
-            ggml_backend_tensor_get(target, sample, tensor_offset, to_read);
-            fprintf(stderr, "[FlashMoE VERIFY] L=%d E=%d slot=%d %s: first_bytes=[%02x %02x %02x %02x]\n",
-                    layer, expert_id, slot_index, proj_key.c_str(),
-                    sample[0], sample[1], sample[2], sample[3]);
-        }
 
         ls.loaded_expert_ids.insert(expert_id);
     }
@@ -327,9 +284,12 @@ namespace FlashMoE {
     // needed — MUL_MAT_ID already indexes by expert ID. This is correct for any batch
     // size: each token's experts are loaded wherever they naturally belong.
     static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::LayerInfo& info) {
-        // Increment tokens_seen on layer 0 to track progression
+        // Increment tokens_seen on layer 0; reset per-token counters
         if (layer == 0) {
             mgr.tokens_seen++;
+            mgr.token_hits    = 0;
+            mgr.token_misses  = 0;
+            mgr.token_experts = 0;
             if (mgr.cache_phase == CachePhase::WARMUP && mgr.tokens_seen >= 10) {
                 mgr.cache_phase = CachePhase::PROFILING;
                 fprintf(stderr, "FlashMoE: Transitioning to PROFILING phase at token %llu\n", mgr.tokens_seen);
@@ -350,26 +310,15 @@ namespace FlashMoE {
 
         int n_exp = g_layers[layer].n_experts;
 
-        // One-time per-layer expert selection diagnostic (first 3 forward passes × layer 0 only)
-        {
-            static std::atomic<int> sel_diag_count{0};
-            if (layer == 0 && sel_diag_count++ < 3) {
-                fprintf(stderr, "[FlashMoE SEL] L=%d ids(%d):", layer, n_ids);
-                for (int i = 0; i < std::min(n_ids, 16); i++)
-                    fprintf(stderr, " %d", id_values[i]);
-                fprintf(stderr, "\n");
-            }
-        }
-
-        // Phase 4: K-overflow diagnostic.
-        // Count distinct valid IDs and warn if they exceed n_expert_used (slot count).
+        // K-overflow guard: if more distinct IDs than slots, excess maps to slot 0.
+        // This shouldn't happen with n_batch=1; warn once if it does.
         {
             std::unordered_set<int32_t> distinct;
             for (auto id : id_values)
                 if (id >= 0 && id < n_exp) distinct.insert(id);
             static std::atomic<int> k_warn_count{0};
             if ((int)distinct.size() > mgr.n_expert_used && k_warn_count++ < 3) {
-                fprintf(stderr, "[FlashMoE WARN] L=%d: %zu distinct expert IDs > n_expert_used=%d — slots overflow, excess mapped to slot 0!\n",
+                fprintf(stderr, "FlashMoE WARN: L=%d: %zu expert IDs > n_expert_used=%d — excess mapped to slot 0\n",
                         layer, distinct.size(), mgr.n_expert_used);
             }
         }
@@ -403,11 +352,31 @@ namespace FlashMoE {
             }
         }
 
-        // Load experts into assigned slots
+        // Load experts into assigned slots; track cache hits vs SSD loads.
+        // A full cache hit = all n_projections calls to get_expert_sync return cached data
+        // (delta == weight_tensors.size()). A cold miss = first call loads from disk with
+        // no hit increment; 2nd/3rd calls hit the freshly-loaded LRU entry, so delta < size.
+        int n_projs = (int)info.weight_tensors.size();
         for (auto const& [eid, slot] : eid_to_slot) {
+            size_t hits_before = g_cache->get_hit_count();
             for (auto* wt : info.weight_tensors) {
                 mgr.ensure_expert_loaded(layer, eid, wt, slot);
             }
+            mgr.token_experts++;
+            int delta = (int)(g_cache->get_hit_count() - hits_before);
+            if (delta >= n_projs) {
+                mgr.token_hits++;
+            } else {
+                mgr.token_misses++;
+            }
+        }
+
+        // Print per-token summary on the last layer
+        if (layer == mgr.n_layers - 1) {
+            int total = mgr.token_hits + mgr.token_misses;
+            int pct = total > 0 ? (mgr.token_hits * 100 / total) : 0;
+            fprintf(stderr, "[FlashMoE] tok=%llu  %d%% cache hits\n",
+                    mgr.tokens_seen, pct);
         }
 
         // Remap IDs in-place to point to SLOTS [0, K-1] instead of global expert IDs
@@ -434,16 +403,6 @@ namespace FlashMoE {
                 if (slot >= 0 && slot < K) slot_to_eid[slot] = eid;
             }
 
-            // Diagnostic: log slot mapping for first few calls
-            {
-                static std::atomic<int> map_diag_count{0};
-                if (layer == 0 && map_diag_count++ < 3) {
-                    fprintf(stderr, "[FlashMoE BIAS_MAP] L=%d slot_to_eid:", layer);
-                    for (int s = 0; s < K; s++) fprintf(stderr, " %d->e%d", s, slot_to_eid[s]);
-                    fprintf(stderr, "\n");
-                }
-            }
-
             auto bias_layer_it = mgr.bias_tensors.find(layer);
             if (bias_layer_it != mgr.bias_tensors.end()) {
                 for (auto& [proj, entry] : bias_layer_it->second) {
@@ -454,20 +413,6 @@ namespace FlashMoE {
                         size_t full_bytes = ggml_nbytes(entry.tensor);
                         entry.backup.resize(full_bytes);
                         ggml_backend_tensor_get(entry.tensor, entry.backup.data(), 0, full_bytes);
-
-                        // Diagnostic: log tensor type, size, and computed vs actual bytes
-                        size_t computed_bytes = (size_t)entry.n_expert * (size_t)entry.nb1;
-                        fprintf(stderr, "[FlashMoE BIAS_INIT] L=%d %s: type=%s ne=[%ld,%d] nb=[%ld,%ld] "
-                                "ggml_nbytes=%zu computed=%zu %s backup_first8=",
-                                layer, proj.c_str(),
-                                ggml_type_name(entry.tensor->type),
-                                (long)entry.tensor->ne[0], entry.n_expert,
-                                (long)entry.tensor->nb[0], (long)entry.nb1,
-                                full_bytes, computed_bytes,
-                                (full_bytes == computed_bytes) ? "OK" : "MISMATCH<<<");
-                        for (size_t i = 0; i < std::min(full_bytes, (size_t)8); i++)
-                            fprintf(stderr, "%02x ", entry.backup[i]);
-                        fprintf(stderr, "\n");
                     }
 
                     // Build full replacement buffer: start from backup, then overwrite
@@ -488,26 +433,6 @@ namespace FlashMoE {
 
                     // Write FULL tensor (CPU_REPACK rejects partial writes)
                     ggml_backend_tensor_set(entry.tensor, tmp.data(), 0, full_bytes);
-
-                    // Diagnostic: verify bias remap by reading back first slot's bytes
-                    {
-                        static std::atomic<int> remap_verify_count{0};
-                        if (layer == 0 && remap_verify_count++ < 3) {
-                            // Read back slot 0 from tensor and compare with expected
-                            uint8_t readback[8] = {};
-                            size_t to_read = std::min(row, (size_t)8);
-                            ggml_backend_tensor_get(entry.tensor, readback, 0, to_read);
-                            int orig_e0 = slot_to_eid[0];
-                            const uint8_t* expected = entry.backup.data() + (size_t)orig_e0 * row;
-                            bool match = (memcmp(readback, expected, to_read) == 0);
-                            fprintf(stderr, "[FlashMoE BIAS_VERIFY] L=%d %s: slot0<-e%d "
-                                    "readback=[%02x %02x %02x %02x] expected=[%02x %02x %02x %02x] %s\n",
-                                    layer, proj.c_str(), orig_e0,
-                                    readback[0], readback[1], readback[2], readback[3],
-                                    expected[0], expected[1], expected[2], expected[3],
-                                    match ? "OK" : "MISMATCH<<<");
-                        }
-                    }
                 }
             }
         }
@@ -573,14 +498,7 @@ namespace FlashMoE {
             // eval_callback will handle it after ffn_moe_weights-N fires.
         }
 
-        if (!current_split_layers.empty()) {
-            int loaded_now = 0;
-            for (const auto& [l, info] : current_split_layers) {
-                if (info.loaded) loaded_now++;
-            }
-            fprintf(stderr, "[FlashMoE DIAG] prepare_nodes: %zu MoE layers, %d loaded eagerly\n",
-                    current_split_layers.size(), loaded_now);
-        }
+        // (DIAG removed — per-token summary printed in load_and_remap_layer)
     }
 
     bool ExpertManager::eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
@@ -611,15 +529,6 @@ namespace FlashMoE {
         // "data" phase: ffn_moe_weights (GET_ROWS) just computed, backend synchronized.
         // t is the ffn_moe_weights tensor. Expert IDs are in ids_tensor (= ffn_moe_topk).
 
-        // Phase 1 diagnostic: unconditional firing counter to confirm callback runs every pass.
-        // Expected: ~36 fires per forward pass (one per MoE layer).
-        static std::atomic<int> total_data_fires{0};
-        {
-            int count = ++total_data_fires;
-            if (count <= 36 || count % 100 == 0)
-                fprintf(stderr, "[FlashMoE FIRE] eval_callback data phase #%d tensor=\"%s\"\n",
-                        count, t->name ? t->name : "(null)");
-        }
 
         ExpertManager& mgr = get_manager();
         if (!mgr.enabled) return true;
@@ -737,9 +646,12 @@ namespace FlashMoE {
             }
             fprintf(stderr, "FlashMoE: Loaded heat map from %s. Total entries: %zu\n", path.c_str(), j.size());
             
-            // If we have a significant heat map, we can jump straight to PROFILING or even PINNED
+            // If we have a significant heat map, set tokens_seen = warmup_tokens so the
+            // first call to load_and_remap_layer triggers promotion immediately.
             if (heat_map.size() > 0) {
                 cache_phase = CachePhase::PROFILING;
+                tokens_seen = (uint64_t)warmup_tokens;
+                fprintf(stderr, "FlashMoE: Heat map loaded — will promote on next token.\n");
             }
         } catch (...) {
             fprintf(stderr, "FlashMoE Warning: Failed to parse %s\n", path.c_str());
