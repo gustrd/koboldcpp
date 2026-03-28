@@ -38,6 +38,7 @@ namespace FlashMoE {
         std::string experts_dir;
         size_t cache_size_mib;
         bool enabled = false;
+        bool no_heatmap = false;  // if true, skip all profiling/pinning — pure LRU cache
         CachePhase cache_phase = CachePhase::WARMUP;
         int warmup_tokens      = 100;
         uint64_t tokens_seen   = 0;
@@ -72,7 +73,7 @@ namespace FlashMoE {
         std::mutex manager_mutex;
 
         // Initialize from CLI
-        void init(const std::string& dir, size_t cache_mib = 4096, int warmup_n = 100);
+        void init(const std::string& dir, size_t cache_mib = 4096, int warmup_n = 100, bool no_heatmap_flag = false);
 
         // Override K from model hparams (call after init, before register_tensor)
         void set_n_expert_used(int n);

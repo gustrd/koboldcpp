@@ -45,14 +45,15 @@ namespace FlashMoE {
         return g_instance;
     }
 
-    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n) {
+    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n, bool no_heatmap_flag) {
         std::lock_guard<std::mutex> lock(manager_mutex);
         experts_dir = dir;
         cache_size_mib = cache_mib;
         warmup_tokens = warmup_n;
+        no_heatmap = no_heatmap_flag;
         enabled = true;
         tokens_seen = 0;
-        cache_phase = CachePhase::WARMUP;
+        cache_phase = no_heatmap ? CachePhase::PINNED : CachePhase::WARMUP;
 
         // Parse expert_index.json
         std::string index_path = dir + "/expert_index.json";
@@ -128,7 +129,11 @@ namespace FlashMoE {
                   << "K=" << (n_expert_used > 0 ? n_expert_used : n_experts) << " slots/tensor"
                   << " from " << dir << std::endl;
 
-        load_heat_map();
+        if (no_heatmap) {
+            fprintf(stderr, "FlashMoE: Heat map disabled — running as pure LRU cache.\n");
+        } else {
+            load_heat_map();
+        }
     }
 
     void ExpertManager::set_n_expert_used(int n) {

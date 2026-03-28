@@ -49,7 +49,7 @@ The two-tier expert caching system (Phases A–E) is **fully implemented and ver
 
 After the first pinning, the heat map stops updating. If the user shifts topic, the pinned set goes stale. Low priority for now.
 
-**Future fix:** `--flashmoerepinrate <N>` — re-profile and re-pin every N tokens.
+**Future fix:** `--flashmoerepinrate <N>` — re-profile and re-pin every N tokens. See *Phase H: Sliding Window Heat Map* below for the full design.
 
 ---
 
@@ -61,7 +61,7 @@ After the first pinning, the heat map stops updating. If the user shifts topic, 
 | 🟡 High | Phase E: File Handle Pooling | 1–2 days | new files + `flash_moe_cache.cpp` |
 | 🟢 Medium | Phase F: Periodic cache stats logging | 2h | `flash_moe_manager.cpp` |
 | 🟢 Medium | Phase F: REST API `/api/extra/flashmoe/stats` | 3h | `koboldcpp.py` |
-| 🔵 Low | Dynamic re-profiling (`--flashmoerepinrate`) | 1 day | `flash_moe_manager.cpp` |
+| 🔵 Low | Phase H: Sliding Window Heat Map (dynamic re-pinning) | 2–3 days | `flash_moe_manager.cpp`, `flash_moe_cache.cpp` |
 | 🔵 Low | Auto-size pinned tier based on model K value | 2h | `flash_moe_manager.cpp` |
 | 🔵 Low | GPU-side pinning (Phase G) | 3+ days | depends on GPU offload |
 
@@ -152,3 +152,43 @@ Response:
 ### Q2: GPU-Side Pinning
 
 When GPU offloading is stable (see PLAN.md), hot experts could be pinned directly in VRAM, eliminating CPU→GPU copies. On discrete GPUs this would be a major win. Tracked as Phase G, blocked on GPU offload.
+
+---
+
+## Phase H: Sliding Window Heat Map (Dynamic Re-pinning)
+
+> **Motivation:** Once pinning fires, the heat map freezes. If the user changes topic mid-conversation (e.g., switches from coding to creative writing), different experts become hot but the pinned tier never adapts. This phase makes the pinned set evolve continuously.
+
+### Core Idea
+
+Replace the static heat map with a **sliding window**: only the last `W` tokens contribute to the score. Old accesses decay to zero and eventually stop influencing which experts stay pinned. When enough of the pinned set has shifted, trigger a re-pin pass.
+
+### New CLI Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--flashmoewindow <W>` | 200 | Decay half-life in tokens. Controls how fast old heat fades. |
+| `--flashmoerepinrate <N>` | 50 | Re-evaluate and re-pin every N tokens after initial pinning. |
+
+### How It Works
+
+1. **Heat map update** — already uses exponential decay based on `last_seen_token`. No change needed; the decay constant is effectively the window.
+
+2. **Periodic re-pin** — in `load_and_remap_layer`, when `cache_phase == PINNED` and `tokens_seen % repinrate == 0`:
+   - Re-sort the heat map by current decayed scores.
+   - Compare the new top-N list to the current `pinned_map`.
+   - If the overlap drops below a threshold (e.g. < 80%), call `pin_experts()` with the new list.
+
+3. **Smooth transition** — experts that leave the pinned set are demoted to the rotating LRU tier rather than dropped entirely. This avoids a hard miss spike when topics shift.
+
+4. **Cost** — a re-pin pass reads new experts from SSD and writes them into pinned slots. During the pass, a few tokens will see elevated SSD loads. After the pass, hit rate recovers. The `--flashmoerepinrate` knob controls this trade-off.
+
+### Implementation Checklist
+
+- [ ] Add `repinrate` field to `ExpertManager` (default 50)
+- [ ] Add `--flashmoerepinrate <N>` CLI flag (same files as `--flashmoewarmup`)
+- [ ] In `load_and_remap_layer` PINNED branch: check `tokens_seen % repinrate == 0`
+- [ ] Add `repin_if_needed()` method: diff new top-N vs `pinned_map`, call `pin_experts()` if changed
+- [ ] In `SlotBufferAllocator::pin_experts()`: demote evicted pinned experts to LRU instead of discarding
+- [ ] Log re-pin events: `FlashMoE: Re-pinned N experts at token T (X changed)`
+- [ ] Test: verify hit rate recovers after a simulated topic shift

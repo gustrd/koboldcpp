@@ -1817,6 +1817,7 @@ def load_model(model_filename):
     flashmoedir_bytes = args.flashmoedir.encode("UTF-8") if args.flashmoedir else b""
     inputs.flash_moe_dir = flashmoedir_bytes if flashmoedir_bytes else None
     inputs.flash_moe_warmup = args.flashmoewarmup
+    inputs.flash_moe_no_heatmap = args.flashmoenoheatmap
     inputs = set_backend_props(inputs)
     ret = handle.load_model(inputs)
     return ret
@@ -10021,6 +10022,7 @@ if __name__ == '__main__':
     advparser.add_argument("--moecpu","--n-cpu-moe", "-ncmoe", metavar=('[layers affected]'), help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU. If no value is provided, applies to all layers.", nargs='?', const=999, type=int, default=0)
     advparser.add_argument("--flashmoedir", metavar=('[directory]'), help="Directory containing Flash-MoE extracted expert files (expert_index.json + blkNN_expNNN.bin). Enables on-demand expert loading from disk.", type=str, default="")
     advparser.add_argument("--flashmoewarmup", metavar=('[tokens]'), help="Number of tokens to use for expert frequency profiling before pinning.", type=int, default=100)
+    advparser.add_argument("--flashmoenoheatmap", help="Disable expert frequency heatmap and pinning. Flash-MoE runs as pure LRU cache only. Useful for benchmarking.", action='store_true', default=False)
     advparser.add_argument("--defaultgenamt", help="How many tokens to generate by default, if not specified. Must be smaller than context size. Usually, your frontend GUI will override this.", type=check_range(int,64,8192), default=default_genlen)
     advparser.add_argument("--nobostoken", help="Prevents BOS token from being added at the start of any prompt. Usually NOT recommended for most models.", action='store_true')
     advparser.add_argument("--enableguidance", help="Enables the use of Classifier-Free-Guidance, which allows the use of negative prompts. Has performance and memory impact.", action='store_true')
