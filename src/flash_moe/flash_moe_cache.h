@@ -40,7 +40,7 @@ namespace FlashMoE {
     // Main Slot Buffer Allocator and LRU Cache
     class SlotBufferAllocator {
     public:
-        SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes);
+        SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes, float pinned_proportion = 0.5f);
         ~SlotBufferAllocator();
 
         // Get an expert into memory synchronously.
@@ -51,9 +51,15 @@ namespace FlashMoE {
 
         size_t get_hit_count() const { return hits; }
         size_t get_miss_count() const { return misses; }
+        
+        // Phase B: Tiered Management
+        void pin_experts(const std::vector<ExpertKey>& keys, const std::string& experts_dir, size_t read_size);
+        bool is_pinned(const ExpertKey& key) const;
 
     private:
         size_t capacity;
+        size_t pinned_capacity;
+        size_t rotating_capacity;
         size_t bytes_per_slot;
         size_t hits = 0;
         size_t misses = 0;
@@ -73,6 +79,9 @@ namespace FlashMoE {
             uint32_t slot_id;
         };
         std::unordered_map<ExpertKey, CacheEntry, ExpertKeyHash> cache_map;
+        
+        // Pinned experts map: ExpertKey -> slot_id
+        std::unordered_map<ExpertKey, uint32_t, ExpertKeyHash> pinned_map;
 
         // Helper to perform the actual I/O (Step 1.3 implementation)
         bool read_direct_io(const std::string& path, void* dest, size_t size);

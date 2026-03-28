@@ -8,6 +8,18 @@
 
 namespace FlashMoE {
 
+    enum class CachePhase {
+        WARMUP,     // First few tokens, ignore for statistics
+        PROFILING,  // Tracking frequency to identify hot experts
+        PINNED      // Hot experts are locked in RAM, LRU for others
+    };
+
+    struct ExpertHeatEntry {
+        double score = 0.0;             // Exponentially-decayed frequency score
+        uint64_t last_seen_token = 0;   // Token index when last accessed
+        uint64_t total_hits = 0;        // Raw hit count
+    };
+
     struct ExpertManager {
         struct TensorState {
             ggml_tensor* tensor;
@@ -26,6 +38,9 @@ namespace FlashMoE {
         std::string experts_dir;
         size_t cache_size_mib;
         bool enabled = false;
+        CachePhase cache_phase = CachePhase::WARMUP;
+        int warmup_tokens      = 100;
+        uint64_t tokens_seen   = 0;
         int n_layers      = 0;
         int n_experts     = 0;
         int n_expert_used = 0;  // K: slots per projection tensor (Phase 2.6)
@@ -45,13 +60,20 @@ namespace FlashMoE {
 
         std::unordered_map<ggml_tensor*, TensorState> tensor_map;
         std::unordered_map<int, LayerInfo> current_split_layers;
+        
+        // layer -> (expert_id -> heat)
+        std::unordered_map<int, std::unordered_map<int, ExpertHeatEntry>> heat_map;
+        
         std::mutex manager_mutex;
 
         // Initialize from CLI
-        void init(const std::string& dir, size_t cache_mib = 4096);
+        void init(const std::string& dir, size_t cache_mib = 4096, int warmup_n = 100);
 
         // Override K from model hparams (call after init, before register_tensor)
         void set_n_expert_used(int n);
+        
+        void update_heat_map(int layer, int expert_id);
+        void promote_highly_used_experts();
 
         // Register a tensor to be backed by Flash-MoE
         void register_tensor(ggml_tensor* tensor);
@@ -68,6 +90,9 @@ namespace FlashMoE {
         // slot_index: which slot (0..n_expert_used-1) to write into (Phase 2.6).
         // If target is nullptr, writes to the registered original tensor.
         void ensure_expert_loaded(int layer, int expert_id, ggml_tensor* target, int slot_index);
+
+        // Update heat map for an expert access
+        void update_heat_map(int layer, int expert_id);
 
     private:
         // Internal state for tracking loaded experts

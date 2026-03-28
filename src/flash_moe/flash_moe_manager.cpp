@@ -8,6 +8,7 @@
 #include <atomic>
 #include <unordered_set>
 #include <cstdlib>
+#include <cmath>
 
 #ifdef _WIN32
 #include <malloc.h>  // _aligned_malloc / _aligned_free
@@ -44,11 +45,14 @@ namespace FlashMoE {
         return g_instance;
     }
 
-    void ExpertManager::init(const std::string& dir, size_t cache_mib) {
+    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n) {
         std::lock_guard<std::mutex> lock(manager_mutex);
         experts_dir = dir;
         cache_size_mib = cache_mib;
+        warmup_tokens = warmup_n;
         enabled = true;
+        tokens_seen = 0;
+        cache_phase = CachePhase::WARMUP;
 
         // Parse expert_index.json
         std::string index_path = dir + "/expert_index.json";
@@ -123,6 +127,8 @@ namespace FlashMoE {
                   << n_experts << " experts, "
                   << "K=" << (n_expert_used > 0 ? n_expert_used : n_experts) << " slots/tensor"
                   << " from " << dir << std::endl;
+
+        load_heat_map();
     }
 
     void ExpertManager::set_n_expert_used(int n) {
@@ -321,6 +327,20 @@ namespace FlashMoE {
     // needed — MUL_MAT_ID already indexes by expert ID. This is correct for any batch
     // size: each token's experts are loaded wherever they naturally belong.
     static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::LayerInfo& info) {
+        // Increment tokens_seen on layer 0 to track progression
+        if (layer == 0) {
+            mgr.tokens_seen++;
+            if (mgr.cache_phase == CachePhase::WARMUP && mgr.tokens_seen >= 10) {
+                mgr.cache_phase = CachePhase::PROFILING;
+                fprintf(stderr, "FlashMoE: Transitioning to PROFILING phase at token %llu\n", mgr.tokens_seen);
+            } else if (mgr.cache_phase == CachePhase::PROFILING && mgr.tokens_seen >= (uint64_t)mgr.warmup_tokens) {
+                mgr.promote_highly_used_experts();
+                mgr.cache_phase = CachePhase::PINNED;
+                mgr.save_heat_map();
+                fprintf(stderr, "FlashMoE: Warmup complete. Promotion triggered and heatmap saved.\n");
+            }
+        }
+
         ggml_tensor* ids_tensor = info.ids_tensor;
         if (!ids_tensor) return;
 
@@ -351,6 +371,17 @@ namespace FlashMoE {
             if ((int)distinct.size() > mgr.n_expert_used && k_warn_count++ < 3) {
                 fprintf(stderr, "[FlashMoE WARN] L=%d: %zu distinct expert IDs > n_expert_used=%d — slots overflow, excess mapped to slot 0!\n",
                         layer, distinct.size(), mgr.n_expert_used);
+            }
+        }
+        
+        // Phase A: Update heat map if profiling
+        if (mgr.cache_phase == CachePhase::PROFILING) {
+            std::unordered_set<int32_t> unique_ids;
+            for (auto id : id_values) {
+                if (id >= 0 && id < n_exp) unique_ids.insert(id);
+            }
+            for (auto id : unique_ids) {
+                mgr.update_heat_map(layer, id);
             }
         }
 
@@ -620,6 +651,99 @@ namespace FlashMoE {
         // Load experts and remap now.
         load_and_remap_layer(mgr, layer, it_layer->second);
         return true;  // continue execution
+    }
+
+    void ExpertManager::update_heat_map(int layer, int expert_id) {
+        // mgr.manager_mutex is already held by load_and_remap_layer callers
+        ExpertHeatEntry& entry = heat_map[layer][expert_id];
+        
+        uint64_t current_token = tokens_seen;
+        if (entry.total_hits > 0) {
+            uint64_t delta = (current_token > entry.last_seen_token) ? (current_token - entry.last_seen_token) : 0;
+            double alpha = 0.01; 
+            entry.score = entry.score * std::exp(-alpha * delta) + 1.0;
+        } else {
+            entry.score = 1.0;
+        }
+        entry.last_seen_token = current_token;
+        entry.total_hits++;
+    }
+
+    void ExpertManager::promote_highly_used_experts() {
+        if (!g_cache) return;
+        
+        std::vector<std::pair<ExpertKey, double>> scored_experts;
+        for (auto const& [l, experts] : heat_map) {
+            for (auto const& [e_id, entry] : experts) {
+                scored_experts.push_back({{l, (int)e_id}, entry.score});
+            }
+        }
+        
+        std::sort(scored_experts.begin(), scored_experts.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        
+        std::vector<ExpertKey> top_keys;
+        for (const auto& pair : scored_experts) {
+            top_keys.push_back(pair.first);
+        }
+        
+        size_t max_expert_bytes = 0;
+        for (int l = 0; l < n_layers; ++l) {
+            if (g_layers[l].padded_expert_size > max_expert_bytes) {
+                max_expert_bytes = g_layers[l].padded_expert_size;
+            }
+        }
+        
+        g_cache->pin_experts(top_keys, experts_dir, max_expert_bytes);
+    }
+
+    void ExpertManager::save_heat_map() {
+        std::string path = experts_dir + "/expert_heatmap.json";
+        json j;
+        for (auto const& [l, experts] : heat_map) {
+            for (auto const& [e_id, entry] : experts) {
+                std::string key = std::to_string(l) + "_" + std::to_string(e_id);
+                j[key] = {
+                    {"score", entry.score},
+                    {"hits", entry.total_hits},
+                    {"last_seen", entry.last_seen_token}
+                };
+            }
+        }
+        std::ofstream f(path);
+        if (f.is_open()) {
+            f << j.dump(4);
+            fprintf(stderr, "FlashMoE: Saved heat map to %s\n", path.c_str());
+        }
+    }
+
+    void ExpertManager::load_heat_map() {
+        std::string path = experts_dir + "/expert_heatmap.json";
+        std::ifstream f(path);
+        if (!f.is_open()) return;
+
+        json j;
+        try {
+            f >> j;
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                int l, e_id;
+                if (sscanf(it.key().c_str(), "%d_%d", &l, &e_id) == 2) {
+                    ExpertHeatEntry& entry = heat_map[l][e_id];
+                    entry.score = it.value()["score"];
+                    entry.total_hits = it.value()["hits"];
+                    entry.last_seen_token = it.value()["last_seen"];
+                }
+            }
+            fprintf(stderr, "FlashMoE: Loaded heat map from %s. Total entries: %zu\n", path.c_str(), j.size());
+            
+            // If we have a significant heat map, we can jump straight to PROFILING or even PINNED
+            if (heat_map.size() > 0) {
+                cache_phase = CachePhase::PROFILING;
+            }
+        } catch (...) {
+            fprintf(stderr, "FlashMoE Warning: Failed to parse %s\n", path.c_str());
+        }
     }
 
 } // namespace FlashMoE

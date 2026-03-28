@@ -441,7 +441,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
     
     if (params.flash_moe_dir) {
-        FlashMoE::get_manager().init(params.flash_moe_dir);
+        FlashMoE::get_manager().init(params.flash_moe_dir, 4096, params.flash_moe_warmup);
     }
 }
 
@@ -8874,6 +8874,8 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.flash_moe_dir               =*/ nullptr,
+        /*.flash_moe_warmup            =*/ 100,
     };
 
     return result;

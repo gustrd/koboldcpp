@@ -84,6 +84,7 @@ struct load_model_inputs
     const bool quiet = false;
     const int debugmode = 0;
     const char * flash_moe_dir = nullptr;
+    const int flash_moe_warmup = 100;
 };
 struct generation_inputs
 {

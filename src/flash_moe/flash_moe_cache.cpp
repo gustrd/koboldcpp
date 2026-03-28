@@ -14,8 +14,11 @@
 
 namespace FlashMoE {
 
-    SlotBufferAllocator::SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes)
+    SlotBufferAllocator::SlotBufferAllocator(size_t max_slots, size_t slot_size_bytes, float pinned_proportion)
         : capacity(max_slots), bytes_per_slot(slot_size_bytes) {
+        
+        pinned_capacity = (size_t)(max_slots * pinned_proportion);
+        rotating_capacity = max_slots - pinned_capacity;
         
         // Allocate contiguous memory pool. 
         // We use VirtualAlloc on Windows to ensure page alignment (4096 bytes)
@@ -39,6 +42,10 @@ namespace FlashMoE {
             s.data = (void*)((char*)memory_pool + (i * slot_size_bytes));
             s.size = slot_size_bytes;
             slots.push_back(s);
+        }
+        
+        // Initial state: all rotating slots are free. Pinned slots are reserved for pin_experts().
+        for (size_t i = pinned_capacity; i < max_slots; ++i) {
             free_slots.push_back((uint32_t)i);
         }
     }
@@ -59,10 +66,17 @@ namespace FlashMoE {
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         ExpertKey key = {layer, expert_idx};
-        auto it_map = cache_map.find(key);
+        
+        // Check Pinned Tier (Phase B)
+        auto it_pinned = pinned_map.find(key);
+        if (it_pinned != pinned_map.end()) {
+            hits++;
+            return slots[it_pinned->second].data;
+        }
 
+        auto it_map = cache_map.find(key);
         if (it_map != cache_map.end()) {
-            // Hit: Promote to front of LRU
+            // Hit in Rotating Tier: Promote to front of LRU
             hits++;
             lru_list.erase(it_map->second.it);
             lru_list.push_front(key);
@@ -79,7 +93,7 @@ namespace FlashMoE {
             selected_slot_id = free_slots.front();
             free_slots.pop_front();
         } else {
-            // Evict LRU
+            // Evict LRU from Rotating Tier
             ExpertKey lru_key = lru_list.back();
             lru_list.pop_back();
 
@@ -87,13 +101,55 @@ namespace FlashMoE {
             cache_map.erase(lru_key);
         }
 
-        // Add new key to LRU and Cache Map
+        // Add new key to LRU and Cache Map (Rotating Tier)
         lru_list.push_front(key);
         cache_map[key] = { lru_list.begin(), selected_slot_id };
 
         read_direct_io(file_path, slots[selected_slot_id].data, read_size);
 
         return slots[selected_slot_id].data;
+    }
+
+    bool SlotBufferAllocator::is_pinned(const ExpertKey& key) const {
+        return pinned_map.find(key) != pinned_map.end();
+    }
+
+    void SlotBufferAllocator::pin_experts(const std::vector<ExpertKey>& keys, const std::string& experts_dir, size_t read_size) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        
+        // 1. Identify experts that were in the rotating tier but are now pinned.
+        for (const auto& key : keys) {
+            auto it = cache_map.find(key);
+            if (it != cache_map.end()) {
+                uint32_t slot_id = it->second.slot_id;
+                lru_list.erase(it->second.it);
+                cache_map.erase(it);
+                free_slots.push_front(slot_id);
+            }
+        }
+
+        pinned_map.clear();
+        size_t n = std::min(keys.size(), pinned_capacity);
+        
+        fprintf(stderr, "FlashMoE: Pinning top %zu experts into RAM...\n", n);
+        
+        for (size_t i = 0; i < n; ++i) {
+            const ExpertKey& key = keys[i];
+            uint32_t slot_id = (uint32_t)i; // Pinned slots are [0, pinned_capacity-1]
+            
+            // Build file path
+            std::string fname = experts_dir + "/blk"
+                + (key.layer     < 10 ? "0" : "") + std::to_string(key.layer)
+                + "_exp"
+                + (key.expert_idx < 10 ? "00" : (key.expert_idx < 100 ? "0" : ""))
+                + std::to_string(key.expert_idx) + ".bin";
+            
+            if (read_direct_io(fname, slots[slot_id].data, read_size)) {
+                pinned_map[key] = slot_id;
+            }
+        }
+        
+        fprintf(stderr, "FlashMoE: Pinning complete. %zu experts pinned.\n", pinned_map.size());
     }
 
     // Helper to perform the actual I/O (Step 1.3 implementation)
