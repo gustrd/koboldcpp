@@ -2379,6 +2379,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         model_params.n_gpu_layers = inputs.gpulayers;
         model_params.flash_moe_dir = (inputs.flash_moe_dir && inputs.flash_moe_dir[0]) ? inputs.flash_moe_dir : nullptr;
         model_params.flash_moe_warmup = inputs.flash_moe_warmup;
+        model_params.flash_moe_cache_gb = inputs.flash_moe_cache_gb;
 
         //set device overrides if needed
         std::vector<ggml_backend_dev_t> devices_override;

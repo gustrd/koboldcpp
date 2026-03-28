@@ -45,15 +45,14 @@ namespace FlashMoE {
         return g_instance;
     }
 
-    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n, bool no_heatmap_flag) {
+    void ExpertManager::init(const std::string& dir, size_t cache_mib, int warmup_n) {
         std::lock_guard<std::mutex> lock(manager_mutex);
         experts_dir = dir;
         cache_size_mib = cache_mib;
         warmup_tokens = warmup_n;
-        no_heatmap = no_heatmap_flag;
         enabled = true;
         tokens_seen = 0;
-        cache_phase = no_heatmap ? CachePhase::PINNED : CachePhase::WARMUP;
+        cache_phase = CachePhase::WARMUP;
 
         // Parse expert_index.json
         std::string index_path = dir + "/expert_index.json";
@@ -115,10 +114,27 @@ namespace FlashMoE {
                 size_t total_bytes = cache_size_mib * 1024ULL * 1024ULL;
                 size_t n_slots = total_bytes / expert_bytes;
                 if (n_slots < 1) n_slots = 1;
-                g_cache = new SlotBufferAllocator(n_slots, expert_bytes);
-                std::cout << "FlashMoE: LRU cache: " << n_slots << " slots × "
-                          << expert_bytes << " bytes/slot ("
-                          << cache_size_mib << " MiB)" << std::endl;
+
+                // Dynamic Tier Sizing:
+                // LRU tier MUST be sized for a single complete feedforward across all layers.
+                // This prevents intra-token thrashing where Layer N evicts Layer 0's experts.
+                size_t rotating_slots = (size_t)n_expert_used * (size_t)n_layers;
+                
+                // If user specifies 0 or a very small cache budget, enforce the floor size
+                if (n_slots < rotating_slots) {
+                    n_slots = rotating_slots;
+                }
+                
+                // All remaining slots go to the pinned tier.
+                size_t pinned_slots = n_slots - rotating_slots;
+
+                float pinned_proportion = (float)pinned_slots / (float)n_slots;
+
+                fprintf(stderr, "FlashMoE: Cache Config: %zu total slots (%zu MiB)\n", n_slots, cache_size_mib);
+                fprintf(stderr, "FlashMoE:   Rotating (LRU): %zu slots (sized for K=%d * %d layers)\n", rotating_slots, n_expert_used, n_layers);
+                fprintf(stderr, "FlashMoE:   Pinned Tier:    %zu slots (%.1f%% of cache)\n", pinned_slots, pinned_proportion * 100.0f);
+
+                g_cache = new SlotBufferAllocator(n_slots, expert_bytes, pinned_proportion);
             } else {
                 std::cerr << "FlashMoE Warning: expert_bytes=0, cache not created." << std::endl;
             }
@@ -129,9 +145,7 @@ namespace FlashMoE {
                   << "K=" << (n_expert_used > 0 ? n_expert_used : n_experts) << " slots/tensor"
                   << " from " << dir << std::endl;
 
-        if (no_heatmap) {
-            fprintf(stderr, "FlashMoE: Heat map disabled — running as pure LRU cache.\n");
-        } else {
+        if (n_expert_used > 0) {
             load_heat_map();
         }
     }

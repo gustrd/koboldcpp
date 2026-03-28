@@ -323,7 +323,7 @@ extern "C" {
 
         const char * flash_moe_dir; // directory containing Flash-MoE expert files
         int32_t      flash_moe_warmup; // number of tokens for expert frequency profiling
-        bool         flash_moe_no_heatmap; // disable heatmap/pinning — pure LRU cache only
+        int32_t      flash_moe_cache_gb; // total GiB for expert cache (LRU + pinned)
     };
 
     struct llama_sampler_seq_config {
