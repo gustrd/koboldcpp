@@ -84,8 +84,14 @@ namespace FlashMoE {
         // Pinned experts map: ExpertKey -> slot_id
         std::unordered_map<ExpertKey, uint32_t, ExpertKeyHash> pinned_map;
 
-        // Helper to perform the actual I/O (Step 1.3 implementation)
+        // Helper to perform the actual I/O using a persistent handle pool.
+        // Handles are opened on first access and kept open for the lifetime of
+        // the allocator, eliminating CreateFile/CloseHandle overhead per load.
         bool read_direct_io(const std::string& path, void* dest, size_t size);
+        intptr_t _get_pooled_handle(const std::string& path);
+
+        // File handle pool: path → opaque handle (HANDLE on Windows, fd on POSIX)
+        std::unordered_map<std::string, intptr_t> _handle_pool;
 
         // Manage free slots
         std::list<uint32_t> free_slots;

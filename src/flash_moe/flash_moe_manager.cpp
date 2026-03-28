@@ -96,65 +96,59 @@ namespace FlashMoE {
             }
         }
 
-        // Create the unified LRU cache pool.
-        // Expert sizes vary across layers (e.g., different down_proj sizes).
-        // Use the MAX size so any layer's expert fits in a single slot.
-        {
-            size_t expert_bytes = 0;
-            for (int l = 0; l < n_layers; ++l) {
-                if (g_layers[l].padded_expert_size > expert_bytes) {
-                    expert_bytes = g_layers[l].padded_expert_size;
-                }
-            }
-            if (expert_bytes > 0) {
-                delete g_cache;
-                size_t total_bytes = cache_size_mib * 1024ULL * 1024ULL;
-                size_t n_slots = total_bytes / expert_bytes;
-                if (n_slots < 1) n_slots = 1;
-
-                // Dynamic Tier Sizing:
-                // LRU tier MUST be sized for a single complete feedforward across all layers.
-                // This prevents intra-token thrashing where Layer N evicts Layer 0's experts.
-                size_t rotating_slots = (size_t)n_expert_used * (size_t)n_layers;
-                
-                // If user specifies 0 or a very small cache budget, enforce the floor size
-                if (n_slots < rotating_slots) {
-                    n_slots = rotating_slots;
-                }
-                
-                // All remaining slots go to the pinned tier.
-                size_t pinned_slots = n_slots - rotating_slots;
-
-                float pinned_proportion = (float)pinned_slots / (float)n_slots;
-
-                fprintf(stderr, "FlashMoE Debug: init(cache_mib=%zu) -> expert_bytes=%zu, n_slots=%zu, pinned_slots=%zu\n", 
-                        cache_size_mib, expert_bytes, n_slots, pinned_slots);
-                fprintf(stderr, "FlashMoE: Cache Config: %zu total slots (%zu MiB)\n", n_slots, cache_size_mib);
-                fprintf(stderr, "FlashMoE:   Rotating (LRU): %zu slots (sized for K=%d * %d layers)\n", rotating_slots, n_expert_used, n_layers);
-                fprintf(stderr, "FlashMoE:   Pinned Tier:    %zu slots (%.1f%% of cache)\n", pinned_slots, pinned_proportion * 100.0f);
-
-                g_cache = new SlotBufferAllocator(n_slots, expert_bytes, pinned_proportion);
-            } else {
-                std::cerr << "FlashMoE Warning: expert_bytes=0, cache not created." << std::endl;
-            }
-        }
+        // Cache creation is deferred to set_n_expert_used(), which is called by
+        // load_hparams() with the model's actual K before register_tensor() runs.
+        // This avoids a large initial allocation (K from JSON can be much larger than
+        // the model's actual K, e.g. JSON K=16 vs model K=4 → 576 vs 144 rotating slots).
 
         std::cout << "FlashMoE: Initialized with " << n_layers << " layers, "
                   << n_experts << " experts, "
-                  << "K=" << (n_expert_used > 0 ? n_expert_used : n_experts) << " slots/tensor"
+                  << "K=" << (n_expert_used > 0 ? n_expert_used : n_experts) << " slots/tensor (from JSON, pending model override)"
                   << " from " << dir << std::endl;
-
-        if (n_expert_used > 0) {
-            load_heat_map();
-        }
     }
 
     void ExpertManager::set_n_expert_used(int n) {
         if (!enabled || n <= 0) return;
         std::lock_guard<std::mutex> lock(manager_mutex);
-        fprintf(stderr, "FlashMoE: Overriding K from JSON(%d) to model hparams(%d)\n",
-                n_expert_used, n);
-        n_expert_used = n;
+
+        // Early return only if K is unchanged AND the cache already exists.
+        // On first call (g_cache==nullptr, init() deferred creation), always proceed.
+        if (n == n_expert_used && g_cache != nullptr) return;
+
+        if (n != n_expert_used) {
+            fprintf(stderr, "FlashMoE: Overriding K from JSON(%d) to model hparams(%d)\n",
+                    n_expert_used, n);
+            n_expert_used = n;
+        }
+
+        // Create (or recreate) the allocator with the correct K-based floor.
+        // init() deferred cache creation so the first call here always does this.
+        if (n_layers > 0) {
+            size_t expert_bytes = 0;
+            for (auto const& [l, ls] : g_layers) {
+                if (ls.padded_expert_size > expert_bytes) expert_bytes = ls.padded_expert_size;
+            }
+            if (expert_bytes > 0) {
+                delete g_cache;
+                g_cache = nullptr;
+
+                size_t total_bytes    = cache_size_mib * 1024ULL * 1024ULL;
+                size_t n_slots        = total_bytes / expert_bytes;
+                if (n_slots < 1) n_slots = 1;
+                size_t rotating_slots = (size_t)n_expert_used * (size_t)n_layers;
+                if (n_slots < rotating_slots) n_slots = rotating_slots;
+                size_t pinned_slots   = n_slots - rotating_slots;
+                float  pinned_prop    = (float)pinned_slots / (float)n_slots;
+
+                fprintf(stderr, "FlashMoE: Cache created (K=%d): %zu total slots (%zu MiB), "
+                        "%zu rotating, %zu pinned\n",
+                        n_expert_used, n_slots, cache_size_mib, rotating_slots, pinned_slots);
+                g_cache = new SlotBufferAllocator(n_slots, expert_bytes, pinned_prop);
+
+                // Load heat map and pre-pin top experts now that cache is ready.
+                load_heat_map();
+            }
+        }
     }
 
     void ExpertManager::register_tensor(ggml_tensor* tensor) {
@@ -664,9 +658,10 @@ static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::L
             fprintf(stderr, "FlashMoE: Loaded heat map from %s. Total entries: %zu\n", path.c_str(), j.size());
             
             if (heat_map.size() > 0) {
-                fprintf(stderr, "FlashMoE: Pinning top %zu experts into RAM...\n", j.size());
+                // Attempt initial pre-pinning. This may be a no-op if the cache was
+                // created with a K from expert_index.json that doesn't match the model's
+                // actual K — set_n_expert_used() will recreate the cache and re-pin.
                 promote_highly_used_experts();
-                fprintf(stderr, "FlashMoE: Pinning complete. %zu experts pinned.\n", j.size());
             }
         } catch (...) {
             fprintf(stderr, "FlashMoE Warning: Failed to parse %s\n", path.c_str());

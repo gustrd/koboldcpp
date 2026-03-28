@@ -53,6 +53,17 @@ namespace FlashMoE {
     }
 
     SlotBufferAllocator::~SlotBufferAllocator() {
+        // Close all pooled file handles before freeing memory.
+        for (auto& [path, h] : _handle_pool) {
+            if (h == -1) continue;
+#ifdef _WIN32
+            CloseHandle((HANDLE)(uintptr_t)h);
+#else
+            ::close((int)h);
+#endif
+        }
+        _handle_pool.clear();
+
         if (memory_pool) {
 #ifdef _WIN32
             VirtualFree(memory_pool, 0, MEM_RELEASE);
@@ -208,18 +219,17 @@ namespace FlashMoE {
         // fprintf(stderr, "FlashMoE: Pinned tier updated. Total pinned: %zu\n", pinned_map.size());
     }
 
-    // Helper to perform the actual I/O (Step 1.3 implementation)
-    bool read_direct_io_low_level(const std::string& path, void* dest, size_t size);
+    // Open (or retrieve from pool) a file handle for reading.
+    // Returns -1 on failure.  All handles are closed in the destructor.
+    // Caller must hold cache_mutex.
+    intptr_t SlotBufferAllocator::_get_pooled_handle(const std::string& path) {
+        auto it = _handle_pool.find(path);
+        if (it != _handle_pool.end()) return it->second;
 
-    bool SlotBufferAllocator::read_direct_io(const std::string& path, void* dest, size_t size) {
-        return read_direct_io_low_level(path, dest, size);
-    }
-
-    bool read_direct_io_low_level(const std::string& path, void* dest, size_t size) {
+        // Not yet in pool — open a new handle.
 #ifdef _WIN32
-        // Convert std::string path to std::wstring for CreateFileW
         int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
-        if (wlen <= 0) return false;
+        if (wlen <= 0) return -1;
         std::vector<wchar_t> wpath(wlen);
         MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
 
@@ -232,56 +242,78 @@ namespace FlashMoE {
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING,
             NULL
         );
-
         if (hFile == INVALID_HANDLE_VALUE) {
-            std::cerr << "FlashMoE Error: Failed to open expert file " << path << " (Error " << GetLastError() << ")" << std::endl;
-            return false;
+            std::cerr << "FlashMoE Error: Failed to open expert file " << path
+                      << " (Error " << GetLastError() << ")" << std::endl;
+            return -1;
         }
-
-        DWORD total_read = 0;
-        // ReadFile requirement: buffer must be aligned (checked in Step 1.2)
-        // size must be multiple of sector size (checked in extraction tool/test)
-        if (!ReadFile(hFile, dest, (DWORD)size, &total_read, NULL)) {
-            std::cerr << "FlashMoE Error: ReadFile failed for " << path << " (Error " << GetLastError() << ")" << std::endl;
-            CloseHandle(hFile);
-            return false;
-        }
-
-        // Short read is OK: file may be smaller than slot (pinning uses max_expert_bytes).
-        CloseHandle(hFile);
-        return total_read > 0;
+        intptr_t h = (intptr_t)(uintptr_t)hFile;
 #elif defined(__APPLE__)
-        // macOS: F_NOCACHE advises the kernel to bypass the buffer cache.
-        // Unlike FILE_FLAG_NO_BUFFERING, this is advisory — it silently falls
-        // back to cached I/O on misalignment, so verify alignment in debug.
         int fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
+        if (fd < 0) {
+            std::cerr << "FlashMoE Error: Failed to open expert file " << path << std::endl;
+            return -1;
+        }
         fcntl(fd, F_NOCACHE, 1);
+        intptr_t h = (intptr_t)fd;
+#else
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            std::cerr << "FlashMoE Error: Failed to open expert file " << path << std::endl;
+            return -1;
+        }
+        intptr_t h = (intptr_t)fd;
+#endif
+        _handle_pool[path] = h;
+        return h;
+    }
+
+    bool SlotBufferAllocator::read_direct_io(const std::string& path, void* dest, size_t size) {
+        intptr_t h = _get_pooled_handle(path);
+        if (h == -1) return false;
+
+#ifdef _WIN32
+        HANDLE hFile = (HANDLE)(uintptr_t)h;
+        // Seek to beginning — pooled handle retains file-pointer from last read.
+        LARGE_INTEGER zero = {};
+        if (!SetFilePointerEx(hFile, zero, NULL, FILE_BEGIN)) {
+            std::cerr << "FlashMoE Error: SetFilePointerEx failed for " << path
+                      << " (Error " << GetLastError() << ")" << std::endl;
+            CloseHandle(hFile);
+            _handle_pool.erase(path);
+            return false;
+        }
+        DWORD total_read = 0;
+        if (!ReadFile(hFile, dest, (DWORD)size, &total_read, NULL)) {
+            DWORD err = GetLastError();
+            // ERROR_HANDLE_EOF with total_read > 0: short read — that's OK.
+            if (err != ERROR_HANDLE_EOF || total_read == 0) {
+                std::cerr << "FlashMoE Error: ReadFile failed for " << path
+                          << " (Error " << err << ")" << std::endl;
+                CloseHandle(hFile);
+                _handle_pool.erase(path);
+                return false;
+            }
+        }
+        return total_read > 0;
+#else
+        // POSIX: pread reads from offset 0 without disturbing the file position,
+        // safe for pooled fds shared across multiple calls.
+        int fd = (int)h;
         size_t total = 0;
-        // Loop to handle short reads (e.g. APFS extent boundaries).
-        // r == 0 means EOF — file is smaller than the slot buffer (e.g. pinning uses
-        // max_expert_bytes but each layer's files can be smaller). That's fine:
-        // ensure_expert_loaded only accesses proj_info.offset+bytes which fit in the file.
         while (total < size) {
             ssize_t r = pread(fd, (char*)dest + total, size - total, (off_t)total);
             if (r < 0) {
                 std::cerr << "FlashMoE Error: pread failed for " << path << std::endl;
-                close(fd);
+                // Evict the bad fd so next miss re-opens.
+                ::close(fd);
+                _handle_pool.erase(path);
                 return false;
             }
-            if (r == 0) break; // EOF — file smaller than slot, OK
+            if (r == 0) break;  // EOF — file smaller than slot buffer, OK
             total += (size_t)r;
         }
-        close(fd);
         return total > 0;
-#else
-        // Linux: O_DIRECT requires 512-byte aligned buffer/offset/size.
-        // Fall back to buffered I/O for now (fix in a future step if needed).
-        FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) return false;
-        size_t r = std::fread(dest, 1, size, f);
-        std::fclose(f);
-        return r > 0; // short read OK: file may be smaller than slot buffer
 #endif
     }
 
