@@ -509,20 +509,28 @@ def main() -> None:
 
             # Check activity based on last log time
             time_since_last_log = time.time() - last_activity_time
+            no_recent_logs = time_since_last_log >= args.activity_timeout
+            
+            worker_missing_from_api = False
+            if args.string:
+                worker_missing_from_api = not http_contains(args.url, args.string)
+            
             is_stuck = False
-
-            if time_since_last_log < args.activity_timeout:
+            if no_recent_logs and (not args.string or worker_missing_from_api):
                 if args.string:
-                    if not http_contains(args.url, args.string):
-                        log(f"Worker '{args.string}' not found at {args.url}.")
-                        is_stuck = True
-                    else:
-                        log(f"Worker appears active (found '{args.string}' and active logs).")
+                    log(f"Worker confirmed stuck: Not found at API AND no logs for {int(time_since_last_log)}s.")
                 else:
-                    log(f"Worker appears active. Last log: {int(time_since_last_log)}s ago.")
-            else:
-                log(f"Worker confirmed stuck (no logs for {int(time_since_last_log)}s).")
+                    log(f"Worker confirmed stuck: No logs for {int(time_since_last_log)}s (API check skipped - no worker name).")
                 is_stuck = True
+            elif no_recent_logs:
+                log(f"No logs for {int(time_since_last_log)}s, but worker '{args.string}' still found at API. Skipping restart.")
+            elif worker_missing_from_api:
+                log(f"Worker '{args.string}' not found at API, but logs are recent ({int(time_since_last_log)}s). Skipping restart.")
+            else:
+                if args.string:
+                    log(f"Worker appears active (found at API and recent logs).")
+                else:
+                    log(f"Worker appears active (recent logs, API check skipped).")
 
             if not is_stuck:
                 if interruptible_sleep(args.interval, args.sleep_interval, current_proc):
