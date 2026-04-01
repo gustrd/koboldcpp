@@ -1,6 +1,6 @@
 # Flash-MoE: Project Status
 
-> **Last updated:** 2026-03-28
+> **Last updated:** 2026-04-01
 > **Branch:** `flash-moe-dev`
 > **Platform:** Windows 11 / Vulkan / Intel Lunar Lake iGPU (16 GB unified)
 > **Model:** gpt-oss-120b-128x3.0B (128 experts, K=4, MXFP4, 36 MoE layers)
@@ -76,46 +76,26 @@ load_and_remap_layer(layer)
 
 ---
 
-## Current State (2026-03-28)
+## Current State (2026-04-01)
 
 ### Working
 
 - **CPU inference validated:** exit code 0, generates "hello" correctly, 1.49 T/s PP, 2.89 T/s TG.
-- **Vulkan inference validated** (pre-P1 code): exit code 0, generates "hello" correctly, 1.60 T/s PP, 2.96 T/s TG.
+- **Vulkan inference validated:** exit code 0, generates "hello" correctly.
 - Two-tier cache (pinned + LRU rotating) with continuous re-pinning.
 - Heat map with exponential decay, JSON persistence, warm-restart pre-pinning.
 - K-slot mapping: weight tensors shrunk to `ne[2]=4`, ids remapped in-place.
 - Bias remap: full-tensor rebuild from backup each layer pass.
 - Per-token logging: `[FlashMoE] tok=N  X% cache hits`.
 - Cache hits reach 70-98% during warmup (pre-pinned from heat map), 30-65% during real inference (cold routing).
+- File handle pooling (P1) complete — pooled handles eliminate per-load CreateFile/CloseHandle overhead.
 
-### In Progress: P1 — File Handle Pooling
+### Next: Performance Optimizations
 
-**Goal:** Eliminate per-load `CreateFileW`/`CloseHandle` overhead by keeping file handles open in a pool inside `SlotBufferAllocator`.
-
-**Implementation (in working tree, NOT yet validated on Vulkan):**
-- `_handle_pool: unordered_map<string, intptr_t>` stores open handles (HANDLE on Win, fd on POSIX).
-- `_get_pooled_handle(path)` opens on first access, returns cached handle thereafter.
-- Destructor closes all pooled handles before freeing the memory pool.
-- Windows: `SetFilePointerEx` to offset 0 before each `ReadFile` (pooled handle retains file pointer).
-- POSIX: `pread` with offset 0 (no file-pointer state needed).
-
-**Current blocker:** Vulkan test crashes during `generate()` with access violation. CPU test passes. The crash manifests as `OSError: exception: access violation reading 0x00007FFB00000018` during the first real generation token (after warmup and prefill succeed).
-
-**What was tried:**
-1. `ReadFile` with `OVERLAPPED{Offset=0}` on non-overlapped handle --> crashed at tok=39 (address 0x8). OVERLAPPED on synchronous FILE_FLAG_NO_BUFFERING handles is unreliable on this platform.
-2. `SetFilePointerEx` + `ReadFile(NULL)` --> improved (tok=63), but still crashes during generation on Vulkan. CPU passes fine.
-3. Reverted to old open-read-close code --> Vulkan passes. Confirms regression is from P1 changes.
-
-**Suspected causes for remaining Vulkan crash:**
-- The `_handle_pool` member adds `std::unordered_map<string, intptr_t>` to `SlotBufferAllocator`. The Makefile lacks header dependency tracking; after changing `flash_moe_cache.h`, `flash_moe_manager.o` must be manually recompiled (`touch src/flash_moe/flash_moe_manager.cpp` then `make`). This was done, but may need a full clean build.
-- Possible interaction between keeping many `FILE_FLAG_NO_BUFFERING` handles open and the Vulkan driver's internal file/memory management on Intel Lunar Lake.
-- The crash address `0x00007FFB00000018` is in DLL space (offset 0x18 from a 64KB-aligned base), suggesting a stale vtable or freed backend buffer pointer, possibly unrelated to file I/O itself.
-
-**Recommended next steps for P1:**
-1. Do a full clean build (`make clean && make LLAMA_VULKAN=1 -j8`) to rule out stale .o files.
-2. If still failing, add diagnostic prints inside `ggml_backend_tensor_get` / `ggml_backend_tensor_set` to identify which tensor has a null buffer.
-3. If the Vulkan crash proves unrelated to the file pool itself, guard `ids_tensor->buffer` with a null check before `ggml_backend_tensor_get`.
+See `NEXT_STEP.md` for the detailed plan. Summary:
+1. **P4 — Skip unchanged bias remaps:** Cache slot mapping per layer, skip 108 tensor writes/token when mapping is stable
+2. **P7 — Increase heat map save interval:** From every 10 tokens to every 100 tokens
+3. **P5 — Dead code removal:** CachePhase enum, unused platform vmem layer
 
 ---
 
@@ -123,15 +103,14 @@ load_and_remap_layer(layer)
 
 | Priority | Task | Status | Notes |
 |----------|------|--------|-------|
-| **P1** | File handle pooling | **In progress** | Code written, CPU passes, Vulkan crash unresolved |
+| **P1** | File handle pooling | **Done** | Pooled handles, CPU + Vulkan pass |
 | **P2** | Linux O_DIRECT I/O path | Pending | Currently uses buffered `fopen`/`fread`; doubles memory usage |
-| **P3** | Throttle repinning to every N tokens | Pending | `promote_highly_used_experts()` runs every token; sort of 4608 entries |
-| **P4** | Skip bias remap when slot mapping unchanged | Pending | 108 full-tensor copies/token (3 projs x 36 layers) even when mapping is same |
-| **P5** | Remove dead code | Pending | `CachePhase` enum (single variant), `flash_moe_platform` vmem layer (unused) |
-| **P6** | Expose decay alpha as CLI param | Pending | Hardcoded at 0.01 |
-| **P7** | Async heat map save | Pending | Currently blocks generation thread every 10 tokens |
-| **P8** | GPU-side expert pinning | Pending | Eliminate CPU-->GPU copy for hot experts; depends on ggml GPU buffer API |
-| **P9** | Batched inference support | Pending | K-slot assumes single sequence; multi-sequence needs per-sequence slot maps |
+| **P3** | Skip bias remap when slot mapping unchanged | Pending | 108 full-tensor copies/token (3 projs x 36 layers) even when mapping is same |
+| **P4** | Remove dead code | Pending | `CachePhase` enum (single variant), `flash_moe_platform` vmem layer (unused) |
+| **P5** | Expose decay alpha as CLI param | Pending | Hardcoded at 0.01 |
+| **P6** | Async heat map save | Pending | Currently blocks generation thread every 10 tokens |
+| **P7** | GPU-side expert pinning | Pending | Eliminate CPU-->GPU copy for hot experts; depends on ggml GPU buffer API |
+| **P8** | Batched inference support | Pending | K-slot assumes single sequence; multi-sequence needs per-sequence slot maps |
 
 ---
 
