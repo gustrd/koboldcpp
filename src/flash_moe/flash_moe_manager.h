@@ -8,10 +8,6 @@
 
 namespace FlashMoE {
 
-    enum class CachePhase {
-        DYNAMIC     // Continuous profiling and sliding-window re-pinning
-    };
-
     struct ExpertHeatEntry {
         double score = 0.0;             // Exponentially-decayed frequency score
         uint64_t last_seen_token = 0;   // Token index when last accessed
@@ -36,7 +32,6 @@ namespace FlashMoE {
         std::string experts_dir;
         size_t cache_size_mib;
         bool enabled = false;
-        CachePhase cache_phase = CachePhase::DYNAMIC;
         int warmup_tokens      = 100;
         uint64_t tokens_seen   = 0;
         int n_layers      = 0;
@@ -66,6 +61,10 @@ namespace FlashMoE {
         int token_hits    = 0;  // experts served from cache (no disk read)
         int token_misses  = 0;  // experts loaded from SSD
         int token_experts = 0;  // total unique experts this token
+
+        // Previous slot→expert mapping per layer, used to skip redundant bias remaps.
+        // Key: layer index. Value: slot_to_eid vector of length K.
+        std::unordered_map<int, std::vector<int32_t>> prev_slot_to_eid;
         
         std::mutex manager_mutex;
 

@@ -1,5 +1,4 @@
 #include "flash_moe_cache.h"
-#include "flash_moe_platform.h"
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
@@ -29,7 +28,7 @@ namespace FlashMoE {
         memory_pool = VirtualAlloc(NULL, max_slots * slot_size_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
         // POSIX: align to OS page size (16KB on Apple Silicon, 4KB elsewhere)
-        size_t alignment = fmoe_page_size();
+        size_t alignment = (size_t)sysconf(_SC_PAGESIZE);
         if (posix_memalign(&memory_pool, alignment, max_slots * slot_size_bytes) != 0) {
             memory_pool = nullptr;
         }
@@ -178,14 +177,12 @@ namespace FlashMoE {
         }
 
         if (!to_evict.empty()) {
-            // fprintf(stderr, "FlashMoE: Evicting %zu experts from pinned tier.\n", to_evict.size());
             for (const auto& key : to_evict) {
                 pinned_map.erase(key);
             }
         }
 
         if (!to_load.empty()) {
-            // fprintf(stderr, "FlashMoE: Pinning %zu new experts.\n", to_load.size());
             for (const auto& key : to_load) {
                 // If this expert was in rotating tier, remove it from there
                 auto it_rot = cache_map.find(key);
@@ -216,7 +213,6 @@ namespace FlashMoE {
             }
         }
         
-        // fprintf(stderr, "FlashMoE: Pinned tier updated. Total pinned: %zu\n", pinned_map.size());
     }
 
     // Open (or retrieve from pool) a file handle for reading.

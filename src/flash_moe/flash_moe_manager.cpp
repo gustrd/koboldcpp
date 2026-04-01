@@ -1,6 +1,5 @@
 #include "flash_moe_manager.h"
 #include "flash_moe_cache.h"
-#include "flash_moe_platform.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
 #include <fstream>
@@ -51,7 +50,6 @@ namespace FlashMoE {
         cache_size_mib = cache_mib;
         enabled = true;
         tokens_seen = 0;
-        cache_phase = CachePhase::DYNAMIC;
 
         // Parse expert_index.json
         std::string index_path = dir + "/expert_index.json";
@@ -307,7 +305,7 @@ static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::L
 
             // Throttled disk save: expert_heatmap.json is only written every 10 tokens 
             // to preserve SSD lifespan.
-            if (mgr.tokens_seen > 0 && mgr.tokens_seen % 10 == 0) {
+            if (mgr.tokens_seen > 0 && mgr.tokens_seen % 100 == 0) {
                 mgr.save_heat_map();
             }
         }
@@ -414,6 +412,20 @@ static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::L
                 if (slot >= 0 && slot < K) slot_to_eid[slot] = eid;
             }
 
+            // Skip the bias remap if the slot→expert mapping is identical to last token.
+            // In stable routing (consecutive tokens selecting the same experts per layer),
+            // this avoids up to 108 full-tensor memcpy+tensor_set calls per token.
+            auto& prev = mgr.prev_slot_to_eid[layer];
+            bool mapping_changed = (prev.size() != (size_t)K);
+            if (!mapping_changed) {
+                for (int s = 0; s < K; s++) {
+                    if (prev[s] != slot_to_eid[s]) { mapping_changed = true; break; }
+                }
+            }
+
+            if (mapping_changed) {
+            prev = slot_to_eid;
+
             auto bias_layer_it = mgr.bias_tensors.find(layer);
             if (bias_layer_it != mgr.bias_tensors.end()) {
                 for (auto& [proj, entry] : bias_layer_it->second) {
@@ -446,6 +458,7 @@ static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::L
                     ggml_backend_tensor_set(entry.tensor, tmp.data(), 0, full_bytes);
                 }
             }
+            } // if (mapping_changed)
         }
 
         info.loaded = true;

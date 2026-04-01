@@ -85,17 +85,12 @@ load_and_remap_layer(layer)
 - Two-tier cache (pinned + LRU rotating) with continuous re-pinning.
 - Heat map with exponential decay, JSON persistence, warm-restart pre-pinning.
 - K-slot mapping: weight tensors shrunk to `ne[2]=4`, ids remapped in-place.
-- Bias remap: full-tensor rebuild from backup each layer pass.
+- Bias remap: skipped when slot→expert mapping unchanged from previous token (P3 done).
 - Per-token logging: `[FlashMoE] tok=N  X% cache hits`.
 - Cache hits reach 70-98% during warmup (pre-pinned from heat map), 30-65% during real inference (cold routing).
 - File handle pooling (P1) complete — pooled handles eliminate per-load CreateFile/CloseHandle overhead.
-
-### Next: Performance Optimizations
-
-See `NEXT_STEP.md` for the detailed plan. Summary:
-1. **P4 — Skip unchanged bias remaps:** Cache slot mapping per layer, skip 108 tensor writes/token when mapping is stable
-2. **P7 — Increase heat map save interval:** From every 10 tokens to every 100 tokens
-3. **P5 — Dead code removal:** CachePhase enum, unused platform vmem layer
+- Heat map save interval raised to 100 tokens (P6 done).
+- Dead code removed: `CachePhase` enum, platform vmem include (P4 partial done).
 
 ---
 
@@ -105,11 +100,11 @@ See `NEXT_STEP.md` for the detailed plan. Summary:
 |----------|------|--------|-------|
 | **P1** | File handle pooling | **Done** | Pooled handles, CPU + Vulkan pass |
 | **P2** | Linux O_DIRECT I/O path | Pending | Currently uses buffered `fopen`/`fread`; doubles memory usage |
-| **P3** | Skip bias remap when slot mapping unchanged | Pending | 108 full-tensor copies/token (3 projs x 36 layers) even when mapping is same |
-| **P4** | Remove dead code | Pending | `CachePhase` enum (single variant), `flash_moe_platform` vmem layer (unused) |
+| **P3** | Skip bias remap when slot mapping unchanged | **Done** | `prev_slot_to_eid` cache per layer; skips up to 108 tensor writes/token |
+| **P4** | Remove dead code | **Done (partial)** | `CachePhase` enum removed; platform include removed from main code; platform files kept for test builds |
 | **P5** | Expose decay alpha as CLI param | Pending | Hardcoded at 0.01 |
-| **P6** | Async heat map save | Pending | Currently blocks generation thread every 10 tokens |
-| **P7** | GPU-side expert pinning | Pending | Eliminate CPU-->GPU copy for hot experts; depends on ggml GPU buffer API |
+| **P6** | Async heat map save | **Done** | Save interval raised from 10 → 100 tokens |
+| **P7** | GPU-side expert pinning | Pending | Eliminate CPU→GPU copy for hot experts; depends on ggml GPU buffer API |
 | **P8** | Batched inference support | Pending | K-slot assumes single sequence; multi-sequence needs per-sequence slot maps |
 
 ---
