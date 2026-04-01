@@ -496,6 +496,20 @@ static void load_and_remap_layer(ExpertManager& mgr, int layer, ExpertManager::L
             current_split_layers[layer].ids_tensor = node->src[2];
         }
 
+        // Step 4: Validate that registered weight tensors still have live buffers.
+        // A NULL buffer here means the graph scheduler reallocated after register_tensor(),
+        // leaving g_layer_tensors with stale pointers → would AV in ggml_backend_tensor_set.
+        for (auto& [layer, info] : current_split_layers) {
+            for (auto* wt : info.weight_tensors) {
+                auto tbuf = wt->view_src ? wt->view_src->buffer : wt->buffer;
+                if (!tbuf) {
+                    fprintf(stderr, "FlashMoE STALE: L=%d tensor=%s has NULL buffer! "
+                            "(graph reallocation invalidated g_layer_tensors)\n",
+                            layer, wt->name);
+                }
+            }
+        }
+
         // For each MoE layer found: if ids_tensor was computed in a PREVIOUS split
         // (not in this_split_outputs), it already holds the real expert IDs.
         // Load experts and remap now, before this split computes.
