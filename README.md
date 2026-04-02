@@ -6,13 +6,21 @@
 
 ## 🔥 What is Flash-MoE?
 
-**Flash-MoE** (Zero-Swap Large Model Inference Engine) allows you to run massive Mixture-of-Experts (MoE) models that are larger than your available RAM (e.g. Qwen3.5-397B, Qwen3-30B-A3B) via `llama.cpp` **without** triggering OS-level disk thrashing or lockups. 
+**Flash-MoE** (Zero-Swap Large Model Inference Engine) allows you to run massive Mixture-of-Experts (MoE) models that are larger than your available RAM (e.g., Qwen3-30B, Qwen3.5-397B, gpt-oss-120b) via `llama.cpp` **without** triggering OS-level disk thrashing or lockups. 
 
-Instead of loading the entire multidimensional expert weight estimators into memory:
-1. **Zero-Swap**: Expert tensors are kept completely on disk, not uploaded to the GPU during model load.
-2. **K-Slot Remapping**: Expert buffers are dynamically shrunk exactly to the number of active experts (K) needed per token.
-3. **Dynamic Loading**: An eval callback reads the MoE router output on the fly, fetching only the required cold experts via Direct I/O from SSD into an CPU/Unified LRU cache, mapping them directly into compute slots in-memory.
-4. **Prompt Batching Restrictions**: `n_batch` is forced to 1 during prompt eval to guarantee exactly K unique experts maximum per forward pass, preventing memory slot overflow.
+Instead of loading the entire multidimensional expert weight estimators into memory, it uses a native zero-swap inference pipeline:
+1. **Two-Tier Caching & Zero-Swap:** Expert tensors remain on disk, bypassing the OS page cache. A heat map with exponential decay continuously pre-pins the "hottest" experts into an LRU cache, practically eliminating redundant SSD reads.
+2. **K-Slot Mapping:** Expert buffers are radically shrunk to accommodate only the `K` active experts per layer. An eval callback transparently remaps expert IDs in-place, plunging memory overhead from ~12GB down to <1GB.
+3. **Eval Callback Pipeline:** A native ggml callback mechanism fires sequentially between the router and MoE ops (GET_ROWS → SSD Read → MUL_MAT_ID). This serial execution design is hardware-optimal for unified memory SoCs.
+4. **Single-Token Batching Constraint:** `n_batch = 1` is enforced during prompt evaluation, bounding the maximum unique experts per layer to exactly `K` and mathematically preventing slot buffer overflow.
+
+> **For full architectural details, performance stats, and strategic next steps, see [FLASH_MOE_FEATURE_PLAN.md](FLASH_MOE_FEATURE_PLAN.md).**
+
+## 🚀 Measured Performance
+| Hardware | Model | Speed |
+| :--- | :--- | :--- |
+| **Mac M2 (16GB)** | Qwen3-30B-A3B | **3.5 T/s** |
+| **Intel Lunar Lake (32GB)** | GPT-OSS-120B | **1.5 T/s** |
 
 ## 👉 How to Run Flash-MoE
 
