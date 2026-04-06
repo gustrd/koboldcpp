@@ -511,6 +511,7 @@ llama_model_loader::llama_model_loader(
         void * set_tensor_data_ud,
         const std::string & fname,
         std::vector<std::string> & splits,
+        FILE * file,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
@@ -658,6 +659,36 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+    } else if (file != nullptr) {
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+
+        metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+        metadata = metadata_ptr.get();
+        if (metadata == nullptr) {
+            throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
+        }
+
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        files.emplace_back(new llama_file(file));
+        contexts.emplace_back(ctx);
+
+        // Save tensors data offset info of the main file.
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string tensor_name = std::string(cur->name);
+            // make sure there is no duplicated tensor names
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+            }
+            n_elements += ggml_nelements(cur);
+            n_bytes    += ggml_nbytes(cur);
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+        }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
@@ -669,7 +700,7 @@ llama_model_loader::llama_model_loader(
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
-            __func__, n_kv, n_tensors, fname.c_str(), llama_file_version_name(fver));
+            __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
@@ -1131,6 +1162,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        if (use_mmap) {
+                            static std::once_flag once;
+                            std::call_once(once, [] {
+                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n");
+                            });
+                        }
                     } else {
                         buft = overrides->buft;
                     }
@@ -1228,7 +1265,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
     last_used_ctx = ctx; //this caches the last ctx which should match the buft we want for this layer. kobo forgive me.
 
-    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+    // LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
 
     if (cur == NULL) {
@@ -1282,7 +1319,7 @@ void llama_model_loader::done_getting_tensors() const {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
     }
     if (n_tensors_moved > 0) {
-        LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
+        LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) moved from %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
     }
