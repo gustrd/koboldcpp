@@ -71,7 +71,7 @@ dry_seq_break_max = 128
 extra_images_max = 4 # for kontext/qwen img
 
 # global vars
-KcppVersion = "1.111.1"
+KcppVersion = "1.111.2"
 showdebug = True
 kcpp_instance = None #global running instance
 global_memory = {"tunnel_url": "", "restart_target":"", "input_to_exit":False, "load_complete":False, "restart_override_config_target":"", "last_active_timestamp":datetime.now(), "triggered_sleeping":False, "current_model":"initial_model", "current_override":"", "swapReqType": None, "autoswapmode": False}
@@ -4567,16 +4567,18 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                             delta = {'role': 'assistant'}
                             if genparams.get('encapsulate_thinking', True):
                                 if encap_in_thinking:
-                                    # We are already inside a thinking block. thinkpairs has already been reduced to [pair], so we just check the active one.
-                                    active_pair = thinkpairs[0]
-                                    if active_pair["end"] in tokenStr:
-                                        encap_in_thinking = False
-                                        out1, out2 = tokenStr.split(active_pair["end"], 1)
-                                        if out1:
-                                            delta['reasoning_content'] = out1
-                                        if out2:
-                                            delta['content'] = out2
-                                    else:
+                                    foundend = False
+                                    for pair in thinkpairs:
+                                        if pair["end"] in tokenStr:
+                                            encap_in_thinking = False
+                                            foundend = True
+                                            out1, out2 = tokenStr.split(pair["end"], 1)
+                                            if out1:
+                                                delta['reasoning_content'] = out1
+                                            if out2:
+                                                delta['content'] = out2
+                                            break
+                                    if not foundend:
                                         # Still thinking
                                         delta['reasoning_content'] = tokenStr
                                 else:
