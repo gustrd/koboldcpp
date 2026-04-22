@@ -17,7 +17,7 @@
 #include "model_adapter.h"
 #include "vocab/vocab.h"
 #include "flux.hpp"
-#include "stable-diffusion.cpp"
+#include "sample-cache.cpp"
 #include "util.cpp"
 #include "name_conversion.cpp"
 #include "upscaler.cpp"
@@ -29,6 +29,7 @@
 
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
+#include "stable-diffusion.cpp"
 
 //#define STB_IMAGE_IMPLEMENTATION //already defined in llava
 #include "stb_image.h"
@@ -1044,13 +1045,6 @@ sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs)
             }
             sd_params->cfg_scale = 1.0f;
         }
-        if (sd_params->sample_method == sample_method_t::EULER_A_SAMPLE_METHOD) {
-            //euler a broken on flux
-            if (!sd_is_quiet && sddebugmode) {
-                printf("%s: switching Euler A to Euler\n", loaded_model_is_chroma(sd_ctx) ? "Chroma" : "Flux");
-            }
-            sd_params->sample_method = sample_method_t::EULER_SAMPLE_METHOD;
-        }
     }
 
     if(!remove_limits && loadedsdver == SDVersion::VERSION_Z_IMAGE)
@@ -1645,6 +1639,16 @@ sd_info_outputs sdtype_get_info()
         }
     }
     j["available_schedulers"] = available_schedulers;
+
+    auto available_samplers = json::array();
+    available_samplers.push_back("default");
+    for (int i = 0; i < sample_method_t::SAMPLE_METHOD_COUNT; i++) {
+        std::string name = sd_sample_method_name((sample_method_t)i);
+        if (name != "NONE") {
+            available_samplers.push_back(name);
+        }
+    }
+    j["available_samplers"] = available_samplers;
 
     static std::string recent_info = j.dump();
     sd_info_outputs output;

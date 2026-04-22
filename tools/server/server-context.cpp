@@ -4,6 +4,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "build-info.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
@@ -632,7 +633,7 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(const common_params & params) {
+    bool load_model(common_params & params) {
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
@@ -640,6 +641,9 @@ private:
         params_base = params;
 
         llama_init = common_init_from_params(params_base);
+
+        // propagate model-metadata sampling defaults back to caller
+        params.sampling = params_base.sampling;
 
         model = llama_init->model();
         ctx   = llama_init->context();
@@ -705,6 +709,7 @@ private:
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.media_marker     = get_media_marker();
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
             if (mctx == nullptr) {
@@ -2404,7 +2409,7 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            return cur.pos_min < pos_min_thold;
+                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
 
@@ -2978,7 +2983,7 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(const common_params & params) {
+bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
 }
 
@@ -3006,7 +3011,7 @@ server_context_meta server_context::get_meta() const {
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx, eos_id, true) : "";
 
     return server_context_meta {
-        /* build_info             */ build_info,
+        /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
@@ -3029,6 +3034,8 @@ server_context_meta server_context::get_meta() const {
         /* fim_pad_token          */ llama_vocab_fim_pad(impl->vocab),
         /* fim_rep_token          */ llama_vocab_fim_rep(impl->vocab),
         /* fim_sep_token          */ llama_vocab_fim_sep(impl->vocab),
+
+        /* logit_bias_eog         */ impl->params_base.sampling.logit_bias_eog,
 
         /* model_vocab_type       */ llama_vocab_type(impl->vocab),
         /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
@@ -3114,6 +3121,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     ctx_server.vocab,
                     params,
                     meta->slot_n_ctx,
+                    meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
 
@@ -3724,6 +3732,33 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_RESP);
+    };
+
+    this->post_transcriptions_oai = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+            res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        std::vector<raw_buffer> files;
+        json body = convert_transcriptions_to_chatcmpl(
+            json::parse(req.body),
+            req.files,
+            files);
+        SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
+        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        json body_parsed = oaicompat_chat_params_parse(
+            body,
+            meta->chat_params,
+            files);
+        return handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            body_parsed,
+            files,
+            TASK_RESPONSE_TYPE_OAI_ASR);
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
