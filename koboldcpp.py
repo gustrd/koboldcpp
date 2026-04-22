@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Optional, Tuple
 import shutil
 import subprocess
 import gzip
@@ -534,6 +534,84 @@ class StdoutRedirector:
     def flush(self):
         self.terminal.flush()
 
+# ==============================================================================
+# GRD: CUSTOM EXTENSIONS
+# ==============================================================================
+# This section contains custom modifications by GRD (gustrd-develop branch).
+# These functions are additions to the upstream KoboldCpp codebase.
+#
+# When merging with upstream (concedo), this entire section should be preserved.
+# The section is intentionally placed after ctypes structures and before
+# utility functions to minimize merge conflicts.
+#
+# Contents:
+#   - _enable_windows_ansi(): Enable ANSI escape sequences on Windows consoles
+#   - debug_dark_yellow_utf(): Debug printing with color and UTF-8 safety
+# ==============================================================================
+
+
+def _enable_windows_ansi() -> None:
+    """
+    Try to enable ANSI escape sequence handling on Windows 10+ consoles.
+    Fails silently on older Windows or when not available.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hStdOut = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint()
+        if kernel32.GetConsoleMode(hStdOut, ctypes.byref(mode)):
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(hStdOut, new_mode)
+    except Exception:
+        # If anything goes wrong (permissions, platform), just ignore — not fatal.
+        pass
+
+_enable_windows_ansi()
+
+def debug_dark_yellow_utf(msg: str, *, file=sys.stderr, encoding: str = "utf-8", errors: str = "backslashreplace") -> None:
+    """
+    Print a debug message in dark yellow and safely handle UTF characters.
+
+    - `msg` should be a Python str (Unicode).
+    - `file` can be any text stream (defaults to sys.stderr).
+      If the stream exposes a `.buffer` attribute (binary underlying stream),
+      the function will encode to `encoding` and write bytes directly to it,
+      avoiding issues if the text wrapper's encoding is something else.
+    - `errors` controls how encoding errors are handled (default 'backslashreplace').
+    """
+    ESC = "\033["       # CSI
+    YELLOW = "0;33m"    # normal/dark yellow
+    RESET = "\033[0m"
+    full = f"{ESC}{YELLOW}\n{msg}{RESET}\n"
+
+    # Prefer writing bytes to the underlying buffer if possible
+    try:
+        buf = getattr(file, "buffer", None)
+        if buf is not None and hasattr(buf, "write"):
+            # encode explicitly to the chosen encoding
+            b = full.encode(encoding, errors=errors)
+            buf.write(b)
+            buf.flush()
+            return
+    except Exception:
+        # fall through to text-mode print if binary write fails
+        pass
+
+    # Fallback: use normal print (may raise if stream can't accept some codepoints)
+    try:
+        print(full, end="", file=file)
+    except Exception:
+        # As a last resort, replace problematic characters and print
+        safe = full.encode(encoding, errors=errors).decode(encoding, errors="replace")
+        print(safe, end="", file=file)
+
+# END OF GRD CUSTOM EXTENSIONS
+# ==============================================================================
+
 class MCPStdioClient:
     def resolve_command(self, command):
         resolved = shutil.which(command)
@@ -736,7 +814,6 @@ class MCPHTTPClient:
             raise RuntimeError(f"MCP HTTP notification failed ({e.code}): {error_body}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"MCP HTTP notification connection failed: {e.reason}") from e
-
 
 def getdirpath():
     return os.path.dirname(os.path.realpath(__file__))
@@ -4699,7 +4776,18 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 global last_non_horde_req_time
                 last_non_horde_req_time = time.time()
 
-            return generate(genparams=genparams,stream_flag=stream_flag)
+            # GRD CUSTOM CODE: catch C backend crashes (e.g. Windows stack overflow) and
+            # trigger a clean process exit so the monitor can restart koboldcpp.
+            try:
+                return generate(genparams=genparams,stream_flag=stream_flag)
+            except OSError as e:
+                print(f"\n[Generate] C backend error ({e}). Returning empty result and restarting in 3s...")
+                def _delayed_exit():
+                    time.sleep(3)
+                    os._exit(1)
+                threading.Thread(target=_delayed_exit, daemon=True).start()
+                return {"text": "", "status": -1, "stopreason": -2, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            # END GRD CUSTOM CODE
 
         genout = {"text": "", "status": -1, "stopreason": -1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
         if stream_flag:
@@ -9284,6 +9372,18 @@ def run_horde_worker(args, api_key, worker_name):
         #submit reply
         print("") #empty newline
         if current_generation:
+
+            # ------------------------------------------------------------------
+            # GRD_DEBUG: Single-token sampling bug detection
+            # ------------------------------------------------------------------
+            # This detects a bug where the model gets stuck generating the same
+            # token repeatedly.
+            # Uses functions from GRD CUSTOM EXTENSIONS section.
+            # ------------------------------------------------------------------
+            generated_string = current_generation["results"][0]["text"]
+            debug_dark_yellow_utf(generated_string)
+            # ------------------------------------------------------------------
+
             submit_dict = {
                 "id": current_id,
                 "generation": current_generation["results"][0]["text"],

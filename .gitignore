@@ -145,3 +145,6 @@ conda/
 
 # Jetbrains idea folder
 .idea/
+
+# GRD: Temp files
+_*

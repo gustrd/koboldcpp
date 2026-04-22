@@ -16224,6 +16224,7 @@ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev)
     case 0x5693:  // A370M
     case 0x56A5:  // A380
     case 0x56B1:  // Pro A40/A50
+    case 0x64A0:  // Arc 140V (Lunar Lake)
         return 8;
     case 0x5697:  // A530M
         return 12;
